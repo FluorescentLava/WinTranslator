@@ -1,0 +1,17 @@
+/target/
+/dist/
+*.log
+/models/
+/runtime/
+*.exe
+*.dll
+.env
+.env.*
+!.env.example
+settings.json
+history.json
+credentials*
+secrets*
+/dictionary/*.csv
+*.partial
+/vendor/windows-reactor/target/

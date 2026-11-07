@@ -1,0 +1,13 @@
+{
+  "source_bytes": 66009548,
+  "source_sha256": "d1ecbdf9ee2b920afb6f430ca6b6bb9f559588cf0dff86e04bd255f9390843cc",
+  "source_rows": 770611,
+  "rows": 59137,
+  "bytes": 10437264,
+  "sha256": "66725c8bb2519410dbf7878c6b3cf5998885eced18ee946dd285f106f22990c2",
+  "repository": "https://github.com/skywind3000/ECDICT",
+  "revision": "39cfb9672c0906b63569e0453c2e6abfb9ab182a",
+  "license": "MIT",
+  "source_url": "https://raw.githubusercontent.com/skywind3000/ECDICT/39cfb9672c0906b63569e0453c2e6abfb9ab182a/ecdict.csv",
+  "filter": "tag nonempty OR collins nonzero OR oxford=1 OR 1<=bnc<=100000 OR 1<=frq<=100000"
+}
