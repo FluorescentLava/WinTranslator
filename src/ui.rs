@@ -1523,11 +1523,11 @@ impl Translator {
             .iter()
             .map(|provider| provider.name())
             .collect::<Vec<_>>()
-            .join(" → ");
+            .join("→");
         let order = if order.is_empty() {
             "手动离线".to_owned()
         } else if self.settings.auto_offline {
-            format!("{order} → 本地离线")
+            format!("{order}→本地离线")
         } else {
             order
         };
@@ -1548,7 +1548,7 @@ impl Translator {
                 route_rows,
                 muted("仅统计本程序的用量，包含失败请求的保守预留。"),
             ))),
-            muted(format!("当前在线路由：{order}。免费额度不足时自动换服务。")),
+            muted(format!("在线路由\n{order} · 免费额度不足时自动换服务")),
         ))
     }
     fn general_settings(&self, cx: &ViewContext<Self>) -> View {
