@@ -28,6 +28,7 @@ pub enum Message {
         Result<Translation, String>,
         Option<crate::dictionary::Entry>,
     ),
+    ChineseDefinitionsReady(u64, Option<crate::dictionary::Entry>),
     Details(bool),
     PopupFrame(native::PopupFrame),
     Pronounce(crate::speech::Accent),
@@ -77,6 +78,8 @@ pub struct Translator {
     pending_provider: Option<Provider>,
     output: Option<Translation>,
     entry: Option<crate::dictionary::Entry>,
+    pending_chinese_entry: Option<crate::dictionary::Entry>,
+    definitions_task: Option<ComponentTask>,
     details_open: bool,
     popup_frame: Option<native::PopupFrame>,
     popup_details_reveal: f64,
@@ -132,7 +135,10 @@ fn meaning_parts(value: &str) -> impl Iterator<Item = &str> {
         .map(str::trim)
         .filter(|part| !part.is_empty())
 }
-fn chinese_senses(entry: &crate::dictionary::Entry) -> Vec<crate::dictionary::Sense> {
+fn display_senses(entry: &crate::dictionary::Entry) -> Vec<crate::dictionary::Sense> {
+    if entry.direction == crate::dictionary::LookupDirection::ChineseToEnglish {
+        return entry.senses.clone();
+    }
     let mut seen = std::collections::HashSet::new();
     let mut senses = Vec::new();
     for sense in &entry.senses {
@@ -178,7 +184,28 @@ fn visual_lines(value: &str, font_size: f64, width: f64) -> usize {
         .max(1)
 }
 fn dictionary_metadata(entry: &crate::dictionary::Entry) -> String {
-    entry.parts_of_speech.join(" · ")
+    if entry.parts_of_speech.is_empty() {
+        "词性未收录".into()
+    } else {
+        entry.parts_of_speech.join(" · ")
+    }
+}
+
+fn merge_chinese_entries(
+    local: Option<crate::dictionary::Entry>,
+    online: Option<crate::dictionary::Entry>,
+) -> Option<crate::dictionary::Entry> {
+    let Some(online) = online else {
+        return local;
+    };
+    if let Some(local) = local {
+        if local.direction != online.direction || local.word != online.word {
+            return Some(local);
+        }
+    }
+    // Exact Chinese-English entries take priority over reverse-index matches,
+    // which can also contain inflected words or borrowings from other languages.
+    Some(online)
 }
 fn at(view: impl Into<View>, row: i32, column: i32) -> View {
     Grid::new()
@@ -390,6 +417,10 @@ impl Translator {
     }
 
     fn invalidate(&mut self) {
+        self.pending_chinese_entry = None;
+        if let Some(task) = self.definitions_task.take() {
+            task.cancel();
+        }
         self.revision += 1;
         self.busy = false;
         self.phonetics = None;
@@ -467,9 +498,21 @@ impl Translator {
         let (source, target) = self.language_indices();
         let from = LANGUAGES[source].code.to_owned();
         let to = LANGUAGES[target].code.to_owned();
+        if to == "en" && (from == "zh" || (from == "auto" && detect(&text) == "zh")) {
+            let query = text.clone();
+            self.definitions_task = Some(cx.spawn_background(move |cancel| {
+                Message::ChineseDefinitionsReady(
+                    revision,
+                    crate::chinese_dictionary::lookup(&query, &|| cancel.is_cancelled()),
+                )
+            }));
+        }
         self.task = Some(cx.spawn_background(move |cancel| {
-            let entry = if from == "en" || from == "auto" {
+            let actual_from = if from == "auto" { detect(&text) } else { &from };
+            let entry = if actual_from == "en" && to == "zh" {
                 crate::dictionary::lookup(&text)
+            } else if actual_from == "zh" && to == "en" {
+                crate::dictionary::lookup_chinese(&text)
             } else {
                 None
             };
@@ -621,7 +664,7 @@ impl Translator {
             .output
             .as_ref()
             .and(self.entry.as_ref())
-            .map(chinese_senses)
+            .map(display_senses)
             .unwrap_or_default();
         let details_open = self.details_open && !dictionary_senses.is_empty();
         let details_reveal = if dictionary_senses.is_empty() {
@@ -721,7 +764,7 @@ impl Translator {
                 let open_header = header_fixed + open_target;
                 let meanings_height = dictionary_senses
                     .iter()
-                    .map(|sense| visual_lines(&sense.definition, 15.0, 440.0) as f64 * 21.0)
+                    .map(|sense| visual_lines(&sense.definition, 15.0, 412.0) as f64 * 21.0)
                     .sum::<f64>()
                     + dictionary_senses.len().saturating_sub(1) as f64 * 12.0;
                 details_height =
@@ -1007,7 +1050,7 @@ impl Translator {
                             (
                                 index,
                                 Grid::new()
-                                    .columns([GridLength::Pixel(42.0), Star(1.0)])
+                                    .columns([GridLength::Pixel(60.0), Star(1.0)])
                                     .column_spacing(8.0)
                                     .children((
                                         text(&sense.part_of_speech, 14.0).opacity(0.6),
@@ -1635,6 +1678,8 @@ impl Component for Translator {
             pending_provider: None,
             output: None,
             entry: None,
+            pending_chinese_entry: None,
+            definitions_task: None,
             details_open: false,
             popup_frame: None,
             popup_details_reveal: 0.0,
@@ -1745,7 +1790,7 @@ impl Component for Translator {
                 self.busy = false;
                 self.pending_provider = None;
                 self.task = None;
-                self.entry = entry;
+                self.entry = merge_chinese_entries(entry, self.pending_chinese_entry.take());
                 match result {
                     Ok(mut t) => {
                         self.error = false;
@@ -1775,12 +1820,28 @@ impl Component for Translator {
                         }
                     }
                     Err(e) => {
+                        if let Some(task) = self.definitions_task.take() {
+                            task.cancel();
+                        }
                         self.output = None;
                         self.entry = None;
                         self.details_open = false;
                         self.error = true;
                         self.status = e;
                     }
+                }
+            }
+            Message::ChineseDefinitionsReady(revision, entry) if revision == self.revision => {
+                self.definitions_task = None;
+                if !self.busy
+                    && self
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.source.trim() == self.text.trim())
+                {
+                    self.entry = merge_chinese_entries(self.entry.take(), entry);
+                } else {
+                    self.pending_chinese_entry = entry;
                 }
             }
             Message::Dismiss => {

@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 use windows_reactor::*;
 mod api;
+mod chinese_dictionary;
 mod desktop;
 mod dictionary;
 mod model;
