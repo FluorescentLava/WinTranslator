@@ -341,9 +341,14 @@ impl Translator {
                                                 .opacity(0.65)
                                                 .vertical_alignment(Center)
                                                 .grid_column(1),
-                                            icon("\u{E767}")
+                                            Viewbox::new()
+                                                .width(14.0)
+                                                .height(14.0)
+                                                .stretch(windows_reactor::Stretch::Uniform)
+                                                .opacity(0.7)
                                                 .vertical_alignment(Center)
-                                                .grid_column(2),
+                                                .grid_column(2)
+                                                .slot(ViewboxSlot::Child, icon("\u{E993}")),
                                         )),
                                 )
                                 .tooltip(format!("{name} {phonetic}")),
