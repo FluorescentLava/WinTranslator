@@ -324,8 +324,8 @@ fn swap_button(cx: &ViewContext<Translator>, dark: bool) -> View {
         .on_click(cx.message(Message::Swap))
         .content(
             Viewbox::new()
-                .width(20.0)
-                .height(20.0)
+                .width(16.0)
+                .height(16.0)
                 .stretch(windows_reactor::Stretch::Uniform)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .vertical_alignment(Center)
@@ -958,7 +958,7 @@ impl Translator {
             WindowVisuals::new()
                 .client_size(POPUP_WIDTH, 172.0)
                 .backdrop(WindowBackdrop::MicaCard {
-                    bottom_inset: native::POPUP_BOTTOM_INSET,
+                    inset: native::POPUP_SHADOW_INSET,
                 })
                 .theme(theme(&self.settings)),
         );

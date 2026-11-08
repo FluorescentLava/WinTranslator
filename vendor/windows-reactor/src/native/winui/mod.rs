@@ -44,6 +44,7 @@ pub use generated::*;
 mod framework;
 mod grid;
 mod navigation_layout;
+mod presenter_frame;
 #[cfg(feature = "test")]
 pub(crate) mod test;
 #[cfg(feature = "test")]
@@ -800,9 +801,8 @@ impl WinUiRuntime {
                 .window_hosts
                 .get_mut(&node)
                 .ok_or(RuntimeError::MissingNode(node))?;
-            if let WindowBackdrop::MicaCard { bottom_inset } = visuals.backdrop {
-                host.enable_card(&window, bottom_inset)
-                    .map_err(native_error)?;
+            if let WindowBackdrop::MicaCard { inset } = visuals.backdrop {
+                host.enable_card(&window, inset).map_err(native_error)?;
             } else {
                 host.disable_card(&window).map_err(native_error)?;
             }

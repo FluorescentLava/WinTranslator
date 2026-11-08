@@ -99,9 +99,9 @@ const RESIZE_DURATION_MS: f64 = 200.0;
 // A 16 ms USER timer can be rounded up to two default clock ticks. Request
 // the supported minimum and use elapsed time, rather than timer counts, below.
 const RESIZE_INTERVAL_MS: u32 = 10;
-// The transparent host reaches the taskbar. The visible Mica card keeps this
-// inset, so its complete surface can slide through the gap below its final edge.
-pub const POPUP_BOTTOM_INSET: u16 = 16;
+// The visible card stays 16 DIPs from the work-area edges. The transparent
+// host reserves the same gutter on all sides for the card's moving shadow.
+pub const POPUP_SHADOW_INSET: u16 = 16;
 const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
 const APP_NAME: &str = "WinTranslater";
 const SETTINGS_TITLE: &str = "WinTranslater 设置";
@@ -346,7 +346,16 @@ unsafe extern "system" {
         rect: *const Rect,
     ) -> i32;
     fn DestroyMenu(menu: Hwnd) -> i32;
-    fn LoadIconW(instance: Hwnd, name: *const u16) -> Hwnd;
+    fn LoadImageW(
+        instance: Hwnd,
+        name: *const u16,
+        kind: u32,
+        width: i32,
+        height: i32,
+        flags: u32,
+    ) -> Hwnd;
+    fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
+    fn GetDpiForSystem() -> u32;
     fn RegisterWindowMessageW(name: *const u16) -> u32;
     fn GetFocus() -> Hwnd;
     fn PostQuitMessage(code: i32);
@@ -386,20 +395,28 @@ unsafe extern "system" {
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
-fn app_icon() -> Hwnd {
+fn app_icon(size: i32) -> Hwnd {
     unsafe {
-        LoadIconW(
+        // Load the matching embedded ICO frame instead of scaling the default
+        // large icon down for both the tray and the window's small-icon slot.
+        LoadImageW(
             GetModuleHandleW(std::ptr::null()),
             APP_ICON_ID as *const u16,
+            1, // IMAGE_ICON
+            size,
+            size,
+            0x8000, // LR_SHARED: the module owns the cached resource handle.
         )
     }
 }
 fn set_window_icon(window: Hwnd) {
-    let icon = app_icon();
-    if !icon.is_null() {
-        unsafe {
-            SendMessageW(window, 0x0080, 0, icon as isize); // WM_SETICON / ICON_SMALL
-            SendMessageW(window, 0x0080, 1, icon as isize); // WM_SETICON / ICON_BIG
+    let dpi = unsafe { GetDpiForWindow(window) }.max(96);
+    for (slot, metric) in [(0, 49), (1, 11)] {
+        let icon = app_icon(unsafe { GetSystemMetricsForDpi(metric, dpi) }.max(1));
+        if !icon.is_null() {
+            unsafe {
+                SendMessageW(window, 0x0080, slot, icon as isize); // WM_SETICON
+            }
         }
     }
 }
@@ -486,22 +503,21 @@ fn placement(window: Hwnd) -> (i32, i32, i32, i32) {
     )
 }
 fn popup_bounds(work: Rect, scale: f64, width: f64, height: f64) -> Rect {
-    let margin = (f64::from(POPUP_BOTTOM_INSET) * scale).round() as i32;
-    let width = ((width * scale).round() as i32).min((work.right - work.left - 2 * margin).max(1));
-    let height =
-        ((height * scale).round() as i32).min((work.bottom - work.top - 2 * margin).max(1));
+    let inset = (f64::from(POPUP_SHADOW_INSET) * scale).round() as i32;
+    let width = ((width * scale).round() as i32).min((work.right - work.left - 2 * inset).max(1));
+    let height = ((height * scale).round() as i32).min((work.bottom - work.top - 2 * inset).max(1));
     Rect {
-        left: work.right - margin - width,
-        top: work.bottom - margin - height,
-        right: work.right - margin,
+        left: work.right - 2 * inset - width,
+        top: work.bottom - 2 * inset - height,
+        right: work.right,
         bottom: work.bottom,
     }
 }
-fn popup_viewport_height(physical_height: i32, scale: f64) -> f64 {
-    let inset = (f64::from(POPUP_BOTTOM_INSET) * scale).round() as i32;
-    f64::from((physical_height - inset).max(1)) / scale
+fn popup_viewport_extent(physical_extent: i32, scale: f64) -> f64 {
+    let inset = (f64::from(POPUP_SHADOW_INSET) * scale).round() as i32;
+    f64::from((physical_extent - 2 * inset).max(1)) / scale
 }
-/// Distance from the card's resting top to the taskbar edge, in XAML DIPs.
+/// Distance needed to move the entire card and shadow below the taskbar edge.
 /// Read the committed viewport rather than a pending translation result size.
 pub fn popup_slide_distance() -> f32 {
     let popup = POPUP.with(Cell::get);
@@ -510,7 +526,7 @@ pub fn popup_slide_distance() -> f32 {
         let scale = f64::from(unsafe { GetDpiForWindow(popup) }.max(96)) / 96.0;
         return (f64::from(client.bottom - client.top) / scale).max(1.0) as f32;
     }
-    (SIZE.with(Cell::get).1 + f64::from(POPUP_BOTTOM_INSET)).max(1.0) as f32
+    (SIZE.with(Cell::get).1 + 2.0 * f64::from(POPUP_SHADOW_INSET)).max(1.0) as f32
 }
 fn finish_resize(window: Hwnd) {
     unsafe {
@@ -691,9 +707,9 @@ fn queue_popup_frame(
             revision,
             serial,
             transition_key: TRANSITION_KEY.with(Cell::get),
-            width: f64::from(rectangle.right - rectangle.left) / scale,
-            height: popup_viewport_height(rectangle.bottom - rectangle.top, scale),
-            target_height: popup_viewport_height(target.bottom - target.top, scale),
+            width: popup_viewport_extent(rectangle.right - rectangle.left, scale),
+            height: popup_viewport_extent(rectangle.bottom - rectangle.top, scale),
+            target_height: popup_viewport_extent(target.bottom - target.top, scale),
             progress,
             finished,
         },
@@ -1087,7 +1103,7 @@ fn tray(window: Hwnd, operation: u32) -> bool {
     data.id = 1;
     data.flags = 1 | 2 | 4;
     data.callback = TRAY_MESSAGE;
-    data.icon = app_icon();
+    data.icon = app_icon(unsafe { GetSystemMetricsForDpi(49, GetDpiForSystem()) }.max(1));
     for (to, from) in data
         .tip
         .iter_mut()
@@ -1229,7 +1245,7 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
         class_extra: 0,
         window_extra: 0,
         instance,
-        icon: app_icon(),
+        icon: app_icon(unsafe { GetSystemMetricsForDpi(11, GetDpiForSystem()) }.max(1)),
         cursor: std::ptr::null_mut(),
         background: std::ptr::null_mut(),
         menu_name: std::ptr::null(),
@@ -1949,14 +1965,21 @@ mod presentation_tests {
             let bounds = popup_bounds(work, scale, 480.0, 320.0);
             let margin = (16.0 * scale).round() as i32;
             assert_eq!(bounds.bottom, work.bottom);
-            assert_eq!(bounds.right, work.right - margin);
-            assert_eq!(bounds.right - bounds.left, (480.0 * scale).round() as i32);
+            assert_eq!(bounds.right, work.right);
             assert_eq!(
-                bounds.top,
-                work.bottom - margin - (320.0 * scale).round() as i32
+                bounds.right - bounds.left,
+                (480.0 * scale).round() as i32 + 2 * margin
             );
             assert_eq!(
-                popup_viewport_height(bounds.bottom - bounds.top, scale),
+                bounds.top,
+                work.bottom - 2 * margin - (320.0 * scale).round() as i32
+            );
+            assert_eq!(
+                popup_viewport_extent(bounds.right - bounds.left, scale),
+                480.0
+            );
+            assert_eq!(
+                popup_viewport_extent(bounds.bottom - bounds.top, scale),
                 320.0
             );
         }
@@ -1971,10 +1994,10 @@ mod presentation_tests {
             bottom: -180,
         };
         let bounds = popup_bounds(work, 1.5, 1600.0, 1200.0);
-        assert_eq!(bounds.left, work.left + 24);
-        assert_eq!(bounds.top, work.top + 24);
+        assert_eq!(bounds.left, work.left);
+        assert_eq!(bounds.top, work.top);
         assert_eq!(bounds.bottom, work.bottom);
-        let viewport = popup_viewport_height(bounds.bottom - bounds.top, 1.5);
+        let viewport = popup_viewport_extent(bounds.bottom - bounds.top, 1.5);
         assert_eq!(viewport, (720.0 - 48.0) / 1.5);
     }
 

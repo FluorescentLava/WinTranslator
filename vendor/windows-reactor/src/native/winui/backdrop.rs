@@ -352,6 +352,125 @@ impl TransparentBackdrop {
     }
 }
 
+// Public WinRT interfaces not included in this runtime's generated subset.
+// Method indices below exclude IInspectable's six slots and are verified
+// against the installed Microsoft.UI[.Xaml].winmd, version 2.4.
+windows_core::imp::define_interface!(
+    CardThemeShadow,
+    IInspectable_Vtbl,
+    0xc264208a_d1f4_58ae_8a88_fc59148bee69
+);
+windows_core::imp::define_interface!(
+    CardCompositionObject,
+    IInspectable_Vtbl,
+    0x0e583d49_fb5e_5481_a426_d3c41e059a5a
+);
+windows_core::imp::define_interface!(
+    CardVisual,
+    IInspectable_Vtbl,
+    0xc0eeab6c_c897_5ac6_a1c9_63abd5055b9b
+);
+windows_core::imp::define_interface!(
+    CardCompositor5,
+    IInspectable_Vtbl,
+    0xbb52d644_a030_5c19_b883_577ded739ae7
+);
+windows_core::imp::define_interface!(
+    CardCompositor6,
+    IInspectable_Vtbl,
+    0x5fd20200_c188_5737_b567_5e61741af19c
+);
+windows_core::imp::define_interface!(
+    CardGeometry,
+    IInspectable_Vtbl,
+    0x4e40bdb2_450b_5a81_9e9b_149417980cc4
+);
+windows_core::imp::define_interface!(
+    CardClip,
+    IInspectable_Vtbl,
+    0xb66b55cb_b5a5_5bee_8972_ae78233cb34c
+);
+windows_core::imp::define_interface!(
+    CardRoundedRectangle,
+    IInspectable_Vtbl,
+    0x02eafc87_8d1f_5445_a416_d81baee8a750
+);
+unsafe fn native_method<T: Copy>(object: &impl Interface, index: usize) -> T {
+    unsafe {
+        let table = *(object.as_raw() as *const *const usize);
+        std::mem::transmute_copy(&*table.add(6 + index))
+    }
+}
+fn native_object(object: &impl Interface, index: usize) -> Result<IUnknown> {
+    let mut result = std::ptr::null_mut();
+    unsafe {
+        native_method::<unsafe extern "system" fn(Raw, *mut Raw) -> HRESULT>(object, index)(
+            object.as_raw(),
+            &mut result,
+        )
+        .ok()?;
+        if result.is_null() {
+            return Err(Error::empty());
+        }
+        Ok(IUnknown::from_raw(result))
+    }
+}
+fn set_clip_size(geometry: &CardRoundedRectangle, width: f64, height: f64) -> Result<()> {
+    unsafe {
+        native_method::<unsafe extern "system" fn(Raw, windows_numerics::Vector2) -> HRESULT>(
+            geometry, 5,
+        )(
+            geometry.as_raw(),
+            windows_numerics::Vector2 {
+                x: width.max(0.0) as f32,
+                y: height.max(0.0) as f32,
+            },
+        )
+        .ok()
+    }
+}
+fn round_content(drawing: &bindings::Grid) -> Result<windows_core::EventRevoker> {
+    // Clip the material/content/stroke, while keeping the caster and its native
+    // ThemeShadow outside the clip. Composition owns a real rounded geometry;
+    // only layout size changes update its bounds, never an animation timer.
+    let visual = ElementCompositionPreview::GetElementVisual(&drawing.cast::<UIElement>()?)?;
+    let compositor = native_object(&visual.cast::<CardCompositionObject>()?, 0)?;
+    let geometry = native_object(&compositor.cast::<CardCompositor5>()?, 14)?
+        .cast::<CardRoundedRectangle>()?;
+    unsafe {
+        native_method::<unsafe extern "system" fn(Raw, windows_numerics::Vector2) -> HRESULT>(
+            &geometry, 1,
+        )(
+            geometry.as_raw(),
+            windows_numerics::Vector2 { x: 12.0, y: 12.0 },
+        )
+        .ok()?;
+    }
+    let element = drawing.cast::<FrameworkElement>()?;
+    set_clip_size(&geometry, element.ActualWidth()?, element.ActualHeight()?)?;
+    let clip_factory = compositor.cast::<CardCompositor6>()?;
+    let mut raw = std::ptr::null_mut();
+    unsafe {
+        native_method::<unsafe extern "system" fn(Raw, Raw, *mut Raw) -> HRESULT>(&clip_factory, 1)(
+            clip_factory.as_raw(), geometry.cast::<CardGeometry>()?.as_raw(), &mut raw,
+        ).ok()?;
+        let clip = IUnknown::from_raw(raw).cast::<CardClip>()?;
+        let visual = visual.cast::<CardVisual>()?;
+        native_method::<unsafe extern "system" fn(Raw, Raw) -> HRESULT>(&visual, 9)(
+            visual.as_raw(),
+            clip.as_raw(),
+        )
+        .ok()?;
+    }
+    element.SizeChanged(move |_, args| {
+        if let Some(args) = args.as_ref() {
+            if let Ok(size) = args.NewSize() {
+                _ = set_clip_size(&geometry, f64::from(size.width), f64::from(size.height));
+            }
+        }
+    })
+}
+
 pub(super) struct WindowHost {
     pub root: Option<NodeId>,
     pub host: bindings::Grid,
@@ -359,8 +478,12 @@ pub(super) struct WindowHost {
 }
 struct MicaCard {
     surface: bindings::Grid,
+    caster: bindings::Border,
     content: bindings::Grid,
     element: BackdropElement,
+    mica: SystemBackdrop,
+    _clip_size_changed: windows_core::EventRevoker,
+    _frame: presenter_frame::PresenterFrame,
     transparent: TransparentBackdrop,
 }
 impl WindowHost {
@@ -386,9 +509,15 @@ impl WindowHost {
             )
         })
     }
-    pub fn enable_card(&mut self, window: &Window, bottom_inset: u16) -> Result<()> {
+    pub fn enable_card(&mut self, window: &Window, inset: u16) -> Result<()> {
         if let Some(card) = &self.card {
-            set_bottom_inset(&card.surface, bottom_inset)?;
+            set_card_inset(&card.caster, inset)?;
+            // disconnect() releases both targets; reconnect the moving Mica
+            // element as well as the transparent window target on reuse.
+            unsafe {
+                (card.element.vtable().set_backdrop)(card.element.as_raw(), card.mica.as_raw())
+                    .ok()?;
+            }
             return window
                 .cast::<IWindow2>()?
                 .SetSystemBackdrop(&card.transparent.value);
@@ -404,14 +533,40 @@ impl WindowHost {
                 .WindowHandle(&mut hwnd)
                 .ok()?;
         }
+        let frame = presenter_frame::PresenterFrame::hide(window)?;
         let surface = bindings::Grid::new()?;
         surface.cast::<UIElement>()?.SetOpacity(0.0)?;
-        set_bottom_inset(&surface, bottom_inset)?;
+        // The animated root includes the transparent shadow gutter. A receiver
+        // confined to the card bounds would cut off the projected shadow.
+        let receiver = XamlReader::Load(
+            r#"<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="Transparent" IsHitTestVisible="False"/>"#,
+        )?.cast::<bindings::Grid>()?;
+        let caster = XamlReader::Load(
+            r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="Transparent" CornerRadius="12" Translation="0,0,32"><Border.Shadow><ThemeShadow/></Border.Shadow></Border>"#,
+        )?.cast::<bindings::Border>()?;
+        set_card_inset(&caster, inset)?;
+        let shadow =
+            native_object(&caster.cast::<IUIElement>()?, 105)?.cast::<CardThemeShadow>()?;
+        native_object(&shadow, 0)?
+            .cast::<windows_collections::IVector<UIElement>>()?
+            .Append(&receiver.cast::<UIElement>()?)?;
+        let drawing = bindings::Grid::new()?;
         let content = bindings::Grid::new()?;
-        let element = create_backdrop_element()?;
+        let (element, mica) = create_backdrop_element()?;
+        // Draw the one-DIP theme stroke as an overlay, so adding it does not
+        // reduce the application's content viewport or add internal padding.
+        let stroke = XamlReader::Load(
+            r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" BorderBrush="{ThemeResource SurfaceStrokeColorFlyoutBrush}" BorderThickness="1" CornerRadius="12" IsHitTestVisible="False"/>"#,
+        )?.cast::<UIElement>()?;
+        let drawing_children = drawing.cast::<IPanel>()?.Children()?;
+        drawing_children.Append(&element.cast::<UIElement>()?)?;
+        drawing_children.Append(&content.cast::<UIElement>()?)?;
+        drawing_children.Append(&stroke)?;
+        caster.SetChild(&drawing.cast::<UIElement>()?)?;
+        let clip_size_changed = round_content(&drawing)?;
         let surface_children = surface.cast::<IPanel>()?.Children()?;
-        surface_children.Append(&element.cast::<UIElement>()?)?;
-        surface_children.Append(&content.cast::<UIElement>()?)?;
+        surface_children.Append(&receiver.cast::<UIElement>()?)?;
+        surface_children.Append(&caster.cast::<UIElement>()?)?;
         let transparent = TransparentBackdrop::new(hwnd as isize)?;
         move_children(&self.host, &content)?;
         self.host
@@ -420,8 +575,12 @@ impl WindowHost {
             .Append(&surface.cast::<UIElement>()?)?;
         self.card = Some(MicaCard {
             surface,
+            caster,
             content,
             element,
+            mica,
+            _clip_size_changed: clip_size_changed,
+            _frame: frame,
             transparent,
         });
         let card = self.card.as_ref().unwrap();
@@ -462,14 +621,14 @@ impl WindowHost {
         }
     }
 }
-fn set_bottom_inset(surface: &bindings::Grid, bottom_inset: u16) -> Result<()> {
-    surface
+fn set_card_inset(caster: &bindings::Border, inset: u16) -> Result<()> {
+    caster
         .cast::<FrameworkElement>()?
         .SetMargin(bindings::Thickness {
-            left: 0.0,
-            top: 0.0,
-            right: 0.0,
-            bottom: f64::from(bottom_inset),
+            left: f64::from(inset),
+            top: f64::from(inset),
+            right: f64::from(inset),
+            bottom: f64::from(inset),
         })
 }
 fn move_children(from: &bindings::Grid, to: &bindings::Grid) -> Result<()> {
@@ -482,7 +641,7 @@ fn move_children(from: &bindings::Grid, to: &bindings::Grid) -> Result<()> {
     }
     Ok(())
 }
-fn create_backdrop_element() -> Result<BackdropElement> {
+fn create_backdrop_element() -> Result<(BackdropElement, SystemBackdrop)> {
     let factory = windows_core::imp::load_factory::<BackdropElementClass, ElementFactory>()?;
     let mut inner = std::ptr::null_mut();
     let mut raw = std::ptr::null_mut();
@@ -513,7 +672,7 @@ fn create_backdrop_element() -> Result<BackdropElement> {
         .ok()?;
         (element.vtable().set_backdrop)(element.as_raw(), mica.as_raw()).ok()?;
     }
-    Ok(element)
+    Ok((element, mica))
 }
 
 // Transparent host setup follows the public DWM/WinUI composition-brush backdrop pattern.
