@@ -163,7 +163,8 @@ pub fn phonetics(text: &str, cancelled: &dyn Fn() -> bool) -> Result<Phonetics, 
     let Some(word) = dictionary_word(text) else {
         return Ok(Phonetics::default());
     };
-    let path = phonetics_cache_path(word);
+    let word = word.to_ascii_lowercase();
+    let path = phonetics_cache_path(&word);
     if let Some(cached) = cached_phonetics(&path) {
         return if cancelled() {
             Err("已取消".into())
@@ -185,7 +186,10 @@ pub fn phonetics(text: &str, cancelled: &dyn Fn() -> bool) -> Result<Phonetics, 
     }
     let mut response = client
         .get("https://dict.youdao.com/jsonapi")
-        .query(&[("q", word)])
+        .query(&[
+            ("q", word.as_str()),
+            ("dicts", r#"{"count":2,"dicts":[["ec","simple"]]}"#),
+        ])
         .send()
         .map_err(|_| "音标查询连接失败或超时".to_owned())?;
     if !response.status().is_success() {

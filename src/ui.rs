@@ -424,8 +424,21 @@ impl Translator {
                 .tooltip("朗读")
                 .into();
         }
-        Grid::new()
-            .columns([Star(1.0), Star(1.0)])
+        let common_phonetic =
+            self.entry
+                .as_ref()
+                .filter(|entry| {
+                    entry.direction == crate::dictionary::LookupDirection::EnglishToChinese
+                        && entry.word.eq_ignore_ascii_case(pronunciation)
+                        && self.phonetics.as_ref().is_none_or(|value| {
+                            value.british.is_empty() && value.american.is_empty()
+                        })
+                })
+                .map(|entry| entry.phonetic.trim().trim_matches('/').trim())
+                .filter(|phonetic| !phonetic.is_empty());
+        let accents = Grid::new()
+            .columns([Auto, Auto])
+            .horizontal_alignment(HorizontalAlignment::Left)
             .column_spacing(8.0)
             .keyed_children(
                 [
@@ -449,7 +462,8 @@ impl Translator {
                         index,
                         at(
                             Grid::new()
-                                .columns([Auto, Star(1.0), Auto])
+                                .columns([Auto, Auto, Auto])
+                                .horizontal_alignment(HorizontalAlignment::Left)
                                 .column_spacing(4.0)
                                 .children((
                                     text(label, 14.0)
@@ -457,6 +471,7 @@ impl Translator {
                                         .is_hit_test_visible(false)
                                         .vertical_alignment(Center),
                                     text(&phonetic, 14.0)
+                                        .max_width(88.0)
                                         .text_wrapping(TextWrapping::NoWrap)
                                         .text_trimming(TextTrimming::CharacterEllipsis)
                                         .opacity(0.65)
@@ -492,7 +507,28 @@ impl Translator {
                         ),
                     )
                 }),
-            )
+            );
+        Grid::new()
+            .columns([Auto, Auto])
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .children((
+                if let Some(phonetic) = common_phonetic {
+                    text(format!("/{phonetic}/"), 14.0)
+                        .max_width(88.0)
+                        .text_wrapping(TextWrapping::NoWrap)
+                        .text_trimming(TextTrimming::CharacterEllipsis)
+                        .opacity(0.65)
+                        .is_hit_test_visible(false)
+                        .vertical_alignment(Center)
+                        .margin(Thickness::new(0.0, 0.0, 8.0, 0.0))
+                        .automation_name("词典音标，未区分口音")
+                        .tooltip(format!("词典音标 /{phonetic}/（未区分口音）"))
+                        .into()
+                } else {
+                    View::empty()
+                },
+                at(accents, 0, 1),
+            ))
     }
 
     fn invalidate(&mut self) {
@@ -1114,6 +1150,7 @@ impl Translator {
                             .content(text(&translation.target, result_font)),
                         if inline_pronunciation {
                             Border::new()
+                                .horizontal_alignment(HorizontalAlignment::Left)
                                 .vertical_alignment(Center)
                                 .grid_row(1)
                                 .grid_column(1)
@@ -1929,6 +1966,12 @@ impl Component for Translator {
             }
             Message::PhoneticsReady(revision, result) if revision == self.revision => {
                 self.phonetics_task = None;
+                storage::diagnostic(serde_json::json!({
+                    "event": "word_phonetics",
+                    "british": result.as_ref().is_ok_and(|value| !value.british.is_empty()),
+                    "american": result.as_ref().is_ok_and(|value| !value.american.is_empty()),
+                    "error": result.as_ref().err(),
+                }));
                 self.phonetics = result.ok();
             }
             Message::ColorScheme(scheme) => self.color_scheme = scheme,
