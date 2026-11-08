@@ -14,6 +14,7 @@ mod spm;
 mod storage;
 mod ui;
 fn main() {
+    set_process_identity();
     if std::env::args().any(|arg| arg == "--check-configuration") {
         let _ = storage::check_configuration();
         return;
@@ -83,6 +84,16 @@ fn main() {
             &format!("{error}\n请确认已安装 Windows App Runtime 2.4 或更新的 2.x。"),
             background,
         );
+    }
+}
+fn set_process_identity() {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(identity: *const u16) -> i32;
+    }
+    let identity: Vec<u16> = "WinTranslater.Desktop\0".encode_utf16().collect();
+    unsafe {
+        SetCurrentProcessExplicitAppUserModelID(identity.as_ptr());
     }
 }
 fn report_error(error: &str, background: bool) {

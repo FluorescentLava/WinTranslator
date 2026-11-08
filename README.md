@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icons/app.png" width="128" height="128" alt="WinTranslater 图标" />
+</p>
+
 # WinTranslater
 
 用 Rust 编写的 Windows 翻译工具，使用原生 WinUI 3 控件与 Mica 背景。
@@ -17,6 +21,8 @@
 - 开机自启时静默驻留后台，首次唤出时才创建主窗口。关闭主窗口后继续驻留；通过托盘菜单退出。
 
 可见面板宽 480 DIP，高度随内容变化；顶部语言框为 108 × 32 DIP，转换与设置按钮为 32 × 32 DIP。设置窗口为 760 × 540 DIP。面板高度变化带短暂过渡动画，底栏保持固定位置。
+
+设置中的“用量明细”同时显示 DeepL Developer 的累计用量和 DeepL API Free 旧版的本月用量；在线路由顺序显示在卡片下方。两种计划分别读取本机记录，查看明细不会修改所选计划或用量账本。
 
 ## 在线优先与免费额度
 
@@ -106,6 +112,24 @@ cargo test --locked -- --include-ignored
 ```
 
 界面使用本仓库 `vendor/windows-reactor` 中的原生 WinUI 3 封装；依赖版本由 `Cargo.lock` 固定。
+
+## 安装与卸载
+
+构建并准备好运行资源后，使用 PowerShell 安装到当前用户：
+
+```powershell
+.\scripts\install.ps1
+```
+
+默认安装目录为 `%LOCALAPPDATA%\Programs\WinTranslater`。也可使用 `-InstallDirectory` 指定用户目录中的独立 `WinTranslater` 文件夹。安装脚本创建名称为 `WinTranslater` 的开始菜单入口，并登记 Windows“已安装的应用”中的卸载项；无需管理员权限。
+
+已有可运行的文件夹可原地登记，不必移动程序或重新下载模型：
+
+```powershell
+.\scripts\register-app.ps1 -InstallDirectory "$env:USERPROFILE\Documents\WinTranslater"
+```
+
+在 Windows“设置 → 应用 → 已安装的应用”中选择 `WinTranslater` 即可卸载，也可运行安装目录内的 `scripts\uninstall.ps1`。卸载会停止该目录的程序、移除对应的开机自启、开始菜单入口及登记文件清单内的程序资源；默认保留设置、历史和 API 凭据，不删除清单外的文件。安装、登记和卸载脚本均支持 `-WhatIf` 预览。
 
 ## 本地数据
 

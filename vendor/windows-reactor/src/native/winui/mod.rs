@@ -33,6 +33,7 @@ mod backdrop;
 mod bootstrap;
 mod caret;
 mod content_dialog;
+mod input_activation;
 mod slide;
 #[cfg(feature = "test")]
 pub(crate) use content_dialog::LiveContentDialogState;
@@ -1523,9 +1524,22 @@ impl WinUiRuntime {
 
             Command::Focus { node, completion } => {
                 let result = self.ui_element(*node).and_then(|element| {
-                    element
-                        .Focus(FocusState::Programmatic)
-                        .map_err(native_error)
+                    let root = element.XamlRoot().map_err(native_error)?;
+                    let window = self.window_hosts.iter().find_map(|(window_node, host)| {
+                        let host_root = host
+                            .host
+                            .cast::<UIElement>()
+                            .and_then(|host| host.XamlRoot());
+                        (host_root.as_ref().ok() == Some(&root))
+                            .then(|| self.windows.get(window_node))
+                            .flatten()
+                    });
+                    match window {
+                        Some(window) => {
+                            input_activation::focus(&element, window).map_err(native_error)
+                        }
+                        None => Ok(false),
+                    }
                 });
                 _ = completion.call(result);
             }

@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -235,13 +235,41 @@ pub struct ProviderStatus {
 // This snapshot is an estimate of this program's reservations, not account-wide
 // billing data. Reading it never resets or changes the persisted allowance.
 pub fn status(settings: &Settings) -> Vec<ProviderStatus> {
-    let path = storage::data_dir().join("free-api-usage.json");
+    status_at(&storage::data_dir(), settings, Utc::now())
+}
+
+fn status_at(directory: &Path, settings: &Settings, now: DateTime<Utc>) -> Vec<ProviderStatus> {
+    let path = directory.join("free-api-usage.json");
     let ledger: Result<Ledger, String> = match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "免费额度记录损坏".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Ledger::default()),
         Err(_) => Err("免费额度记录无法读取".into()),
     };
-    status_from_ledger(settings, &ledger, Utc::now())
+    usage_details_from_ledger(settings, &ledger, now)
+}
+
+fn usage_details_from_ledger(
+    settings: &Settings,
+    ledger: &Result<Ledger, String>,
+    now: DateTime<Utc>,
+) -> Vec<ProviderStatus> {
+    // A usage report shows both free DeepL ledgers even when the selected route
+    // uses another plan. Only this local clone changes; neither settings nor the
+    // ledger is written, and each plan retains its existing account/period rules.
+    let mut snapshot_settings = settings.clone();
+    snapshot_settings.deepl_plan = DeepLPlan::Developer;
+    let mut rows = status_from_ledger(&snapshot_settings, ledger, now);
+    snapshot_settings.deepl_plan = DeepLPlan::LegacyFree;
+    let legacy = status_from_ledger(&snapshot_settings, ledger, now)
+        .into_iter()
+        .find(|row| row.provider == Provider::DeepL)
+        .unwrap();
+    let developer_index = rows
+        .iter()
+        .position(|row| row.provider == Provider::DeepL)
+        .unwrap();
+    rows.insert(developer_index + 1, legacy);
+    rows
 }
 
 fn status_from_ledger(
@@ -1264,6 +1292,116 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ledger.accounts[&account].used_characters, 2);
+    }
+    #[test]
+    fn usage_details_show_both_free_deepl_ledgers_without_changing_the_selected_plan() {
+        let mut settings = configured(Provider::DeepL);
+        let store = TestStore::with_settings(&settings);
+        let now = date("2026-11-08T12:00:00Z");
+        for (plan, used) in [(DeepLPlan::Developer, 17), (DeepLPlan::LegacyFree, 23)] {
+            settings.deepl_plan = plan;
+            let account = QuotaStore::account(&settings, Provider::DeepL);
+            QuotaStore::new(store.0.directory.clone(), &settings)
+                .reserve(&account, Provider::DeepL, &"中".repeat(used), now)
+                .unwrap();
+        }
+        let path = store.0.directory.join("free-api-usage.json");
+        let original_bytes = fs::read(&path).unwrap();
+        for (plan, free) in [
+            (DeepLPlan::Developer, true),
+            (DeepLPlan::LegacyFree, true),
+            (DeepLPlan::Paid, false),
+            (DeepLPlan::Auto, true),
+            (DeepLPlan::Auto, false),
+        ] {
+            settings.deepl_plan = plan;
+            settings.deepl_free = free;
+            let original_settings = serde_json::to_value(&settings).unwrap();
+            let original_candidates = candidates_at(&settings, now);
+            let rows = status_at(&store.0.directory, &settings, now);
+            assert_eq!(rows.len(), 6);
+            let deepl = rows
+                .iter()
+                .filter(|row| row.provider == Provider::DeepL)
+                .collect::<Vec<_>>();
+            assert_eq!(deepl.len(), 2);
+            assert_eq!(deepl[0].label, "DeepL Developer");
+            assert_eq!(deepl[0].allowance_characters, 1_000_000);
+            assert_eq!(deepl[0].remaining_characters, Some(999_983));
+            assert_eq!(deepl[0].allowance_period, AllowancePeriod::Lifetime);
+            assert_eq!(deepl[1].label, "DeepL API Free（旧版）");
+            assert_eq!(deepl[1].allowance_characters, 500_000);
+            assert_eq!(deepl[1].remaining_characters, Some(499_977));
+            assert_eq!(deepl[1].allowance_period, AllowancePeriod::Monthly);
+            assert!(!rows.iter().any(|row| row.label == DeepLPlan::Paid.name()));
+            assert_eq!(serde_json::to_value(&settings).unwrap(), original_settings);
+            assert_eq!(candidates_at(&settings, now), original_candidates);
+            assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        }
+    }
+    #[test]
+    fn usage_details_refresh_legacy_month_only_in_the_read_only_snapshot() {
+        let mut settings = configured(Provider::DeepL);
+        let store = TestStore::with_settings(&settings);
+        let before = date("2026-11-30T23:59:59Z");
+        for (plan, text) in [
+            (DeepLPlan::Developer, "abc"),
+            (DeepLPlan::LegacyFree, "defgh"),
+        ] {
+            settings.deepl_plan = plan;
+            let account = QuotaStore::account(&settings, Provider::DeepL);
+            QuotaStore::new(store.0.directory.clone(), &settings)
+                .reserve(&account, Provider::DeepL, text, before)
+                .unwrap();
+        }
+        settings.deepl_plan = DeepLPlan::Paid;
+        let path = store.0.directory.join("free-api-usage.json");
+        let original_bytes = fs::read(&path).unwrap();
+        let rows = status_at(&store.0.directory, &settings, date("2026-12-01T00:00:00Z"));
+        let deepl = rows
+            .iter()
+            .filter(|row| row.provider == Provider::DeepL)
+            .collect::<Vec<_>>();
+        assert_eq!(deepl[0].remaining_characters, Some(999_997));
+        assert_eq!(deepl[1].remaining_characters, Some(500_000));
+        assert_eq!(settings.deepl_plan, DeepLPlan::Paid);
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+    }
+    #[test]
+    fn usage_details_keep_both_deepl_totals_when_credentials_or_ledger_are_unavailable() {
+        let store = TestStore::new();
+        let now = date("2026-11-08T12:00:00Z");
+        let rows = status_at(&store.0.directory, &Settings::default(), now);
+        assert!(
+            !store.0.directory.exists(),
+            "reading an absent ledger must not create files"
+        );
+        let deepl = rows
+            .iter()
+            .filter(|row| row.provider == Provider::DeepL)
+            .collect::<Vec<_>>();
+        assert_eq!(deepl.len(), 2);
+        assert_eq!(deepl[0].allowance_characters, 1_000_000);
+        assert_eq!(deepl[1].allowance_characters, 500_000);
+        assert!(
+            deepl
+                .iter()
+                .all(|row| !row.configured && row.remaining_characters.is_none())
+        );
+
+        fs::create_dir_all(&store.0.directory).unwrap();
+        let path = store.0.directory.join("free-api-usage.json");
+        fs::write(&path, b"corrupted").unwrap();
+        let rows = status_at(&store.0.directory, &configured(Provider::DeepL), now);
+        let deepl = rows
+            .iter()
+            .filter(|row| row.provider == Provider::DeepL)
+            .collect::<Vec<_>>();
+        assert_eq!(deepl.len(), 2);
+        assert!(deepl.iter().all(|row| {
+            row.remaining_characters.is_none() && row.message.contains("记录损坏")
+        }));
+        assert_eq!(fs::read(path).unwrap(), b"corrupted");
     }
     #[test]
     fn developer_allowance_persists_across_reopen_months_and_years() {

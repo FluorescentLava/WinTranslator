@@ -1139,10 +1139,6 @@ impl Translator {
                             .style(ButtonStyle::Subtle)
                             .min_width(0.0)
                             .min_height(0.0)
-                            .resource_overrides(
-                                ResourceOverrides::new()
-                                    .set("ControlCornerRadius", CornerRadius::uniform(8.0)),
-                            )
                             .horizontal_alignment(Stretch)
                             .vertical_alignment(VerticalAlignment::Stretch)
                             .horizontal_content_alignment(Stretch)
@@ -1465,53 +1461,71 @@ impl Translator {
             _ => View::empty(),
         };
         let routes = crate::routing::status(&self.settings);
-        let route_rows = StackPanel::new()
-            .spacing(10.0)
-            .keyed_children(routes.into_iter().map(|route| {
-                let description = if !route.configured {
-                    if self.settings_load_warning.is_some() {
-                        "凭据读取失败".to_owned()
+        let route_rows =
+            StackPanel::new()
+                .spacing(10.0)
+                .keyed_children(routes.into_iter().enumerate().map(|(index, route)| {
+                    let note = if !route.configured {
+                        if self.settings_load_warning.is_some() {
+                            "凭据读取失败".to_owned()
+                        } else {
+                            "未配置".to_owned()
+                        }
+                    } else if !route.eligible {
+                        format!("未启用 · {}", route.message)
+                    } else if route.cooldown_seconds > 0 {
+                        format!("暂不可用 · {}", route.message)
+                    } else if route.remaining_characters.is_none() {
+                        route.message.clone()
                     } else {
-                        "未配置".to_owned()
-                    }
-                } else if !route.eligible {
-                    format!("未启用 · {}", route.message)
-                } else if route.cooldown_seconds > 0 {
-                    format!("暂不可用 · {}", route.message)
-                } else if let Some(remaining) = route.remaining_characters {
-                    let period = route.allowance_period.label();
-                    let description = format!(
-                        "{period}剩余 {remaining} / {} 字符（本程序估算）",
-                        route.allowance_characters
-                    );
-                    if let Some(expires_at) = route.expires_at {
-                        format!(
-                            "{description} · 到期 {}",
-                            expires_at
-                                .with_timezone(&chrono::Local)
-                                .format("%Y-%m-%d %H:%M")
-                        )
-                    } else {
+                        String::new()
+                    };
+                    let description = if route.allowance_characters > 0 {
+                        let period = match route.allowance_period {
+                            crate::routing::AllowancePeriod::Lifetime => "累计",
+                            period => period.label(),
+                        };
+                        let used = route
+                            .remaining_characters
+                            .map(|remaining| {
+                                route
+                                    .allowance_characters
+                                    .saturating_sub(remaining)
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "—".to_owned());
+                        let mut description =
+                            format!("{period}已用 {used} / {} 字符", route.allowance_characters);
+                        if let Some(expires_at) = route.expires_at {
+                            description.push_str(&format!(
+                                " · 到期 {}",
+                                expires_at
+                                    .with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M")
+                            ));
+                        }
+                        if !note.is_empty() {
+                            description.push_str(&format!(" · {note}"));
+                        }
                         description
-                    }
-                } else {
-                    route.message
-                };
-                (
-                    route.provider.index(),
-                    Grid::new()
-                        .columns([GridLength::Pixel(90.0), Star(1.0)])
-                        .column_spacing(8.0)
-                        .children((text(route.label, 13.0), muted(description).grid_column(1))),
-                )
-            }));
+                    } else {
+                        note
+                    };
+                    (
+                        index,
+                        Grid::new()
+                            .columns([GridLength::Pixel(150.0), Star(1.0)])
+                            .column_spacing(8.0)
+                            .children((text(route.label, 13.0), muted(description).grid_column(1))),
+                    )
+                }));
         let order = crate::routing::candidates(&self.settings)
             .iter()
             .map(|provider| provider.name())
             .collect::<Vec<_>>()
             .join(" → ");
         let order = if order.is_empty() {
-            "当前为手动离线".to_owned()
+            "手动离线".to_owned()
         } else if self.settings.auto_offline {
             format!("{order} → 本地离线")
         } else {
@@ -1530,11 +1544,11 @@ impl Translator {
                 )),
             ),
             self.card(StackPanel::new().spacing(10.0).children((
-                text("在线路由", 14.0),
-                muted(order),
+                text("用量明细", 14.0),
                 route_rows,
-                muted("只记录本程序的用量；免费额度不足时自动换服务。"),
+                muted("仅统计本程序的用量，包含失败请求的保守预留。"),
             ))),
+            muted(format!("当前在线路由：{order}。免费额度不足时自动换服务。")),
         ))
     }
     fn general_settings(&self, cx: &ViewContext<Self>) -> View {
@@ -2043,7 +2057,7 @@ impl Component for Translator {
                 let keyboard_focus = native::popup_has_keyboard_focus();
                 storage::diagnostic(serde_json::json!({
                     "event":"popup_input_focus", "attempt":attempt,
-                    "xaml_focused":focused, "keyboard_focused":keyboard_focus,
+                    "input_site_verified":focused, "keyboard_focused":keyboard_focus,
                 }));
                 if focused && keyboard_focus {
                     self.repair_caret(cx, 0);
