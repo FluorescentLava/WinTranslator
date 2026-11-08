@@ -40,6 +40,7 @@ pub enum Message {
     Dismiss,
     Drag,
     Show,
+    PopupActivated,
     CaptureSelection,
     SelectionCaptured(u64, Option<String>),
     Quit,
@@ -105,6 +106,7 @@ pub struct Translator {
     status: String,
     error: bool,
     input: ElementRef<TextBox>,
+    provider_button: ElementRef<Button>,
 }
 fn text(value: impl Into<String>, size: f64) -> TextBlock {
     TextBlock::new()
@@ -215,9 +217,10 @@ fn at(view: impl Into<View>, row: i32, column: i32) -> View {
 }
 // Native Fluent vector glyphs use their intrinsic size and centered layout.
 const TRANSLATE: &str = "\u{E8C1}";
-const SWAP: &str = "\u{E8AB}";
 const SETTINGS: &str = "\u{E713}";
 const HISTORY: &str = "\u{E81C}";
+const POPUP_WIDTH: f64 = 480.0;
+const POPUP_CONTENT_WIDTH: f64 = POPUP_WIDTH - 32.0;
 fn icon(path: &str) -> FontIcon {
     FontIcon::new().glyph(path)
 }
@@ -254,15 +257,44 @@ fn field(label: &str, control: impl Into<View>) -> View {
 fn icon_button(path: &str, name: &str, message: Message, cx: &ViewContext<Translator>) -> View {
     Button::new()
         .style(ButtonStyle::Subtle)
-        .width(44.0)
-        .height(44.0)
+        .width(32.0)
+        .height(32.0)
+        .min_width(0.0)
+        .min_height(32.0)
         .padding(6.0)
         .horizontal_content_alignment(HorizontalAlignment::Center)
         .vertical_content_alignment(Center)
         .automation_name(name)
         .on_click(cx.message(message))
-        .content(icon(path))
+        .content(
+            Viewbox::new()
+                .width(16.0)
+                .height(16.0)
+                .stretch(windows_reactor::Stretch::Uniform)
+                .slot(ViewboxSlot::Child, icon(path)),
+        )
         .tooltip(name)
+}
+fn swap_button(cx: &ViewContext<Translator>) -> View {
+    Button::new()
+        .style(ButtonStyle::Subtle)
+        .width(32.0)
+        .height(32.0)
+        .min_width(0.0)
+        .min_height(32.0)
+        .padding(6.0)
+        .horizontal_content_alignment(HorizontalAlignment::Center)
+        .vertical_content_alignment(Center)
+        .automation_name("交换语言")
+        .on_click(cx.message(Message::Swap))
+        .content(
+            PathIcon::new()
+                .data(include_str!("../assets/icons/arrow-swap.path"))
+                .width(20.0)
+                .height(20.0)
+                .opacity(0.72),
+        )
+        .tooltip("交换语言")
 }
 fn theme(settings: &Settings) -> WindowTheme {
     match settings.theme {
@@ -537,11 +569,13 @@ impl Translator {
     }
     fn provider_choices(&self, selected: Provider, compact: bool, cx: &ViewContext<Self>) -> View {
         NavigationView::new()
-            .width(if compact { 320.0 } else { 420.0 })
-            .height(if compact { 264.0 } else { 144.0 })
+            .width(if compact { 248.0 } else { 420.0 })
+            .height(if compact { 248.0 } else { 144.0 })
+            .min_width(0.0)
+            .min_height(0.0)
             .horizontal_alignment(HorizontalAlignment::Left)
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
-            .open_pane_length(if compact { 320.0 } else { 420.0 })
+            .open_pane_length(if compact { 248.0 } else { 420.0 })
             .menu_columns(if compact { 1 } else { 3 })
             .is_pane_open(true)
             .is_pane_toggle_button_visible(false)
@@ -617,10 +651,11 @@ impl Translator {
             )])
     }
     fn close_provider_picker(&mut self) {
+        let _ = self.provider_button.request_hide_flyout();
         self.provider_picker_open = false;
         self.provider_picker_selected = None;
         self.provider_picker_revision = self.provider_picker_revision.wrapping_add(1);
-        if !self.settings_window {
+        if !self.settings_window && native::popup_is_foreground() {
             let _ = self.input.request_focus();
         }
     }
@@ -682,7 +717,7 @@ impl Translator {
                     .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'')
         });
         let long_input = self.text.chars().count() > 80
-            || visual_lines(&self.text, 23.0, 502.0) > 2
+            || visual_lines(&self.text, 23.0, POPUP_CONTENT_WIDTH - 12.0) > 2
             || self
                 .text
                 .lines()
@@ -691,7 +726,9 @@ impl Translator {
                 > 1;
         let input_font = if long_input { 15.0 } else { 23.0 };
         let input_line_height = if long_input { 21.0 } else { 32.0 };
-        let input_height = (visual_lines(&self.text, input_font, 502.0) as f64 * input_line_height
+        let input_height = (visual_lines(&self.text, input_font, POPUP_CONTENT_WIDTH - 12.0)
+            as f64
+            * input_line_height
             + 12.0)
             .clamp(60.0, 180.0);
         let fixed_height = 119.0 + input_height;
@@ -702,7 +739,7 @@ impl Translator {
         let result_font = self.output.as_ref().map_or(23.0, |translation| {
             if long_input
                 || translation.target.chars().count() > 80
-                || visual_lines(&translation.target, 23.0, 472.0) > 2
+                || visual_lines(&translation.target, 23.0, POPUP_CONTENT_WIDTH - 56.0) > 2
                 || translation
                     .target
                     .lines()
@@ -716,8 +753,24 @@ impl Translator {
             }
         });
         let result_line_height = if result_font == 15.0 { 21.0 } else { 32.0 };
+        let pronunciation_width = self.phonetics.as_ref().map_or(104.0, |phonetics| {
+            [&phonetics.british, &phonetics.american]
+                .into_iter()
+                .map(|value| {
+                    let length = value.trim().trim_matches('/').chars().count();
+                    let phonetic = if length == 0 {
+                        0.0
+                    } else {
+                        (length + 2) as f64 * 8.4
+                    };
+                    (48.0 + phonetic).min(160.0)
+                })
+                .sum::<f64>()
+                + 8.0
+        });
         let inline_pronunciation = self.pronunciation_text().is_some()
             && self.entry.is_some()
+            && pronunciation_width <= POPUP_CONTENT_WIDTH - 180.0
             && self.output.as_ref().is_some_and(|translation| {
                 visual_lines(&translation.target, result_font, 120.0) == 1
             });
@@ -738,7 +791,7 @@ impl Translator {
             }
         });
         let notice_height = result_notice.map_or(0.0, |notice| {
-            visual_lines(notice, 12.0, 496.0) as f64 * 18.0 + 6.0
+            visual_lines(notice, 12.0, POPUP_CONTENT_WIDTH - 32.0) as f64 * 18.0 + 6.0
         });
         let metadata = self
             .entry
@@ -751,12 +804,18 @@ impl Translator {
         let (result_height, rendered_result_height) = if let Some(translation) = &self.output {
             if self.entry.is_some() {
                 let metadata_height = metadata.as_ref().map_or(0.0, |value| {
-                    let width = if inline_pronunciation { 120.0 } else { 472.0 };
+                    let width = if inline_pronunciation {
+                        120.0
+                    } else {
+                        POPUP_CONTENT_WIDTH - 56.0
+                    };
                     visual_lines(value, 14.0, width) as f64 * 20.0 + 6.0
                 });
                 let header_fixed = 28.0 + metadata_height + pronunciation_height;
-                let estimated_target = visual_lines(&translation.target, result_font, 472.0) as f64
-                    * result_line_height;
+                let estimated_target =
+                    visual_lines(&translation.target, result_font, POPUP_CONTENT_WIDTH - 56.0)
+                        as f64
+                        * result_line_height;
                 let closed_target =
                     estimated_target.min((available_result - header_fixed).max(result_line_height));
                 let open_target = estimated_target
@@ -764,7 +823,10 @@ impl Translator {
                 let open_header = header_fixed + open_target;
                 let meanings_height = dictionary_senses
                     .iter()
-                    .map(|sense| visual_lines(&sense.definition, 15.0, 412.0) as f64 * 21.0)
+                    .map(|sense| {
+                        visual_lines(&sense.definition, 15.0, POPUP_CONTENT_WIDTH - 118.0) as f64
+                            * 21.0
+                    })
                     .sum::<f64>()
                     + dictionary_senses.len().saturating_sub(1) as f64 * 12.0;
                 details_height =
@@ -788,14 +850,17 @@ impl Translator {
                     + notice_height
                     + pronunciation_height
                     + word_metadata
-                    + visual_lines(&translation.target, result_font, 496.0) as f64
+                    + visual_lines(&translation.target, result_font, POPUP_CONTENT_WIDTH - 32.0)
+                        as f64
                         * result_line_height)
                     .min(available_result);
                 (height, height)
             }
         } else if self.error {
-            let height = (visual_lines(&self.status, 12.0, 502.0).min(4) as f64 * 18.0 + 4.0)
-                .min(available_result);
+            let height =
+                (visual_lines(&self.status, 12.0, POPUP_CONTENT_WIDTH - 12.0).min(4) as f64 * 18.0
+                    + 4.0)
+                    .min(available_result);
             (height, height)
         } else {
             (0.0, 0.0)
@@ -807,19 +872,13 @@ impl Translator {
         } else {
             fixed_height.max(184.0).min(480.0)
         };
-        let height = if self.provider_picker_open {
-            natural_height.max(322.0)
-        } else {
-            natural_height
-        };
-        let transition_key = u64::from(details_open)
-            | (u64::from(self.provider_picker_open) << 1)
-            | (u64::from(expanded) << 2)
-            | (u64::from(self.error) << 3);
+        let height = natural_height;
+        let transition_key =
+            u64::from(details_open) | (u64::from(expanded) << 2) | (u64::from(self.error) << 3);
         cx.window_title("翻译");
         cx.window_visuals(
             WindowVisuals::new()
-                .client_size(558.0, 184.0)
+                .client_size(POPUP_WIDTH, 184.0)
                 .backdrop(WindowBackdrop::Mica)
                 .theme(theme(&self.settings)),
         );
@@ -828,7 +887,7 @@ impl Translator {
             "popup-target",
             (transition_key, height.to_bits()),
             move || {
-                native::configure_popup_with_key(558.0, height, transition_key);
+                native::configure_popup_with_key(POPUP_WIDTH, height, transition_key);
                 native::escape_handler(move || {
                     let _ = dismiss.call(());
                 });
@@ -851,9 +910,10 @@ impl Translator {
                 None
             },
         );
-        let input_focus = self.input.clone();
-        cx.use_effect("input-focus", (), move || {
-            let _ = input_focus.request_focus();
+        cx.use_effect("popup-initial-show", (), move || {
+            // The first WinUI Activate can inherit SW_HIDE from silent startup.
+            // Use the same committed-frame show/activation path as later opens.
+            native::show_popup();
             None
         });
         let caret_sender = cx.sender();
@@ -864,32 +924,40 @@ impl Translator {
         let (from, to) = self.language_indices();
         let languages = Grid::new()
             .columns([Auto, Auto, Auto, Auto, Star(1.0), Auto])
-            .column_spacing(4.0)
+            .column_spacing(8.0)
             .children((
                 Border::new()
-                    .width(44.0)
-                    .height(44.0)
+                    .width(32.0)
+                    .height(32.0)
                     .vertical_alignment(Center)
                     .content(
-                        icon(TRANSLATE)
+                        Viewbox::new()
+                            .width(20.0)
+                            .height(20.0)
+                            .stretch(windows_reactor::Stretch::Uniform)
                             .horizontal_alignment(HorizontalAlignment::Center)
-                            .vertical_alignment(Center),
+                            .vertical_alignment(Center)
+                            .slot(ViewboxSlot::Child, icon(TRANSLATE)),
                     ),
                 ComboBox::new()
                     .items_source(LANGUAGES.iter().map(popup_language))
                     .selected_index(from)
-                    .width(144.0)
-                    .height(44.0)
+                    .width(108.0)
+                    .height(32.0)
+                    .min_width(0.0)
+                    .min_height(32.0)
                     .vertical_alignment(Center)
                     .automation_name("源语言")
                     .on_selection_changed(cx.callback(Message::Source))
                     .grid_column(1),
-                at(icon_button(SWAP, "交换语言", Message::Swap, cx), 0, 2),
+                at(swap_button(cx), 0, 2),
                 ComboBox::new()
                     .items_source(LANGUAGES.iter().skip(1).map(popup_language))
                     .selected_index(to - 1)
-                    .width(132.0)
-                    .height(44.0)
+                    .width(108.0)
+                    .height(32.0)
+                    .min_width(0.0)
+                    .min_height(32.0)
                     .vertical_alignment(Center)
                     .automation_name("目标语言")
                     .on_selection_changed(cx.callback(Message::Target))
@@ -1194,14 +1262,16 @@ impl Translator {
             .as_ref()
             .map_or(self.settings.provider, |translation| translation.provider);
         let provider = self.pending_provider.unwrap_or(actual_provider);
+        let closed = cx.message(Message::ProviderPicker(false));
         let state = Button::new()
+            .element_ref(&self.provider_button)
             .style(ButtonStyle::Subtle)
             .height(32.0)
             .min_height(32.0)
             .padding(Thickness::new(6.0, 4.0, 6.0, 4.0))
             .horizontal_alignment(HorizontalAlignment::Left)
             .automation_name("选择翻译服务")
-            .on_click(cx.message(Message::ProviderPicker(!self.provider_picker_open)))
+            .on_click(cx.message(Message::ProviderPicker(true)))
             .content(
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
@@ -1222,8 +1292,21 @@ impl Translator {
                         .vertical_alignment(Center),
                     )),
             )
-            .tooltip("选择翻译服务");
-        let state = Grid::new().keyed_children([(self.settings.provider.index(), state)]);
+            .flyout_with(
+                Flyout::rich(self.provider_choices(
+                    self.provider_picker_selected.unwrap_or(provider),
+                    true,
+                    cx,
+                ))
+                .placement(FlyoutPlacement::TopEdgeAlignedLeft)
+                .constrain_to_root_bounds(false)
+                .padding(0.0)
+                .min_width(0.0)
+                .min_height(0.0)
+                .on_closed(move || {
+                    let _ = closed.call(());
+                }),
+            );
         let footer = Grid::new()
             .columns([Auto, Star(1.0)])
             .column_spacing(8.0)
@@ -1243,7 +1326,7 @@ impl Translator {
             .height(frame_height)
             .vertical_alignment(VerticalAlignment::Top)
             .corner_radius(12.0)
-            .padding(Thickness::new(14.0, 12.0, 14.0, 10.0))
+            .padding(Thickness::new(16.0, 12.0, 16.0, 10.0))
             .on_pointer_pressed(cx.callback(|point: PointerEventInfo| {
                 if point.window_y < 8.0 {
                     Message::Drag
@@ -1267,36 +1350,7 @@ impl Translator {
                         at(footer, 3, 0),
                     )),
             );
-        let dismiss_layer: View = if self.provider_picker_open {
-            Border::new()
-                .background(Color::transparent())
-                .on_pointer_pressed(
-                    cx.callback(|_: PointerEventInfo| Message::ProviderPicker(false)),
-                )
-                .content(View::empty())
-        } else {
-            View::empty()
-        };
-        let choices: View = if self.provider_picker_open {
-            Border::new()
-                .background(ThemeBrush::SolidBackground)
-                .border_brush(ThemeBrush::CardStroke)
-                .border_thickness(1.0)
-                .corner_radius(8.0)
-                .width(322.0)
-                .height(266.0)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .vertical_alignment(VerticalAlignment::Bottom)
-                .margin(Thickness::new(16.0, 0.0, 0.0, 44.0))
-                .content(self.provider_choices(
-                    self.provider_picker_selected.unwrap_or(provider),
-                    true,
-                    cx,
-                ))
-        } else {
-            View::empty()
-        };
-        Grid::new().children((surface, dismiss_layer, choices))
+        surface.into()
     }
     fn provider_settings(&self, cx: &ViewContext<Self>) -> View {
         let provider = self.settings.provider;
@@ -1649,6 +1703,7 @@ impl Component for Translator {
             native::install_handler(move |action| {
                 let _ = sender.send(match action {
                     native::Action::Show => Message::Show,
+                    native::Action::PopupActivated => Message::PopupActivated,
                     native::Action::TranslateSelection => Message::CaptureSelection,
                     native::Action::Settings => Message::OpenSettings,
                     native::Action::Quit => Message::Quit,
@@ -1715,6 +1770,7 @@ impl Component for Translator {
             status: warning.clone().unwrap_or_default(),
             error: warning.is_some(),
             input: ElementRef::new(),
+            provider_button: ElementRef::new(),
         }
     }
     fn update(&mut self, message: Message, cx: &ComponentContext<Self>) {
@@ -1868,8 +1924,6 @@ impl Component for Translator {
                 self.cancel_selection();
                 self.close_provider_picker();
                 native::show_popup();
-                let _ = self.input.request_focus();
-                self.repair_caret(cx, 0);
                 if self
                     .output
                     .as_ref()
@@ -1878,6 +1932,10 @@ impl Component for Translator {
                 {
                     self.schedule(cx);
                 }
+            }
+            Message::PopupActivated if native::popup_is_foreground() => {
+                let _ = self.input.request_focus();
+                self.repair_caret(cx, 0);
             }
             Message::CaptureSelection => {
                 self.cancel_selection();

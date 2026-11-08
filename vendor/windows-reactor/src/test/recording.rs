@@ -711,8 +711,24 @@ impl RecordingRuntime {
                     .ok_or(RuntimeError::MissingNode(*node))?;
                 _ = completion.call(Ok(true));
             }
-            Command::SetTextBoxCaretColor { node, completion, .. } => {
-                let recorded = self.nodes.get(node).ok_or(RuntimeError::MissingNode(*node))?;
+            Command::HideFlyout { node, completion } => {
+                let recorded = self
+                    .nodes
+                    .get(node)
+                    .ok_or(RuntimeError::MissingNode(*node))?;
+                _ = completion.call(if recorded.kind == Some(MountedKind::Button) {
+                    Ok(self.flyouts.contains_key(node))
+                } else {
+                    Err(RuntimeError::UnsupportedKind)
+                });
+            }
+            Command::SetTextBoxCaretColor {
+                node, completion, ..
+            } => {
+                let recorded = self
+                    .nodes
+                    .get(node)
+                    .ok_or(RuntimeError::MissingNode(*node))?;
                 _ = completion.call(if recorded.kind == Some(MountedKind::TextBox) {
                     Ok(false)
                 } else {
@@ -922,6 +938,7 @@ impl RecordingRuntime {
                 target,
                 content,
                 placement,
+                ..
             } => {
                 let target_node = self
                     .nodes

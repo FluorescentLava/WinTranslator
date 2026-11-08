@@ -47,6 +47,13 @@ impl<R: NativeRuntime> Pump<R> {
                     }
                     commands.push(Command::Focus { node, completion });
                 }
+                ImperativeRequest::HideFlyout { node, completion } => {
+                    if self.tree.try_native(node).is_none() {
+                        _ = completion.call(Err(RuntimeError::MissingNode(node)));
+                        continue;
+                    }
+                    commands.push(Command::HideFlyout { node, completion });
+                }
                 ImperativeRequest::SetTextBoxCaretColor {
                     node,
                     color,
@@ -224,6 +231,12 @@ impl<R: NativeRuntime> Pump<R> {
                 continue;
             }
             let callback_accepted = match &queued.work {
+                HostEvent::FlyoutClosed { owner, revision } => {
+                    let Some(callback) = self.tree.flyout_closed_callback(*owner, *revision) else {
+                        continue;
+                    };
+                    callback.call(())
+                }
                 HostEvent::WindowSize { observation, size } => {
                     let current = self
                         .tree

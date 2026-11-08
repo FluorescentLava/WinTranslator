@@ -285,6 +285,37 @@ impl<T: FocusControl> ElementRef<T> {
     }
 }
 
+impl ElementRef<crate::Button> {
+    /// Enqueues Hide for this button's attached rich-content flyout.
+    ///
+    /// Native dismissal, focus restoration, and animations remain owned by WinUI. `true` means
+    /// the request entered the host queue; it does not mean the flyout was open.
+    #[must_use = "false means the reference is currently unbound or its queue is full"]
+    pub fn request_hide_flyout(&self) -> bool {
+        self.request_hide_flyout_result(|_| {})
+    }
+
+    /// Enqueues Hide and reports whether the button had a published rich-content flyout.
+    #[must_use = "false means the reference is currently unbound or its queue is full"]
+    pub fn request_hide_flyout_result(
+        &self,
+        completion: impl Fn(Result<bool, IntegrationError>) + 'static,
+    ) -> bool {
+        let Some(binding) = self.target.borrow().binding.clone() else {
+            return false;
+        };
+        binding.endpoint.enqueue(NativeWork {
+            identity: binding.identity,
+            work: ImperativeRequest::HideFlyout {
+                node: binding.node,
+                completion: Callback::new(move |result: Result<bool, RuntimeError>| {
+                    completion(result.map_err(IntegrationError::from_runtime));
+                }),
+            },
+        })
+    }
+}
+
 impl ElementRef<crate::TextBox> {
     /// Enqueues a color override for this text box's native insertion caret.
     ///
@@ -855,6 +886,10 @@ pub(crate) enum ImperativeRequest {
         node: NodeId,
         completion: Callback<Result<bool, RuntimeError>>,
     },
+    HideFlyout {
+        node: NodeId,
+        completion: Callback<Result<bool, RuntimeError>>,
+    },
     SetTextBoxCaretColor {
         node: NodeId,
         color: crate::Color,
@@ -904,6 +939,7 @@ impl ImperativeRequest {
     pub(crate) fn complete_unavailable(self) {
         match self {
             Self::Focus { node, completion }
+            | Self::HideFlyout { node, completion }
             | Self::SetTextBoxCaretColor {
                 node, completion, ..
             } => {

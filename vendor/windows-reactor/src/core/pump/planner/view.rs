@@ -403,6 +403,7 @@ impl<R: NativeRuntime> Pump<R> {
                 };
                 let current_target = *current_target;
                 let current_content = *current_content;
+                let settings_changed = tree.set_flyout_settings(node, flyout.settings);
                 Self::reconcile_planned_view(
                     tree,
                     current_target,
@@ -419,7 +420,13 @@ impl<R: NativeRuntime> Pump<R> {
                     changes,
                     plan,
                 )?;
-                Self::refresh_flyout_attachment(tree, node, flyout.placement, plan)?;
+                Self::refresh_flyout_attachment(
+                    tree,
+                    node,
+                    flyout.placement,
+                    settings_changed,
+                    plan,
+                )?;
                 Ok(node)
             }
             ViewKind::Menu { target, menu } => {
@@ -859,7 +866,9 @@ impl<R: NativeRuntime> Pump<R> {
                 Self::node_matches_view_kind(tree, *content, tooltip.content.as_kind())
             }
             ViewKind::Flyout { target, flyout } => {
-                if tree.kind(node) != NodeKind::Flyout(flyout.placement) {
+                if tree.kind(node) != NodeKind::Flyout(flyout.placement)
+                    || !tree.flyout_settings_match(node, &flyout.settings)
+                {
                     return Ok(false);
                 }
                 let [current_target, current_content] = tree.children(node) else {
@@ -1242,7 +1251,7 @@ impl<R: NativeRuntime> Pump<R> {
                     Self::refresh_tooltip_attachment(tree, owner, placement, plan)?;
                 }
                 NativeAttachment::Flyout { owner, placement } => {
-                    Self::refresh_flyout_attachment(tree, owner, placement, plan)?;
+                    Self::refresh_flyout_attachment(tree, owner, placement, false, plan)?;
                 }
                 NativeAttachment::ContentDialog => {}
             }
@@ -1469,6 +1478,7 @@ impl<R: NativeRuntime> Pump<R> {
 
         let placement = flyout.placement;
         let owner = tree.insert_flyout(Some(parent), key, placement);
+        tree.set_flyout_settings(owner, flyout.settings);
         tree.reparent(target, owner, None);
         let (_, content_native) = Self::mount_planned_view(
             tree,
@@ -1490,7 +1500,7 @@ impl<R: NativeRuntime> Pump<R> {
         children.remove(appended);
         children.insert(index, owner);
         tree.set_children(parent, children);
-        Self::refresh_flyout_attachment(tree, owner, placement, plan)?;
+        Self::refresh_flyout_attachment(tree, owner, placement, false, plan)?;
         debug_assert_eq!(
             tree.flyout_attachment(owner),
             Some((Self::native_root(tree, target)?, *content_native))
@@ -1655,7 +1665,7 @@ impl<R: NativeRuntime> Pump<R> {
                 Self::refresh_tooltip_attachment(tree, owner, placement, plan)?;
             }
             (NativeAttachment::Flyout { owner, placement }, None) => {
-                Self::refresh_flyout_attachment(tree, owner, placement, plan)?;
+                Self::refresh_flyout_attachment(tree, owner, placement, false, plan)?;
             }
             (
                 NativeAttachment::ChildList {
@@ -1706,7 +1716,7 @@ impl<R: NativeRuntime> Pump<R> {
             let NodeKind::Flyout(placement) = tree.kind(owner) else {
                 return Err(PumpError::StructureUnsupported);
             };
-            Self::refresh_flyout_attachment(tree, owner, placement, plan)?;
+            Self::refresh_flyout_attachment(tree, owner, placement, false, plan)?;
         }
         if let Some(owner) = owned_attachment_owner {
             Self::refresh_owned_attachment(tree, owner, plan)?;
@@ -1956,6 +1966,7 @@ impl<R: NativeRuntime> Pump<R> {
                 }
                 let placement = flyout.placement;
                 let node = tree.insert_flyout(logical_parent, key, placement);
+                tree.set_flyout_settings(node, flyout.settings);
                 let (_, target_native) = Self::mount_planned_view(
                     tree,
                     Some(node),
@@ -1987,11 +1998,7 @@ impl<R: NativeRuntime> Pump<R> {
                     return Err(PumpError::StructureUnsupported);
                 }
                 tree.set_flyout_attachment(node, Some((*target, *content)));
-                plan.push(Command::SetFlyout {
-                    target: *target,
-                    content: Some(*content),
-                    placement,
-                });
+                plan.push(tree.flyout_command(node, *target, Some(*content), placement));
                 Ok((node, vec![*target]))
             }
             ViewKind::Menu { target, menu } => {

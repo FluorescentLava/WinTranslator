@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::Thickness as FlyoutPadding;
 use windows_core::Interface;
 
 windows_core::link!("kernel32.dll" "system" fn FindResourceW(module: *mut std::ffi::c_void, name: *const u16, resource_type: *const u16) -> *mut std::ffi::c_void);
@@ -160,7 +161,7 @@ pub struct WinUiRuntime {
     controlled_collection_indices: HashMap<NodeId, i32>,
     content_dialogs: Rc<RefCell<ContentDialogScheduler>>,
     drop_policies: Rc<RefCell<HashMap<NodeId, DragDropPolicy>>>,
-    flyouts: HashMap<NodeId, (bindings::Flyout, NodeId)>,
+    flyouts: HashMap<NodeId, NativeFlyout>,
     owned_menus: HashMap<NodeId, NativeOwnedMenu>,
     pointer_capture: Rc<RefCell<HashMap<NodeId, bool>>>,
     resource_override_keys: HashMap<NodeId, HashSet<String>>,
@@ -309,6 +310,14 @@ struct NativeOwnedMenu {
     kind: OwnedMenuKind,
     _flyout: Option<MenuFlyout>,
     _revokers: Vec<windows_core::EventRevoker>,
+}
+
+struct NativeFlyout {
+    flyout: bindings::Flyout,
+    content: NodeId,
+    presenter: (Option<FlyoutPadding>, Option<f64>, Option<f64>),
+    constrain_to_root_bounds: Option<bool>,
+    closed: Option<((NodeId, u32), windows_core::EventRevoker)>,
 }
 
 struct NativeCommandBarFlyout {
@@ -1462,7 +1471,7 @@ impl WinUiRuntime {
                 }
                 self.cancel_retirements_for_node(*node)?;
                 if self.flyouts.contains_key(node)
-                    || self.flyouts.values().any(|(_, content)| content == node)
+                    || self.flyouts.values().any(|flyout| flyout.content == *node)
                     || self.owned_menus.values().any(|menu| menu.target == *node)
                     || self
                         .command_bar_flyouts
@@ -1496,6 +1505,21 @@ impl WinUiRuntime {
                         .Focus(FocusState::Programmatic)
                         .map_err(native_error)
                 });
+                _ = completion.call(result);
+            }
+            Command::HideFlyout { node, completion } => {
+                let result = match self.handles.get(node) {
+                    Some(Handle::Button(_)) => self.flyouts.get(node).map_or(Ok(false), |state| {
+                        state
+                            .flyout
+                            .cast::<IFlyoutBase>()
+                            .and_then(|flyout| flyout.Hide())
+                            .map(|()| true)
+                            .map_err(native_error)
+                    }),
+                    Some(_) => Err(RuntimeError::UnsupportedKind),
+                    None => Err(RuntimeError::MissingNode(*node)),
+                };
                 _ = completion.call(result);
             }
             Command::SetTextBoxCaretColor {
@@ -2166,6 +2190,11 @@ impl WinUiRuntime {
                 target,
                 content,
                 placement,
+                padding,
+                min_width,
+                min_height,
+                constrain_to_root_bounds,
+                closed,
             } => {
                 let target_handle = self
                     .handles
@@ -2175,19 +2204,24 @@ impl WinUiRuntime {
                     if self
                         .flyouts
                         .iter()
-                        .any(|(owner, (_, owned))| owner != target && owned == content)
+                        .any(|(owner, state)| owner != target && state.content == *content)
                     {
                         return Err(RuntimeError::AlreadyParented(*content));
                     }
                     let content_element = self.ui_element(*content)?;
-                    let flyout = if let Some((flyout, previous_content)) = self.flyouts.get(target)
-                    {
-                        if previous_content != content {
-                            flyout
+                    let mut state = if let Some(mut state) = self.flyouts.remove(target) {
+                        if state.content != *content {
+                            state
+                                .flyout
                                 .SetContent(None::<&UIElement>)
                                 .map_err(native_error)?;
+                            state
+                                .flyout
+                                .SetContent(&content_element)
+                                .map_err(native_error)?;
+                            state.content = *content;
                         }
-                        flyout.clone()
+                        state
                     } else {
                         let flyout = bindings::Flyout::new().map_err(native_error)?;
                         match &target_handle {
@@ -2196,9 +2230,85 @@ impl WinUiRuntime {
                             _ => return Err(RuntimeError::UnsupportedKind),
                         }
                         .map_err(native_error)?;
-                        flyout
+                        flyout.SetContent(&content_element).map_err(native_error)?;
+                        NativeFlyout {
+                            flyout,
+                            content: *content,
+                            presenter: (None, None, None),
+                            constrain_to_root_bounds: None,
+                            closed: None,
+                        }
                     };
-                    flyout.SetContent(&content_element).map_err(native_error)?;
+                    let flyout = &state.flyout;
+                    if state.constrain_to_root_bounds != *constrain_to_root_bounds {
+                        flyout
+                            .cast::<IFlyoutBase>()
+                            .and_then(|flyout| {
+                                flyout.SetShouldConstrainToRootBounds(
+                                    constrain_to_root_bounds.unwrap_or(true),
+                                )
+                            })
+                            .map_err(native_error)?;
+                        state.constrain_to_root_bounds = *constrain_to_root_bounds;
+                    }
+                    let presenter = (padding.clone(), *min_width, *min_height);
+                    if state.presenter != presenter {
+                        if padding.is_none() && min_width.is_none() && min_height.is_none() {
+                            flyout
+                                .SetFlyoutPresenterStyle(None::<&Style>)
+                                .map_err(native_error)?;
+                        } else {
+                            let mut xaml = String::from(
+                                "<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' TargetType='FlyoutPresenter'>",
+                            );
+                            if let Some(padding) = padding {
+                                write!(
+                                    xaml,
+                                    "<Setter Property='Padding' Value='{},{},{},{}'/>",
+                                    padding.left(),
+                                    padding.top(),
+                                    padding.right(),
+                                    padding.bottom()
+                                )
+                                .unwrap();
+                            }
+                            if let Some(width) = min_width {
+                                write!(xaml, "<Setter Property='MinWidth' Value='{width}'/>")
+                                    .unwrap();
+                            }
+                            if let Some(height) = min_height {
+                                write!(xaml, "<Setter Property='MinHeight' Value='{height}'/>")
+                                    .unwrap();
+                            }
+                            xaml.push_str("</Style>");
+                            let style = XamlReader::Load(&xaml)
+                                .and_then(|value| value.cast::<Style>())
+                                .map_err(native_error)?;
+                            flyout
+                                .SetFlyoutPresenterStyle(&style)
+                                .map_err(native_error)?;
+                        }
+                        state.presenter = presenter;
+                    }
+                    if state.closed.as_ref().map(|(observation, _)| observation) != closed.as_ref()
+                    {
+                        state.closed = None;
+                        if let Some((owner, revision)) = *closed {
+                            let sink = self.event_sink()?;
+                            let subscription = flyout
+                                .cast::<IFlyoutBase>()
+                                .and_then(|flyout| {
+                                    flyout.Closed(move |_, _| {
+                                        sink.enqueue_host(HostEvent::FlyoutClosed {
+                                            owner,
+                                            revision,
+                                        });
+                                    })
+                                })
+                                .map_err(native_error)?;
+                            state.closed = Some(((owner, revision), subscription));
+                        }
+                    }
                     flyout
                         .cast::<IFlyoutBase>()
                         .and_then(|flyout| {
@@ -2236,10 +2346,17 @@ impl WinUiRuntime {
                             })
                         })
                         .map_err(native_error)?;
-                    self.flyouts.insert(*target, (flyout, *content));
+                    self.flyouts.insert(*target, state);
                 } else {
-                    if let Some((flyout, _)) = self.flyouts.get(target) {
-                        flyout
+                    if let Some(mut state) = self.flyouts.remove(target) {
+                        state.closed = None;
+                        state
+                            .flyout
+                            .cast::<IFlyoutBase>()
+                            .and_then(|flyout| flyout.Hide())
+                            .map_err(native_error)?;
+                        state
+                            .flyout
                             .SetContent(None::<&UIElement>)
                             .map_err(native_error)?;
                     }
@@ -2249,7 +2366,6 @@ impl WinUiRuntime {
                         _ => return Err(RuntimeError::UnsupportedKind),
                     }
                     .map_err(native_error)?;
-                    self.flyouts.remove(target);
                 }
             }
             Command::SetOwnedMenu {
@@ -3642,8 +3758,13 @@ impl NativeRuntime for WinUiRuntime {
         self.owned_menus.clear();
         self.command_bar_flyouts.clear();
         content_dialog::reset(&self.content_dialogs);
-        for (target, (flyout, _)) in self.flyouts.drain() {
-            _ = flyout.SetContent(None::<&UIElement>);
+        for (target, mut state) in self.flyouts.drain() {
+            state.closed = None;
+            _ = state
+                .flyout
+                .cast::<IFlyoutBase>()
+                .and_then(|flyout| flyout.Hide());
+            _ = state.flyout.SetContent(None::<&UIElement>);
             match self.handles.get(&target) {
                 Some(Handle::Button(button)) => {
                     _ = button.SetFlyout(None::<&FlyoutBase>);

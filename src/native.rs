@@ -129,6 +129,7 @@ struct PendingPopupFrame {
 #[derive(Clone, Copy)]
 pub enum Action {
     Show,
+    PopupActivated,
     TranslateSelection,
     Settings,
     Quit,
@@ -143,7 +144,7 @@ thread_local! {
     static ORIGINAL_PROC: Cell<isize> = const { Cell::new(0) };
     static POPUP: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
     static ANCHOR: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
-    static SIZE: Cell<(f64, f64)> = const { Cell::new((558.0, 184.0)) };
+    static SIZE: Cell<(f64, f64)> = const { Cell::new((480.0, 184.0)) };
     static TASKBAR_MESSAGE: Cell<u32> = const { Cell::new(0) };
     static STARTUP_WARNING: RefCell<Option<String>> = const { RefCell::new(None) };
     static PENDING_ACTION: Cell<Option<Action>> = const { Cell::new(None) };
@@ -157,6 +158,7 @@ thread_local! {
     static MANUAL_MOVE: Cell<bool> = const { Cell::new(false) };
     static DEFER_EXTERNAL_GEOMETRY: Cell<bool> = const { Cell::new(false) };
     static SHOW_AFTER_FRAME: Cell<bool> = const { Cell::new(false) };
+    static POPUP_PRESENTED: Cell<bool> = const { Cell::new(false) };
     static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 #[link(name = "user32")]
@@ -202,6 +204,8 @@ unsafe extern "system" {
     fn SendMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> isize;
     fn PostMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
     fn SetForegroundWindow(window: Hwnd) -> i32;
+    fn GetForegroundWindow() -> Hwnd;
+    fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
     fn GetWindowThreadProcessId(window: Hwnd, process: *mut u32) -> u32;
     fn AllowSetForegroundWindow(process: u32) -> i32;
     fn SetWindowsHookExW(
@@ -505,11 +509,8 @@ pub fn commit_popup_frame(frame: PopupFrame) {
     }
     if frame.finished {
         finish_resize(pending.window);
-        if SHOW_AFTER_FRAME.with(Cell::take) && prepare_activation(pending.window) {
-            unsafe {
-                ShowWindow(pending.window, 5);
-                SetForegroundWindow(pending.window);
-            }
+        if SHOW_AFTER_FRAME.with(Cell::take) {
+            activate_popup(pending.window);
         }
         request_refresh(pending.window);
     } else {
@@ -1158,19 +1159,95 @@ fn prepare_activation(window: Hwnd) -> bool {
     }
     ready
 }
+
+/// Share the current foreground queue only during the requested activation.
+/// UIA selection capture and a committed XAML frame can outlive the hotkey's
+/// foreground permission. Attaching here makes the one SetForegroundWindow
+/// synchronous with that queue; it does not inject input or change desktops.
+struct InputQueueAttachment {
+    foreground_thread: u32,
+    attached: bool,
+}
+impl InputQueueAttachment {
+    fn new() -> Self {
+        let foreground = unsafe { GetForegroundWindow() };
+        let foreground_thread =
+            unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) };
+        let current_thread = unsafe { GetCurrentThreadId() };
+        Self {
+            foreground_thread,
+            attached: foreground_thread != 0
+                && foreground_thread != current_thread
+                && unsafe { AttachThreadInput(current_thread, foreground_thread, 1) } != 0,
+        }
+    }
+}
+impl Drop for InputQueueAttachment {
+    fn drop(&mut self) {
+        if self.attached {
+            unsafe { AttachThreadInput(GetCurrentThreadId(), self.foreground_thread, 0) };
+        }
+    }
+}
+
+fn activate_window(window: Hwnd) -> bool {
+    if !prepare_activation(window) {
+        return false;
+    }
+    unsafe {
+        // Explicit visibility is independent of WinUI's initial Activate and
+        // STARTUPINFO's initial show command. The desktop and final viewport
+        // have both been committed before this nonactivating show.
+        SetWindowPos(
+            window,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0040,
+        );
+    }
+    let attachment = InputQueueAttachment::new();
+    if unsafe { GetForegroundWindow() } != window {
+        unsafe { SetForegroundWindow(window) };
+    }
+    drop(attachment);
+    (unsafe { IsWindowVisible(window) }) != 0 && unsafe { GetForegroundWindow() } == window
+}
+
+fn activate_popup(window: Hwnd) {
+    let activated = activate_window(window);
+    POPUP_PRESENTED.with(|value| value.set(unsafe { IsWindowVisible(window) } != 0));
+    crate::storage::diagnostic(serde_json::json!({
+        "event": "popup_activation",
+        "visible": unsafe { IsWindowVisible(window) } != 0,
+        "foreground": activated,
+    }));
+    if activated {
+        // WinUI must request TextBox focus after the HWND is visible and owns
+        // foreground, not while a hidden window is waiting for its final frame.
+        emit(Action::PopupActivated);
+    }
+}
+
+pub fn popup_is_foreground() -> bool {
+    let popup = POPUP.with(Cell::get);
+    !popup.is_null()
+        && unsafe { IsWindowVisible(popup) } != 0
+        && unsafe { GetForegroundWindow() } == popup
+}
+
 pub fn show_popup() {
     ANCHOR.with(|v| v.set(mouse_monitor()));
     if let Some(window) = window("翻译") {
-        if unsafe { IsWindowVisible(window) } != 0
+        if POPUP_PRESENTED.with(Cell::get)
+            && unsafe { IsWindowVisible(window) } != 0
             && unsafe { MonitorFromWindow(window, 2) } == ANCHOR.with(Cell::get)
         {
             // Re-activating an already visible popup must not snap an active
             // expansion to its destination. Its pending UI frame remains valid.
-            if prepare_activation(window) {
-                unsafe {
-                    SetForegroundWindow(window);
-                }
-            }
+            activate_popup(window);
             return;
         }
         // Hidden/first/cross-monitor presentation is a single final frame, but
@@ -1205,12 +1282,7 @@ pub fn drag_popup() {
 }
 pub fn activate_settings() -> bool {
     if let Some(window) = window("翻译设置") {
-        if prepare_activation(window) {
-            unsafe {
-                ShowWindow(window, 5);
-                SetForegroundWindow(window);
-            }
-        }
+        activate_window(window);
         true
     } else {
         false

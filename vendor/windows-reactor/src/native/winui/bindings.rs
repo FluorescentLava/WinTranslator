@@ -9101,12 +9101,29 @@ impl IFlyout {
             .ok()
         }
     }
+    pub(crate) fn SetFlyoutPresenterStyle<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<Style>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFlyoutPresenterStyle)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
+        }
+    }
 }
 #[repr(C)]
 pub struct IFlyout_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
     Content: usize,
     pub SetContent: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    FlyoutPresenterStyle: usize,
+    pub SetFlyoutPresenterStyle: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
@@ -9130,6 +9147,50 @@ impl IFlyoutBase {
             .ok()
         }
     }
+    pub(crate) fn Closed<F>(&self, handler: F) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(
+                windows_core::Ref<windows_core::IInspectable>,
+                windows_core::Ref<windows_core::IInspectable>,
+            ) + 'static,
+    {
+        let handler: EventHandler<windows_core::IInspectable> = {
+            let com =
+                windows_core::imp::DelegateBox::<EventHandler<windows_core::IInspectable>, F>::new(
+                    &EventHandlerBox::<windows_core::IInspectable, F>::VTABLE,
+                    handler,
+                );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut token = 0;
+            (windows_core::Interface::vtable(self).Closed)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut token,
+            )
+            .ok()?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token,
+                windows_core::Interface::vtable(self).RemoveClosed,
+            ))
+        }
+    }
+    pub(crate) fn Hide(&self) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).Hide)(windows_core::Interface::as_raw(self)).ok()
+        }
+    }
+    pub(crate) fn SetShouldConstrainToRootBounds(&self, value: bool) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetShouldConstrainToRootBounds)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
 }
 #[repr(C)]
 pub struct IFlyoutBase_Vtbl {
@@ -9139,6 +9200,46 @@ pub struct IFlyoutBase_Vtbl {
         *mut core::ffi::c_void,
         FlyoutPlacementMode,
     ) -> windows_core::HRESULT,
+    // Verified against Microsoft.UI.Xaml.winmd (Windows App SDK) IFlyoutBase method order.
+    Target: usize,
+    AllowFocusOnInteraction: usize,
+    SetAllowFocusOnInteraction: usize,
+    LightDismissOverlayMode: usize,
+    SetLightDismissOverlayMode: usize,
+    AllowFocusWhenDisabled: usize,
+    SetAllowFocusWhenDisabled: usize,
+    ShowMode: usize,
+    SetShowMode: usize,
+    InputDevicePrefersPrimaryCommands: usize,
+    AreOpenCloseAnimationsEnabled: usize,
+    SetAreOpenCloseAnimationsEnabled: usize,
+    ShouldConstrainToRootBounds: usize,
+    pub SetShouldConstrainToRootBounds:
+        unsafe extern "system" fn(*mut core::ffi::c_void, bool) -> windows_core::HRESULT,
+    IsConstrainedToRootBounds: usize,
+    ElementSoundMode: usize,
+    SetElementSoundMode: usize,
+    OverlayInputPassThroughElement: usize,
+    SetOverlayInputPassThroughElement: usize,
+    IsOpen: usize,
+    XamlRoot: usize,
+    SetXamlRoot: usize,
+    Opened: usize,
+    RemoveOpened: usize,
+    pub Closed: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveClosed:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+    Opening: usize,
+    RemoveOpening: usize,
+    Closing: usize,
+    RemoveClosing: usize,
+    ShowAt: usize,
+    ShowAtWithOptions: usize,
+    pub Hide: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IFlyoutFactory,

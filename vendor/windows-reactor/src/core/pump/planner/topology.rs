@@ -471,11 +471,7 @@ impl<R: NativeRuntime> Pump<R> {
             return Err(PumpError::StructureUnsupported);
         };
         if let Some((target, _)) = tree.flyout_attachment(owner) {
-            plan.push(Command::SetFlyout {
-                target,
-                content: None,
-                placement,
-            });
+            plan.push(tree.flyout_command(owner, target, None, placement));
             tree.set_flyout_attachment(owner, None);
         }
         Ok(())
@@ -562,6 +558,7 @@ impl<R: NativeRuntime> Pump<R> {
         tree: &mut Tree,
         owner: NodeId,
         placement: FlyoutPlacement,
+        settings_changed: bool,
         plan: &mut UpdatePlan,
     ) -> Result<(), PumpError> {
         let NodeKind::Flyout(previous_placement) = tree.kind(owner) else {
@@ -584,18 +581,10 @@ impl<R: NativeRuntime> Pump<R> {
         if let Some((previous_target, _)) = previous
             && previous_target != attachment.0
         {
-            plan.push(Command::SetFlyout {
-                target: previous_target,
-                content: None,
-                placement: previous_placement,
-            });
+            plan.push(tree.flyout_command(owner, previous_target, None, previous_placement));
         }
-        if previous != Some(attachment) || previous_placement != placement {
-            plan.push(Command::SetFlyout {
-                target: attachment.0,
-                content: Some(attachment.1),
-                placement,
-            });
+        if previous != Some(attachment) || previous_placement != placement || settings_changed {
+            plan.push(tree.flyout_command(owner, attachment.0, Some(attachment.1), placement));
             tree.set_flyout_attachment(owner, Some(attachment));
         }
         tree.set_flyout_placement(owner, placement);

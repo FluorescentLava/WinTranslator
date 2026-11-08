@@ -229,6 +229,7 @@ pub struct Tree {
     providers: ProviderStore,
     root: Option<NodeId>,
     owned_attachments: Rc<HashMap<NodeId, (NodeId, NodeId)>>,
+    flyout_settings: Rc<HashMap<NodeId, (FlyoutSettings, u32)>>,
     window_declarations: Rc<HashMap<ScopeId, WindowDeclarations>>,
     window_title_bars: Rc<HashMap<NodeId, WindowTitleBarHeight>>,
 }
@@ -329,6 +330,7 @@ impl Tree {
             providers: ProviderStore::default(),
             root: None,
             owned_attachments: Rc::new(HashMap::default()),
+            flyout_settings: Rc::new(HashMap::default()),
             window_declarations: Rc::new(HashMap::default()),
             window_title_bars: Rc::new(HashMap::default()),
         }
@@ -658,6 +660,64 @@ impl Tree {
             }
             _ => panic!("node is not a flyout"),
         }
+    }
+
+    pub(crate) fn set_flyout_settings(&mut self, id: NodeId, settings: FlyoutSettings) -> bool {
+        let entries = Rc::make_mut(&mut self.flyout_settings);
+        let (current, revision) = entries
+            .entry(id)
+            .or_insert_with(|| (FlyoutSettings::default(), 0));
+        if *current == settings {
+            return false;
+        }
+        if current.on_closed != settings.on_closed {
+            *revision = revision.checked_add(1).unwrap();
+        }
+        *current = settings;
+        true
+    }
+
+    pub(crate) fn flyout_settings_match(&self, id: NodeId, settings: &FlyoutSettings) -> bool {
+        self.flyout_settings
+            .get(&id)
+            .map(|(current, _)| current)
+            .unwrap_or(&FlyoutSettings::default())
+            == settings
+    }
+
+    pub(crate) fn flyout_command(
+        &self,
+        owner: NodeId,
+        target: NodeId,
+        content: Option<NodeId>,
+        placement: FlyoutPlacement,
+    ) -> Command {
+        let (settings, revision) = self
+            .flyout_settings
+            .get(&owner)
+            .cloned()
+            .unwrap_or_default();
+        Command::SetFlyout {
+            target,
+            content,
+            placement,
+            padding: settings.padding,
+            min_width: settings.min_width,
+            min_height: settings.min_height,
+            constrain_to_root_bounds: settings.constrain_to_root_bounds,
+            closed: settings.on_closed.map(|_| (owner, revision)),
+        }
+    }
+
+    pub(crate) fn flyout_closed_callback(
+        &self,
+        owner: NodeId,
+        revision: u32,
+    ) -> Option<&Callback<()>> {
+        let (settings, current) = self.flyout_settings.get(&owner)?;
+        (*current == revision)
+            .then_some(settings.on_closed.as_ref())
+            .flatten()
     }
 
     pub fn flyout_attachment(&self, id: NodeId) -> Option<(NodeId, NodeId)> {
@@ -1232,6 +1292,7 @@ impl Tree {
             }
             if matches!(&node.data, NodeData::Tooltip(_) | NodeData::Flyout(_)) {
                 Rc::make_mut(&mut self.owned_attachments).remove(&id);
+                Rc::make_mut(&mut self.flyout_settings).remove(&id);
             }
             retired.push((id, kind));
         }

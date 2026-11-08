@@ -585,6 +585,16 @@ pub enum FlyoutPlacement {
 pub struct Flyout {
     pub(crate) content: Box<View>,
     pub(crate) placement: FlyoutPlacement,
+    pub(crate) settings: FlyoutSettings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct FlyoutSettings {
+    pub(crate) padding: Option<Thickness>,
+    pub(crate) min_width: Option<f64>,
+    pub(crate) min_height: Option<f64>,
+    pub(crate) constrain_to_root_bounds: Option<bool>,
+    pub(crate) on_closed: Option<Callback<()>>,
 }
 
 impl Flyout {
@@ -598,12 +608,62 @@ impl Flyout {
         Self {
             content: Box::new(content.into()),
             placement: FlyoutPlacement::Top,
+            settings: FlyoutSettings::default(),
         }
     }
 
     /// Sets the preferred placement.
     pub fn placement(mut self, placement: FlyoutPlacement) -> Self {
         self.placement = placement;
+        self
+    }
+
+    /// Overrides the native FlyoutPresenter's padding, measured in DIPs.
+    pub fn padding(mut self, padding: impl Into<Thickness>) -> Self {
+        let padding = padding.into();
+        assert!(
+            padding.is_finite_non_negative(),
+            "flyout padding must be finite and non-negative"
+        );
+        self.settings.padding = Some(padding);
+        self
+    }
+
+    /// Overrides the native FlyoutPresenter's minimum width, measured in DIPs.
+    pub fn min_width(mut self, width: f64) -> Self {
+        assert!(
+            width.is_finite() && width >= 0.0,
+            "flyout minimum width must be finite and non-negative"
+        );
+        self.settings.min_width = Some(width);
+        self
+    }
+
+    /// Overrides the native FlyoutPresenter's minimum height, measured in DIPs.
+    pub fn min_height(mut self, height: f64) -> Self {
+        assert!(
+            height.is_finite() && height >= 0.0,
+            "flyout minimum height must be finite and non-negative"
+        );
+        self.settings.min_height = Some(height);
+        self
+    }
+
+    /// Controls whether WinUI confines the flyout to its XamlRoot's bounds.
+    ///
+    /// `false` allows a desktop flyout to extend beyond the owner window. Native placement and
+    /// work-area adjustment still apply. Omitting this setting preserves WinUI's default.
+    pub fn constrain_to_root_bounds(mut self, constrain: bool) -> Self {
+        self.settings.constrain_to_root_bounds = Some(constrain);
+        self
+    }
+
+    /// Runs after the native flyout closes, including light dismissal, Escape, and explicit Hide.
+    ///
+    /// Delivery uses the UI event queue. A callback replaced before delivery does not receive a
+    /// stale notification from its previous subscription.
+    pub fn on_closed(mut self, callback: impl IntoUnitCallback) -> Self {
+        self.settings.on_closed = Some(callback.into_unit_callback());
         self
     }
 }

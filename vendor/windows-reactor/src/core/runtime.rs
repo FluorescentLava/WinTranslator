@@ -197,6 +197,10 @@ pub struct QueuedEventError {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostEvent {
+    FlyoutClosed {
+        owner: NodeId,
+        revision: u32,
+    },
     WindowSize {
         observation: HostObservationId,
         size: WindowSize,
@@ -304,6 +308,10 @@ pub enum Command {
         node: NodeId,
         completion: Callback<Result<bool, RuntimeError>>,
     },
+    HideFlyout {
+        node: NodeId,
+        completion: Callback<Result<bool, RuntimeError>>,
+    },
     SetTextBoxCaretColor {
         node: NodeId,
         color: Color,
@@ -379,6 +387,11 @@ pub enum Command {
         target: NodeId,
         content: Option<NodeId>,
         placement: FlyoutPlacement,
+        padding: Option<Thickness>,
+        min_width: Option<f64>,
+        min_height: Option<f64>,
+        constrain_to_root_bounds: Option<bool>,
+        closed: Option<(NodeId, u32)>,
     },
     SetOwnedMenu {
         owner: NodeId,
@@ -431,7 +444,10 @@ impl Command {
     pub(crate) fn complete_unavailable(&self) {
         match self {
             Self::Focus { node, completion }
-            | Self::SetTextBoxCaretColor { node, completion, .. } => {
+            | Self::HideFlyout { node, completion }
+            | Self::SetTextBoxCaretColor {
+                node, completion, ..
+            } => {
                 _ = completion.call(Err(RuntimeError::MissingNode(*node)));
             }
             Self::InitializeWebView2 { node, completion } => {
