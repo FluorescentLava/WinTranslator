@@ -28,6 +28,7 @@ pub enum Message {
     Details(bool),
     Pronounce(crate::speech::Accent),
     Pronounced(u64, Result<(), String>),
+    PhoneticsReady(u64, Result<crate::speech::Phonetics, String>),
     ColorScheme(ColorScheme),
     RepairCaret(u8),
     RetryCaret(u8),
@@ -84,6 +85,8 @@ pub struct Translator {
     speech_task: Option<ComponentTask>,
     speech_revision: u64,
     speech_error: Option<String>,
+    phonetics: Option<crate::speech::Phonetics>,
+    phonetics_task: Option<ComponentTask>,
     status: String,
     error: bool,
     input: ElementRef<TextBox>,
@@ -163,16 +166,7 @@ fn visual_lines(value: &str, font_size: f64, width: f64) -> usize {
         .max(1)
 }
 fn dictionary_metadata(entry: &crate::dictionary::Entry) -> String {
-    let phonetic = entry.phonetic.trim().trim_matches('/');
-    let pos = entry.parts_of_speech.join(" · ");
-    [
-        (!phonetic.is_empty()).then(|| format!("/{phonetic}/")),
-        (!pos.is_empty()).then_some(pos),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("   ·   ")
+    entry.parts_of_speech.join(" · ")
 }
 fn at(view: impl Into<View>, row: i32, column: i32) -> View {
     Grid::new()
@@ -249,21 +243,107 @@ impl Translator {
     }
 
     fn pronunciation_text(&self) -> Option<&str> {
-        let (from, _) = self.language_indices();
-        if LANGUAGES[from].code == "en" && !self.text.trim().is_empty() {
-            Some(self.text.trim())
-        } else {
-            self.output
-                .as_ref()
-                .filter(|translation| translation.to == "en")
-                .map(|translation| translation.target.trim())
-                .filter(|value| !value.is_empty())
+        let translation = self.output.as_ref()?;
+        if self.busy || self.text.trim() != translation.source.trim() {
+            return None;
         }
+        if translation.from == "en" {
+            Some(translation.source.trim())
+        } else if translation.to == "en" {
+            Some(translation.target.trim())
+        } else {
+            None
+        }
+    }
+
+    fn load_phonetics(&mut self, cx: &ComponentContext<Self>) {
+        if let Some(task) = self.phonetics_task.take() {
+            task.cancel();
+        }
+        self.phonetics = None;
+        if let Some(text) = self.pronunciation_text().map(str::to_owned) {
+            let revision = self.revision;
+            self.phonetics_task = Some(cx.spawn_background(move |cancel| {
+                Message::PhoneticsReady(
+                    revision,
+                    crate::speech::phonetics(&text, &|| cancel.is_cancelled()),
+                )
+            }));
+        }
+    }
+
+    fn pronunciation_controls(&self, cx: &ViewContext<Self>) -> View {
+        if self.pronunciation_text().is_none() {
+            return View::empty();
+        }
+        Grid::new()
+            .columns([Star(1.0), Star(1.0)])
+            .column_spacing(8.0)
+            .keyed_children(
+                [
+                    (crate::speech::Accent::British, "英", "英式发音"),
+                    (crate::speech::Accent::American, "美", "美式发音"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (accent, label, name))| {
+                    let phonetic = self.phonetics.as_ref().map_or("", |value| match accent {
+                        crate::speech::Accent::British => value.british.as_str(),
+                        crate::speech::Accent::American => value.american.as_str(),
+                    });
+                    let phonetic = phonetic.trim().trim_matches('/');
+                    let phonetic = if phonetic.is_empty() {
+                        String::new()
+                    } else {
+                        format!("/{phonetic}/")
+                    };
+                    (
+                        index,
+                        at(
+                            Button::new()
+                                .style(ButtonStyle::Subtle)
+                                .height(32.0)
+                                .padding(4.0)
+                                .horizontal_alignment(Stretch)
+                                .horizontal_content_alignment(Stretch)
+                                .vertical_content_alignment(Center)
+                                .automation_name(name)
+                                .on_click(cx.message(Message::Pronounce(accent)))
+                                .content(
+                                    Grid::new()
+                                        .columns([Auto, Star(1.0), Auto])
+                                        .column_spacing(6.0)
+                                        .children((
+                                            text(label, 14.0)
+                                                .opacity(0.65)
+                                                .vertical_alignment(Center),
+                                            text(&phonetic, 14.0)
+                                                .text_wrapping(TextWrapping::NoWrap)
+                                                .text_trimming(TextTrimming::CharacterEllipsis)
+                                                .opacity(0.65)
+                                                .vertical_alignment(Center)
+                                                .grid_column(1),
+                                            icon("\u{E767}")
+                                                .vertical_alignment(Center)
+                                                .grid_column(2),
+                                        )),
+                                )
+                                .tooltip(format!("{name} {phonetic}")),
+                            0,
+                            index as i32,
+                        ),
+                    )
+                }),
+            )
     }
 
     fn invalidate(&mut self) {
         self.revision += 1;
         self.busy = false;
+        self.phonetics = None;
+        if let Some(task) = self.phonetics_task.take() {
+            task.cancel();
+        }
         if let Some(task) = self.task.take() {
             task.cancel();
         }
@@ -455,6 +535,11 @@ impl Translator {
             Color::argb(90, 0, 0, 0)
         };
         let expanded = self.output.is_some();
+        let pronunciation_height = if self.pronunciation_text().is_some() {
+            40.0
+        } else {
+            0.0
+        };
         let dictionary_senses = self
             .output
             .as_ref()
@@ -528,7 +613,7 @@ impl Translator {
                 let metadata_height = metadata.as_ref().map_or(0.0, |value| {
                     visual_lines(value, 14.0, 472.0) as f64 * 20.0 + 6.0
                 });
-                let header_fixed = 28.0 + metadata_height;
+                let header_fixed = 28.0 + metadata_height + pronunciation_height;
                 let detail_reserve = if details_open { 72.0 } else { 0.0 };
                 let target_limit =
                     (available_result - header_fixed - detail_reserve).max(result_line_height);
@@ -553,6 +638,7 @@ impl Translator {
                 let word_metadata = if is_word { 26.0 } else { 0.0 };
                 (30.0
                     + notice_height
+                    + pronunciation_height
                     + word_metadata
                     + visual_lines(&translation.target, result_font, 496.0) as f64
                         * result_line_height)
@@ -614,15 +700,21 @@ impl Translator {
             .columns([Auto, Auto, Auto, Auto, Star(1.0), Auto])
             .column_spacing(4.0)
             .children((
-                icon(TRANSLATE)
-                    .width(20.0)
-                    .height(20.0)
-                    .vertical_alignment(Center),
+                Border::new()
+                    .width(44.0)
+                    .height(44.0)
+                    .vertical_alignment(Center)
+                    .content(
+                        icon(TRANSLATE)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .vertical_alignment(Center),
+                    ),
                 ComboBox::new()
                     .items_source(LANGUAGES.iter().map(popup_language))
                     .selected_index(from)
                     .width(144.0)
-                    .height(34.0)
+                    .height(44.0)
+                    .vertical_alignment(Center)
                     .automation_name("源语言")
                     .on_selection_changed(cx.callback(Message::Source))
                     .grid_column(1),
@@ -631,7 +723,8 @@ impl Translator {
                     .items_source(LANGUAGES.iter().skip(1).map(popup_language))
                     .selected_index(to - 1)
                     .width(132.0)
-                    .height(34.0)
+                    .height(44.0)
+                    .vertical_alignment(Center)
                     .automation_name("目标语言")
                     .on_selection_changed(cx.callback(Message::Target))
                     .grid_column(3),
@@ -774,11 +867,17 @@ impl Translator {
                     .corner_radius(8.0)
                     .max_height(result_height)
                     .vertical_alignment(VerticalAlignment::Top)
-                    .content(
-                        Grid::new()
-                            .rows([Auto, Auto])
-                            .children((header, at(details, 1, 0))),
-                    )
+                    .content(Grid::new().rows([Auto, Auto, Auto]).children((
+                        if pronunciation_height > 0.0 {
+                            Border::new()
+                                .padding(Thickness::new(12.0, 8.0, 12.0, 0.0))
+                                .content(self.pronunciation_controls(cx))
+                        } else {
+                            View::empty()
+                        },
+                        at(header, 1, 0),
+                        at(details, 2, 0),
+                    )))
             } else {
                 Border::new()
                     .background(ThemeBrush::CardBackground)
@@ -790,13 +889,17 @@ impl Translator {
                     .vertical_alignment(VerticalAlignment::Top)
                     .content(
                         StackPanel::new().spacing(6.0).children((
+                            self.pronunciation_controls(cx),
                             if let Some(notice) = result_notice {
                                 text(notice, 12.0).opacity(0.75).into()
                             } else {
                                 View::empty()
                             },
                             ScrollViewer::new()
-                                .max_height((result_height - 30.0 - notice_height).max(32.0))
+                                .max_height(
+                                    (result_height - 30.0 - notice_height - pronunciation_height)
+                                        .max(32.0),
+                                )
                                 .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                                 .content(
@@ -878,45 +981,8 @@ impl Translator {
             )
             .tooltip("选择翻译服务");
         let state = Grid::new().keyed_children([(self.settings.provider.index(), state)]);
-        let can_pronounce = self.pronunciation_text().is_some();
-        let pronunciation = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(4.0)
-            .keyed_children(
-                [
-                    (crate::speech::Accent::British, "英", "英式发音"),
-                    (crate::speech::Accent::American, "美", "美式发音"),
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(index, (accent, label, name))| {
-                    (
-                        index,
-                        Button::new()
-                            .style(ButtonStyle::Subtle)
-                            .width(62.0)
-                            .height(32.0)
-                            .padding(4.0)
-                            .is_enabled(can_pronounce)
-                            .horizontal_content_alignment(HorizontalAlignment::Center)
-                            .vertical_content_alignment(Center)
-                            .automation_name(name)
-                            .on_click(cx.message(Message::Pronounce(accent)))
-                            .content(
-                                StackPanel::new()
-                                    .orientation(Orientation::Horizontal)
-                                    .spacing(4.0)
-                                    .children((
-                                        icon("\u{E767}"),
-                                        text(label, 12.0).vertical_alignment(Center),
-                                    )),
-                            )
-                            .tooltip(name),
-                    )
-                }),
-            );
         let footer = Grid::new()
-            .columns([Auto, Star(1.0), Auto])
+            .columns([Auto, Star(1.0)])
             .column_spacing(8.0)
             .children((
                 state,
@@ -929,7 +995,6 @@ impl Translator {
                 } else {
                     View::empty()
                 },
-                at(pronunciation, 0, 2),
             ));
         let surface = Border::new()
             .corner_radius(12.0)
@@ -1373,6 +1438,8 @@ impl Component for Translator {
             speech_task: None,
             speech_revision: 0,
             speech_error: None,
+            phonetics: None,
+            phonetics_task: None,
             status: warning.clone().unwrap_or_default(),
             error: warning.is_some(),
             input: ElementRef::new(),
@@ -1426,6 +1493,10 @@ impl Component for Translator {
                 self.speech_task = None;
                 self.speech_error = result.err();
             }
+            Message::PhoneticsReady(revision, result) if revision == self.revision => {
+                self.phonetics_task = None;
+                self.phonetics = result.ok();
+            }
             Message::ColorScheme(scheme) => self.color_scheme = scheme,
             Message::RepairCaret(attempt) => self.repair_caret(cx, attempt),
             Message::RetryCaret(attempt) => {
@@ -1462,6 +1533,7 @@ impl Component for Translator {
                         self.history.insert(0, t.clone());
                         self.history.truncate(100);
                         self.output = Some(t);
+                        self.load_phonetics(cx);
                         if let Err(e) = storage::save_history(&self.history) {
                             self.status = format!("记录保存失败：{e}");
                         }
@@ -1715,6 +1787,9 @@ impl Component for Translator {
 }
 impl Drop for Translator {
     fn drop(&mut self) {
+        if let Some(task) = self.phonetics_task.take() {
+            task.cancel();
+        }
         if !self.settings_window {
             self.cancel_speech();
         }

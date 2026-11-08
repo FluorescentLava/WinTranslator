@@ -288,8 +288,9 @@ impl<T: FocusControl> ElementRef<T> {
 impl ElementRef<crate::TextBox> {
     /// Enqueues a color override for this text box's native insertion caret.
     ///
-    /// The edit control, selection, IME, caret positioning, and blinking remain native. The caret
-    /// is created lazily by WinUI; use [`Self::request_caret_color_result`] when a retry is needed.
+    /// The edit control, selection, IME, caret positioning, and blinking remain native. WinUI
+    /// creates the caret lazily; the runtime retries briefly after this request and after this
+    /// TextBox's native Loaded/GotFocus events, including when its text is still empty.
     #[must_use = "false means the reference is currently unbound or its queue is full"]
     pub fn request_caret_color(&self, color: crate::Color) -> bool {
         self.request_caret_color_result(color, |_| {})
@@ -299,8 +300,9 @@ impl ElementRef<crate::TextBox> {
     ///
     /// `Ok(true)` means the native caret was identified and updated. `Ok(false)` means that it
     /// has not been created yet, or that the WinUI visual tree did not match the verified caret
-    /// structure. Retry after focus/layout, and after a caret is recreated (for example by an RTL
-    /// input change). A theme change should enqueue the newly desired color as well.
+    /// structure. Each request and native Loaded/GotFocus event also starts a bounded two-second
+    /// watch for lazy creation or replacement during layout. A later caret recreation (for
+    /// example by an RTL input change) and a theme change should enqueue the desired color again.
     ///
     /// This is a guarded workaround for WinUI's inverted caret over a transparent system backdrop.
     /// It uses an internal type identity only to identify TextBoxView, then public visual-tree,
@@ -902,7 +904,9 @@ impl ImperativeRequest {
     pub(crate) fn complete_unavailable(self) {
         match self {
             Self::Focus { node, completion }
-            | Self::SetTextBoxCaretColor { node, completion, .. } => {
+            | Self::SetTextBoxCaretColor {
+                node, completion, ..
+            } => {
                 _ = completion.call(Err(RuntimeError::MissingNode(node)));
             }
             Self::InitializeWebView2 { node, completion } => {

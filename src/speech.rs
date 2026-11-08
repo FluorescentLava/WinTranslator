@@ -17,6 +17,218 @@ pub enum Accent {
     British,
     American,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Phonetics {
+    pub british: String,
+    pub american: String,
+}
+
+const MAX_PHONETICS_RESPONSE: usize = 512 * 1024;
+const MAX_PHONETICS_CACHE_FILES: usize = 200;
+static PHONETICS_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+fn dictionary_word(text: &str) -> Option<&str> {
+    let text = text.trim();
+    (text.len() <= 128
+        && text.bytes().any(|c| c.is_ascii_alphabetic())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || matches!(c, '\'' | '’' | '-')))
+    .then_some(text)
+}
+
+fn phonetic_value(value: &serde_json::Value) -> String {
+    let Some(value) = value.as_str() else {
+        return String::new();
+    };
+    let value = value.trim().trim_matches('/').trim();
+    if value.len() > 256
+        || value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '<' | '>'))
+    {
+        String::new()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn parse_phonetics(value: &serde_json::Value) -> Phonetics {
+    let field = |name| {
+        let primary = phonetic_value(&value["ec"]["word"][0][name]);
+        if primary.is_empty() {
+            phonetic_value(&value["simple"]["word"][0][name])
+        } else {
+            primary
+        }
+    };
+    // Each accent has its own source field. A missing accent remains missing,
+    // even when the other field exists or the local dictionary has one IPA.
+    Phonetics {
+        british: field("ukphone"),
+        american: field("usphone"),
+    }
+}
+
+fn phonetics_cache_path(word: &str) -> PathBuf {
+    let mut hash = Sha256::new();
+    hash.update(b"youdao-jsonapi-phonetics-v1\0");
+    hash.update(word.as_bytes());
+    storage::data_dir()
+        .join("pronunciation")
+        .join("phonetics")
+        .join(format!("{}.json", hex::encode(hash.finalize())))
+}
+
+fn cached_phonetics(path: &Path) -> Option<Phonetics> {
+    let _guard = CACHE_LOCK.lock().ok()?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 2_048 {
+        return None;
+    }
+    let cached: Phonetics = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let clean = |value: &str| {
+        value.len() <= 256
+            && !value
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '<' | '>'))
+    };
+    (clean(&cached.british)
+        && clean(&cached.american)
+        && !(cached.british.is_empty() && cached.american.is_empty()))
+    .then_some(cached)
+}
+
+fn save_phonetics(path: &Path, value: &Phonetics) -> Result<(), String> {
+    if value.british.is_empty() && value.american.is_empty() {
+        return Ok(());
+    }
+    let _guard = CACHE_LOCK.lock().map_err(|_| "音标缓存不可用".to_owned())?;
+    let directory = path.parent().ok_or_else(|| "音标缓存路径无效".to_owned())?;
+    fs::create_dir_all(directory).map_err(|_| "无法创建音标缓存".to_owned())?;
+    let mut files = fs::read_dir(directory)
+        .map_err(|_| "无法读取音标缓存".to_owned())?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let stem = name.strip_suffix(".json")?;
+            if stem.len() != 64
+                || !stem.bytes().all(|c| c.is_ascii_hexdigit())
+                || entry.path() == path
+            {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| {
+                (
+                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    entry.path(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|file| file.0);
+    let mut count = files.len() + 1;
+    for (_, old) in files {
+        if count <= MAX_PHONETICS_CACHE_FILES {
+            break;
+        }
+        if fs::remove_file(old).is_ok() {
+            count -= 1;
+        }
+    }
+    if count > MAX_PHONETICS_CACHE_FILES {
+        return Err("音标缓存已满".into());
+    }
+    let bytes = serde_json::to_vec(value).map_err(|_| "无法保存音标缓存".to_owned())?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = fs::write(&temp, bytes).and_then(|_| fs::rename(&temp, path));
+    let _ = fs::remove_file(temp);
+    result.map_err(|_| "无法保存音标缓存".into())
+}
+
+/// Queries real UK/US dictionary fields for one English word. Sentences and
+/// missing fields return empty strings; a cached entry also works offline.
+pub fn phonetics(text: &str, cancelled: &dyn Fn() -> bool) -> Result<Phonetics, String> {
+    if cancelled() {
+        return Err("已取消".into());
+    }
+    let Some(word) = dictionary_word(text) else {
+        return Ok(Phonetics::default());
+    };
+    let path = phonetics_cache_path(word);
+    if let Some(cached) = cached_phonetics(&path) {
+        return if cancelled() {
+            Err("已取消".into())
+        } else {
+            Ok(cached)
+        };
+    }
+    let client = PHONETICS_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_millis(900))
+            .timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::limited(3))
+            .user_agent("TranslationTool/0.1")
+            .build()
+            .expect("phonetics HTTP client initialization failed")
+    });
+    if cancelled() {
+        return Err("已取消".into());
+    }
+    let mut response = client
+        .get("https://dict.youdao.com/jsonapi")
+        .query(&[("q", word)])
+        .send()
+        .map_err(|_| "音标查询连接失败或超时".to_owned())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "音标查询失败（HTTP {}）",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_PHONETICS_RESPONSE as u64)
+    {
+        return Err("音标服务响应过大".into());
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 16_384];
+    loop {
+        if cancelled() {
+            return Err("已取消".into());
+        }
+        let count = response
+            .read(&mut buffer)
+            .map_err(|_| "音标查询读取失败或超时".to_owned())?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len() + count > MAX_PHONETICS_RESPONSE {
+            return Err("音标服务响应过大".into());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    if cancelled() {
+        return Err("已取消".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "音标服务返回了无效数据".to_owned())?;
+    let result = parse_phonetics(&value);
+    if cancelled() {
+        return Err("已取消".into());
+    }
+    // Disk failure should not hide valid dictionary data already received.
+    let _ = save_phonetics(&path, &result);
+    if cancelled() {
+        return Err("已取消".into());
+    }
+    Ok(result)
+}
+
 impl Accent {
     fn dictionary_type(self) -> &'static str {
         match self {
@@ -717,5 +929,51 @@ mod tests {
         );
         assert_eq!(Accent::British.language_filter(), "Language=809");
         assert_eq!(Accent::American.language_filter(), "Language=409");
+    }
+    #[test]
+    fn phonetics_preserve_real_accent_fields_and_leave_missing_accents_empty() {
+        for (uk, us) in [
+            ("təˈmɑːtəʊ", "təˈmeɪtoʊ"),
+            ("ˈʃedjuːl", "ˈskedʒuːl"),
+            ("sneɪk", "sneɪk"),
+        ] {
+            let result =
+                parse_phonetics(&serde_json::json!({"ec":{"word":[{"ukphone":uk,"usphone":us}]}}));
+            assert_eq!(result.british, uk);
+            assert_eq!(result.american, us);
+        }
+        let uk_only =
+            parse_phonetics(&serde_json::json!({"ec":{"word":[{"ukphone":"təˈmɑːtəʊ"}]}}));
+        assert_eq!(uk_only.british, "təˈmɑːtəʊ");
+        assert!(uk_only.american.is_empty());
+        let simple = parse_phonetics(
+            &serde_json::json!({"ec":{"word":[{"ukphone":"təˈmɑːtəʊ"}]}, "simple":{"word":[{"ukphone":"different","usphone":"təˈmeɪtoʊ"}]}}),
+        );
+        assert_eq!(simple.british, "təˈmɑːtəʊ");
+        assert_eq!(simple.american, "təˈmeɪtoʊ");
+        assert_eq!(
+            parse_phonetics(&serde_json::json!({})),
+            Phonetics::default()
+        );
+    }
+    #[test]
+    fn phonetics_only_query_single_english_words_and_respect_pre_cancellation() {
+        for word in ["snake", "can't", "mother-in-law", "can’t"] {
+            assert_eq!(dictionary_word(word), Some(word));
+        }
+        for sentence in [
+            "snake in the grass",
+            "中文",
+            "https://example.com",
+            "",
+            "snake\nword",
+        ] {
+            assert!(dictionary_word(sentence).is_none());
+            assert_eq!(
+                phonetics(sentence, &|| false).unwrap(),
+                Phonetics::default()
+            );
+        }
+        assert_eq!(phonetics("snake", &|| true).err().unwrap(), "已取消");
     }
 }
