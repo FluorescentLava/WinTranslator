@@ -1,6 +1,6 @@
 # Application icon
 
-The WinTranslater icon is an original generated translation mark using exactly two overlapping, asymmetrical panels based on the user's silhouette sketch. The front-left golden-yellow panel is a rounded wedge; the rear-right purple panel sits higher and has a gently irregular quadrilateral outline. Coral forms the transition between the two panels. Both `A` and `文` are white and have matched optical prominence. It is not a Microsoft application logo.
+The WinTranslater icon is an original generated translation mark using exactly two overlapping, asymmetrical panels based on the user's updated silhouette sketch. The front-left golden-yellow panel tapers to a short, rounded blunt end, blending through orange into coral. The rear-right irregular quadrilateral has a bright coral-to-rose-pink-to-pink-lilac gradient, with the panels' lower edges approximately aligned. Both `A` and `文` are white and have matched optical prominence. It is not a Microsoft application logo.
 
 Design reference: Jon Friedman, Microsoft Design, [Fluid forms, vibrant colors](https://microsoft.design/articles/fluid-forms-vibrant-colors/), 1 October 2025. The relevant design principles are simpler silhouettes, soft folds and curves, richer analogous gradients, clear layering, and legibility at small sizes.
 
