@@ -90,6 +90,9 @@ const SHOW_MESSAGE: u32 = 0x8000 + 43;
 const REFRESH_MESSAGE: u32 = 0x8000 + 44;
 const RESIZE_TIMER: usize = 0x5452_535a;
 const RESIZE_DURATION_MS: f64 = 200.0;
+// A 16 ms USER timer can be rounded up to two default clock ticks. Request
+// the supported minimum and use elapsed time, rather than timer counts, below.
+const RESIZE_INTERVAL_MS: u32 = 10;
 const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
 #[derive(Clone, Copy)]
 struct ResizeAnimation {
@@ -102,6 +105,7 @@ struct ResizeAnimation {
 #[derive(Clone, Copy)]
 pub enum Action {
     Show,
+    TranslateSelection,
     Settings,
     Quit,
     CompositionStarted,
@@ -357,12 +361,17 @@ fn set_rectangle(window: Hwnd, rectangle: Rect, flags: u32) {
             rectangle.top,
             rectangle.right - rectangle.left,
             rectangle.bottom - rectangle.top,
-            // XAML owns the composed client surface. Do not preserve old raster
-            // pixels while its content is being laid out at the new height.
-            flags | 0x0004 | 0x0010 | 0x0100 | 0x2000,
+            // Keep the existing redirected surface until XAML commits the new
+            // layout. SWP_NOCOPYBITS discarded it on every animation frame,
+            // exposing the host background before the compositor was ready.
+            flags | 0x0004 | 0x0010 | 0x2000,
         );
     }
-    request_refresh(window);
+    // WM_SIZE already notifies the XAML host. Forcing child-window paint while
+    // that layout is still pending presents an intermediate, cleared surface.
+    if RESIZE_ANIMATION.with(Cell::get).is_none() {
+        request_refresh(window);
+    }
 }
 fn target_rectangle(window: Hwnd) -> Rect {
     let (x, y, width, height) = placement(window);
@@ -458,7 +467,7 @@ fn resize_popup(window: Hwnd, first: bool) {
             monitor,
         }))
     });
-    if unsafe { SetTimer(window, RESIZE_TIMER, 16, None) } == 0 {
+    if unsafe { SetTimer(window, RESIZE_TIMER, RESIZE_INTERVAL_MS, None) } == 0 {
         stop_resize(window);
         set_rectangle(window, target, 0);
     }
@@ -469,17 +478,33 @@ unsafe extern "system" fn popup_proc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
+    if INITIALIZED.with(Cell::get) && POPUP.with(Cell::get) == window {
+        if message == 0x0083 && wparam != 0 {
+            // This popup has no caption or resize frame. Keep its client area
+            // equal to the whole HWND, rather than letting the overlapped
+            // presenter reintroduce top/bottom frame insets during a resize.
+            // DWM continues to own the rounded edge and shadow.
+            return 0;
+        }
+        if message == 0x0014 {
+            // The configured popup is covered by the native Mica/composition
+            // surface. A class-background GDI erase would flash through the
+            // newly exposed band while XAML is preparing its next frame.
+            return 1;
+        }
+    }
     if message == REFRESH_MESSAGE {
         REFRESH_PENDING.with(|value| value.set(false));
-        if unsafe { IsWindowVisible(window) } != 0 {
+        if unsafe { IsWindowVisible(window) } != 0 && RESIZE_ANIMATION.with(Cell::get).is_none() {
             unsafe {
-                // Invalidate the complete composed surface and its child hosts.
-                // Do not introduce GDI background erasure over the Mica backdrop.
+                // Invalidate once at the settled size. Let the ordinary XAML
+                // dispatcher/compositor paint; RDW_UPDATENOW | ALLCHILDREN used
+                // to synchronously repaint every intermediate client surface.
                 RedrawWindow(
                     window,
                     std::ptr::null(),
                     std::ptr::null_mut(),
-                    0x0001 | 0x0020 | 0x0080 | 0x0100,
+                    0x0001 | 0x0020,
                 );
             }
         }
@@ -636,7 +661,11 @@ unsafe extern "system" fn sink_proc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
-    if message == SHOW_MESSAGE || (message == 0x0312 && wparam == HOTKEY_ID as usize) {
+    if message == 0x0312 && wparam == HOTKEY_ID as usize {
+        emit(Action::TranslateSelection);
+        return 0;
+    }
+    if message == SHOW_MESSAGE {
         emit(Action::Show);
         return 0;
     }
@@ -848,6 +877,12 @@ pub fn wait_for_activation() -> Result<bool> {
             match action {
                 Action::Quit => return Ok(false),
                 Action::Show => return Ok(true),
+                Action::TranslateSelection => {
+                    // main captures the current foreground selection before
+                    // creating/activating the first WinUI window.
+                    PENDING_ACTION.with(|value| value.set(Some(Action::TranslateSelection)));
+                    return Ok(true);
+                }
                 Action::Settings => {
                     PENDING_ACTION.with(|v| v.set(Some(Action::Settings)));
                     return Ok(true);
@@ -871,24 +906,40 @@ pub fn wait_for_activation() -> Result<bool> {
         }
     }
 }
+pub fn take_startup_selection_request() -> bool {
+    PENDING_ACTION.with(|value| match value.take() {
+        Some(Action::TranslateSelection) => true,
+        other => {
+            value.set(other);
+            false
+        }
+    })
+}
 pub fn configure_popup(width: f64, height: f64) {
     SIZE.with(|v| v.set((width, height)));
     if let Some(window) = window("翻译") {
         unsafe {
             attach_popup(window);
             let style = GetWindowLongPtrW(window, -16);
-            let popup_style = style & !(0x00C00000 | 0x00040000 | 0x00080000 | 0x00030000);
-            if style != popup_style {
+            let popup_style =
+                (style & !(0x00C00000 | 0x00040000 | 0x00080000 | 0x00030000)) | 0x02000000;
+            let frame_changed = style != popup_style;
+            if frame_changed {
                 SetWindowLongPtrW(window, -16, popup_style);
             }
-            if !INITIALIZED.with(Cell::get) {
+            let first = !INITIALIZED.with(Cell::get);
+            if first {
                 let round: u32 = 2;
                 DwmSetWindowAttribute(window, 33, &round as *const _ as _, 4);
                 let border: u32 = 0xffff_fffe; // DWMWA_COLOR_NONE: Mica keeps its rounded edge.
                 DwmSetWindowAttribute(window, 34, &border as *const _ as _, 4);
             }
-            resize_popup(window, !INITIALIZED.with(Cell::get));
+            // Activate the frameless client calculation before FRAMECHANGED
+            // sends WM_NCCALCSIZE for the first configured rectangle.
             INITIALIZED.with(|v| v.set(true));
+            // If the presenter ever restores a frame style, clear its cached
+            // non-client metrics too; SetWindowLongPtr alone does not do this.
+            resize_popup(window, first || frame_changed);
         }
     }
 }

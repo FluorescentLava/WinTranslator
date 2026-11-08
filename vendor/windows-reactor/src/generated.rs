@@ -1903,6 +1903,7 @@ pub mod public {
         pane_title: Property<String>,
         open_pane_length: Property<f64>,
         is_pane_open: Property<bool>,
+        menu_columns: Property<i32>,
         events: Option<std::rc::Rc<NavigationViewEvents>>,
         element_state: Option<std::rc::Rc<ElementState>>,
     }
@@ -1971,6 +1972,17 @@ pub mod public {
         pub fn is_pane_open(mut self, value: impl Into<Option<bool>>) -> Self {
             let value = value.into();
             self.is_pane_open = Property::from(value);
+            self
+        }
+        /// Arranges the native left menu in uniform cells with up to this many columns.
+        /// A value of one, or clearing the property, restores the template's layout.
+        pub fn menu_columns(mut self, value: impl Into<Option<i32>>) -> Self {
+            let value = value.into();
+            assert!(
+                value.as_ref().is_none_or(|value| *value > 0),
+                "NavigationView MenuColumns must contain positive values",
+            );
+            self.menu_columns = Property::from(value);
             self
         }
         pub fn on_is_pane_open_changed(mut self, callback: impl IntoPayloadCallback<bool>) -> Self {
@@ -6888,6 +6900,7 @@ pub mod public {
                         pane_title,
                         open_pane_length,
                         is_pane_open,
+                        menu_columns,
                         events,
                         element_state,
                     } = value;
@@ -6904,6 +6917,7 @@ pub mod public {
                                 pane_title,
                                 open_pane_length,
                                 is_pane_open,
+                                menu_columns,
                                 events,
                             },
                         )),
@@ -10086,6 +10100,13 @@ impl MountedPropsExt for MountedProps {
                         Property::Set(value) => Some(PropertyValueRef::Bool(*value)),
                     },
                 );
+                visit(
+                    PropertyId::NavigationViewMenuColumns,
+                    match &values.menu_columns {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::I32(*value)),
+                    },
+                );
             }
             Self::NavigationViewItem(values) => {
                 visit(
@@ -12993,6 +13014,7 @@ pub(crate) struct NavigationViewMountedProps {
     pane_title: Property<String>,
     open_pane_length: Property<f64>,
     is_pane_open: Property<bool>,
+    menu_columns: Property<i32>,
     events: Option<std::rc::Rc<NavigationViewEvents>>,
 }
 impl PartialEq for NavigationViewMountedProps {
@@ -13006,6 +13028,7 @@ impl PartialEq for NavigationViewMountedProps {
             && self.pane_title == other.pane_title
             && f64_property_eq(&self.open_pane_length, &other.open_pane_length)
             && self.is_pane_open == other.is_pane_open
+            && self.menu_columns == other.menu_columns
             && self.events == other.events
     }
 }
@@ -14024,6 +14047,7 @@ pub enum PropertyId {
     NavigationViewPaneTitle,
     NavigationViewOpenPaneLength,
     NavigationViewIsPaneOpen,
+    NavigationViewMenuColumns,
     NavigationViewItemTag,
     NavigationViewItemIsSelected,
     NavigationViewItemSelectsOnInvoked,
@@ -15999,6 +16023,17 @@ const NAVIGATION_VIEW_PROPERTIES: &[PropertyDescriptor] = &[
         feedback: Some("IsPaneOpenChanged"),
         feedback_contract: Some("synchronous_exact"),
         observes_feedback: true,
+    },
+    PropertyDescriptor {
+        id: PropertyId::NavigationViewMenuColumns,
+        name: "MenuColumns",
+        field: "menu_columns",
+        value: "I32",
+        interface: "windows_reactor.NavigationViewMenuLayout",
+        clearable: true,
+        feedback: None,
+        feedback_contract: None,
+        observes_feedback: false,
     },
 ];
 const NAVIGATION_VIEW_EVENTS: &[EventDescriptor] = &[

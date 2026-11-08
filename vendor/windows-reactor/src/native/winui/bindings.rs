@@ -9234,6 +9234,16 @@ impl windows_core::RuntimeType for IFrameworkElement {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IFrameworkElement {
+    pub(crate) fn Name(&self) -> windows_core::Result<windows_core::HSTRING> {
+        unsafe {
+            let mut value = core::mem::MaybeUninit::<windows_core::HSTRING>::zeroed();
+            (windows_core::Interface::vtable(self).Name)(
+                windows_core::Interface::as_raw(self),
+                value.as_mut_ptr().cast(),
+            )
+            .map(|| value.assume_init())
+        }
+    }
     pub(crate) fn Width(&self) -> windows_core::Result<f64> {
         unsafe {
             let mut value = 0.0;
@@ -9580,7 +9590,10 @@ pub struct IFrameworkElement_Vtbl {
     Margin: usize,
     pub SetMargin:
         unsafe extern "system" fn(*mut core::ffi::c_void, Thickness) -> windows_core::HRESULT,
-    Name: usize,
+    pub Name: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     SetName: usize,
     BaseUri: usize,
     DataContext: usize,
@@ -10691,6 +10704,27 @@ impl windows_core::RuntimeType for IItemsRepeater {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IItemsRepeater {
+    // Keep the Layout default-interface pointer returned by the ABI intact.
+    // IInspectable is only an owning holder here; do not QueryInterface it before SetLayout.
+    pub(crate) fn Layout(&self) -> windows_core::Result<windows_core::IInspectable> {
+        unsafe {
+            let mut value = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Layout)(
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .and_then(|| windows_core::imp::Type::from_abi(value))
+        }
+    }
+    pub(crate) fn SetLayout(&self, value: &windows_core::IInspectable) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetLayout)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(value),
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetItemsSource<P0>(&self, value: P0) -> windows_core::Result<()>
     where
         P0: windows_core::Param<windows_core::IInspectable>,
@@ -10741,8 +10775,14 @@ pub struct IItemsRepeater_Vtbl {
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    Layout: usize,
-    SetLayout: usize,
+    pub Layout: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub SetLayout: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     HorizontalCacheLength: usize,
     SetHorizontalCacheLength: usize,
     VerticalCacheLength: usize,

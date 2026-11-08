@@ -40,6 +40,7 @@ mod generated;
 pub use generated::*;
 mod framework;
 mod grid;
+mod navigation_layout;
 #[cfg(feature = "test")]
 pub(crate) mod test;
 #[cfg(feature = "test")]
@@ -149,6 +150,7 @@ pub struct WinUiRuntime {
     event_errors: Rc<RefCell<Vec<NativeWork<QueuedEventError>>>>,
     handles: HashMap<NodeId, Handle>,
     caret_overrides: HashMap<NodeId, caret::CaretState>,
+    navigation_menu_layouts: HashMap<NodeId, navigation_layout::NavigationMenuLayout>,
     events: Rc<RefCell<Vec<NativeWork<QueuedEvent>>>>,
     host_events: Rc<RefCell<Vec<NativeWork<HostEvent>>>>,
     async_ingress: Arc<Mutex<AsyncIngressQueue>>,
@@ -1875,6 +1877,28 @@ impl WinUiRuntime {
                 property,
                 value,
             } => {
+                if *property == PropertyId::NavigationViewMenuColumns {
+                    let Some(Handle::NavigationView(control)) = self.handles.get(node) else {
+                        return Err(RuntimeError::UnsupportedKind);
+                    };
+                    return match value {
+                        PropertyValue::I32(1) => {
+                            if let Some(layout) = self.navigation_menu_layouts.remove(node) {
+                                layout.restore().map_err(native_error)?;
+                            }
+                            Ok(())
+                        }
+                        PropertyValue::I32(columns) if *columns > 1 => {
+                            navigation_layout::set_columns(
+                                control,
+                                *columns,
+                                self.navigation_menu_layouts.entry(*node).or_default(),
+                            )
+                            .map_err(native_error)
+                        }
+                        _ => Err(RuntimeError::UnsupportedKind),
+                    };
+                }
                 if matches!(
                     property,
                     PropertyId::ImageSource | PropertyId::ImageIconSource
@@ -1993,6 +2017,12 @@ impl WinUiRuntime {
                 }
             }
             Command::ClearProperty { node, property } => {
+                if *property == PropertyId::NavigationViewMenuColumns {
+                    if let Some(layout) = self.navigation_menu_layouts.remove(node) {
+                        layout.restore().map_err(native_error)?;
+                    }
+                    return Ok(());
+                }
                 if matches!(
                     property,
                     PropertyId::ImageSource | PropertyId::ImageIconSource
@@ -4052,6 +4082,7 @@ impl WinUiRuntime {
             .retain(|(subscription_node, _), _| *subscription_node != node);
         self.drop_policies.borrow_mut().remove(&node);
         self.caret_overrides.remove(&node);
+        self.navigation_menu_layouts.remove(&node);
         self.pointer_capture.borrow_mut().remove(&node);
         if self.resource_override_keys.contains_key(&node) {
             self.clear_resource_overrides(node)?;

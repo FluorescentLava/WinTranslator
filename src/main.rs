@@ -6,6 +6,7 @@ mod model;
 mod native;
 mod offline;
 mod routing;
+mod selection;
 mod speech;
 mod spm;
 mod storage;
@@ -25,6 +26,7 @@ fn main() {
             return;
         }
     };
+    let mut initial_text = String::new();
     if background {
         storage::diagnostic(
             serde_json::json!({"event":"background_ready", "winui_started":false, "hotkey":"Ctrl+Tab"}),
@@ -41,11 +43,17 @@ fn main() {
                 return;
             }
         }
+        if native::take_startup_selection_request() {
+            initial_text = selection::capture(&|| false).unwrap_or_default();
+        }
     }
     storage::diagnostic(
         serde_json::json!({"event":"ui_start", "trigger":if background { "explicit_open" } else { "manual_launch" }}),
     );
-    if let Err(error) = App::run_component::<ui::Translator>(ui::WindowInput::default()) {
+    if let Err(error) = App::run_component::<ui::Translator>(ui::WindowInput {
+        initial_text,
+        ..Default::default()
+    }) {
         report_error(
             &format!("{error}\n请确认已安装 Windows App Runtime 2.4 或更新的 2.x。"),
             background,
