@@ -144,7 +144,7 @@ thread_local! {
     static ORIGINAL_PROC: Cell<isize> = const { Cell::new(0) };
     static POPUP: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
     static ANCHOR: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
-    static SIZE: Cell<(f64, f64)> = const { Cell::new((480.0, 184.0)) };
+    static SIZE: Cell<(f64, f64)> = const { Cell::new((480.0, 172.0)) };
     static TASKBAR_MESSAGE: Cell<u32> = const { Cell::new(0) };
     static STARTUP_WARNING: RefCell<Option<String>> = const { RefCell::new(None) };
     static PENDING_ACTION: Cell<Option<Action>> = const { Cell::new(None) };

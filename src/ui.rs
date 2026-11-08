@@ -731,11 +731,11 @@ impl Translator {
             * input_line_height
             + 12.0)
             .clamp(60.0, 180.0);
-        let fixed_height = 119.0 + input_height;
+        let fixed_height = 107.0 + input_height;
         let available_result = (480.0 - fixed_height).max(80.0);
-        let frame_height = self.popup_frame.map_or(184.0, |frame| frame.height);
-        let input_viewport_height = input_height.min((frame_height - 119.0).max(0.0));
-        let frame_result_height = (frame_height - 119.0 - input_viewport_height).max(0.0);
+        let frame_height = self.popup_frame.map_or(172.0, |frame| frame.height);
+        let input_viewport_height = input_height.min((frame_height - 107.0).max(0.0));
+        let frame_result_height = (frame_height - 107.0 - input_viewport_height).max(0.0);
         let result_font = self.output.as_ref().map_or(23.0, |translation| {
             if long_input
                 || translation.target.chars().count() > 80
@@ -868,9 +868,9 @@ impl Translator {
         let rendered_result_height = rendered_result_height.min(frame_result_height);
         let details_reveal_height = details_height * details_reveal;
         let natural_height = if expanded || self.error {
-            (fixed_height + result_height).clamp(184.0, 480.0)
+            (fixed_height + result_height).clamp(172.0, 480.0)
         } else {
-            fixed_height.max(184.0).min(480.0)
+            fixed_height.max(172.0).min(480.0)
         };
         let height = natural_height;
         let transition_key =
@@ -878,7 +878,7 @@ impl Translator {
         cx.window_title("翻译");
         cx.window_visuals(
             WindowVisuals::new()
-                .client_size(POPUP_WIDTH, 184.0)
+                .client_size(POPUP_WIDTH, 172.0)
                 .backdrop(WindowBackdrop::Mica)
                 .theme(theme(&self.settings)),
         );
@@ -1337,7 +1337,7 @@ impl Translator {
             .content(
                 Grid::new()
                     .rows([
-                        GridLength::Pixel(44.0),
+                        GridLength::Pixel(32.0),
                         GridLength::Pixel(input_viewport_height),
                         Star(1.0),
                         GridLength::Pixel(32.0),
