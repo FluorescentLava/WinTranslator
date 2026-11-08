@@ -114,6 +114,39 @@ pub struct Credential {
     pub id: String,
     pub key: String,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeepLPlan {
+    /// Existing settings without a plan retain the meaning of `deepl_free`.
+    #[default]
+    Auto,
+    Developer,
+    LegacyFree,
+    Paid,
+}
+impl DeepLPlan {
+    pub fn is_free(self) -> bool {
+        matches!(self, Self::Developer | Self::LegacyFree)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Developer => "DeepL Developer",
+            Self::LegacyFree => "DeepL API Free（旧版）",
+            Self::Paid => "DeepL 付费计划",
+            Self::Auto => "DeepL 旧设置兼容",
+        }
+    }
+
+    pub fn api_base_url(self) -> Option<&'static str> {
+        match self {
+            Self::Developer | Self::LegacyFree => Some("https://api-free.deepl.com"),
+            Self::Auto | Self::Paid => None,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -122,6 +155,8 @@ pub struct Settings {
     pub auto_offline: bool,
     pub region: String,
     pub deepl_free: bool,
+    #[serde(default)]
+    pub deepl_plan: DeepLPlan,
     pub from_index: usize,
     pub to_index: usize,
     pub auto_pair: bool,
@@ -137,6 +172,7 @@ impl Default for Settings {
             auto_offline: true,
             region: "ap-guangzhou".into(),
             deepl_free: true,
+            deepl_plan: DeepLPlan::Developer,
             from_index: 1,
             to_index: 2,
             auto_pair: true,
@@ -146,6 +182,14 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn effective_deepl_plan(&self) -> DeepLPlan {
+        match self.deepl_plan {
+            DeepLPlan::Auto if self.deepl_free => DeepLPlan::LegacyFree,
+            DeepLPlan::Auto => DeepLPlan::Paid,
+            plan => plan,
+        }
+    }
+
     pub fn follow_bilingual_input(&mut self, text: &str) {
         if text.trim().is_empty()
             || !matches!(self.from_index, 0..=2)
@@ -189,6 +233,29 @@ pub struct Translation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deepl_plan_migrates_old_settings_without_enabling_paid_accounts() {
+        let old_free: Settings = serde_json::from_str(r#"{"deepl_free":true}"#).unwrap();
+        assert_eq!(old_free.deepl_plan, DeepLPlan::Auto);
+        assert_eq!(old_free.effective_deepl_plan(), DeepLPlan::LegacyFree);
+        let old_paid: Settings = serde_json::from_str(r#"{"deepl_free":false}"#).unwrap();
+        assert_eq!(old_paid.effective_deepl_plan(), DeepLPlan::Paid);
+        assert!(!old_paid.effective_deepl_plan().is_free());
+        let developer: Settings =
+            serde_json::from_str(r#"{"deepl_free":false,"deepl_plan":"developer"}"#).unwrap();
+        assert_eq!(developer.effective_deepl_plan(), DeepLPlan::Developer);
+        assert_eq!(
+            Settings::default().effective_deepl_plan(),
+            DeepLPlan::Developer
+        );
+        assert_eq!(
+            serde_json::from_str::<Settings>(&serde_json::to_string(&old_free).unwrap())
+                .unwrap()
+                .effective_deepl_plan(),
+            DeepLPlan::LegacyFree
+        );
+    }
+
     #[test]
     fn scripts_and_japanese_priority() {
         assert_eq!(detect("Hello world"), "en");

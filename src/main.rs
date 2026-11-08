@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 use windows_reactor::*;
 mod api;
+mod desktop;
 mod dictionary;
 mod model;
 mod native;
@@ -18,6 +19,9 @@ fn main() {
         let _ = std::fs::write(dir.join("last-error.log"), info.to_string());
     }));
     let background = std::env::args().any(|arg| arg == "--background");
+    if !background {
+        desktop::remember_foreground();
+    }
     let _session = match native::initialize(background) {
         Ok(Some(session)) => session,
         Ok(None) => return,

@@ -29,6 +29,7 @@ pub enum Message {
         Option<crate::dictionary::Entry>,
     ),
     Details(bool),
+    PopupFrame(native::PopupFrame),
     Pronounce(crate::speech::Accent),
     Pronounced(u64, Result<(), String>),
     PhoneticsReady(u64, Result<crate::speech::Phonetics, String>),
@@ -58,7 +59,7 @@ pub enum Message {
     SetKey(String),
     Region(String),
     AutoOffline(bool),
-    DeepLFree(bool),
+    DeepLPlan(Option<usize>),
     Save,
     Theme(Option<usize>),
     Search(String),
@@ -77,6 +78,10 @@ pub struct Translator {
     output: Option<Translation>,
     entry: Option<crate::dictionary::Entry>,
     details_open: bool,
+    popup_frame: Option<native::PopupFrame>,
+    popup_details_reveal: f64,
+    popup_details_from: f64,
+    popup_committed_reveal: std::rc::Rc<std::cell::Cell<f64>>,
     provider_picker_open: bool,
     provider_picker_selected: Option<Provider>,
     provider_picker_revision: u64,
@@ -287,8 +292,32 @@ impl Translator {
     }
 
     fn pronunciation_controls(&self, cx: &ViewContext<Self>) -> View {
-        if self.pronunciation_text().is_none() {
+        let Some(pronunciation) = self.pronunciation_text() else {
             return View::empty();
+        };
+        if !crate::speech::supports_word_phonetics(pronunciation) {
+            return Button::new()
+                .style(ButtonStyle::Subtle)
+                .width(32.0)
+                .height(32.0)
+                .min_width(0.0)
+                .padding(4.0)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .horizontal_content_alignment(HorizontalAlignment::Center)
+                .vertical_content_alignment(Center)
+                .automation_name("朗读")
+                .on_click(cx.message(Message::Pronounce(crate::speech::Accent::American)))
+                .content(
+                    Viewbox::new()
+                        .width(14.0)
+                        .height(14.0)
+                        .stretch(windows_reactor::Stretch::Uniform)
+                        .opacity(0.7)
+                        .vertical_alignment(Center)
+                        .slot(ViewboxSlot::Child, icon("\u{E993}")),
+                )
+                .tooltip("朗读")
+                .into();
         }
         Grid::new()
             .columns([Auto, Auto])
@@ -595,6 +624,12 @@ impl Translator {
             .map(chinese_senses)
             .unwrap_or_default();
         let details_open = self.details_open && !dictionary_senses.is_empty();
+        let details_reveal = if dictionary_senses.is_empty() {
+            0.0
+        } else {
+            self.popup_details_reveal.clamp(0.0, 1.0)
+        };
+        let details_mounted = details_open || details_reveal > 0.0;
         let is_word = self.output.as_ref().is_some_and(|translation| {
             !translation.source.trim().is_empty()
                 && translation
@@ -618,6 +653,9 @@ impl Translator {
             .clamp(60.0, 180.0);
         let fixed_height = 119.0 + input_height;
         let available_result = (480.0 - fixed_height).max(80.0);
+        let frame_height = self.popup_frame.map_or(184.0, |frame| frame.height);
+        let input_viewport_height = input_height.min((frame_height - 119.0).max(0.0));
+        let frame_result_height = (frame_height - 119.0 - input_viewport_height).max(0.0);
         let result_font = self.output.as_ref().map_or(23.0, |translation| {
             if long_input
                 || translation.target.chars().count() > 80
@@ -665,50 +703,62 @@ impl Translator {
             .map(dictionary_metadata)
             .filter(|value| !value.is_empty());
         let mut target_max_height = available_result;
+        let mut details_height = 0.0;
         let mut details_viewport_height = 0.0;
-        let result_height = if let Some(translation) = &self.output {
+        let (result_height, rendered_result_height) = if let Some(translation) = &self.output {
             if self.entry.is_some() {
                 let metadata_height = metadata.as_ref().map_or(0.0, |value| {
                     let width = if inline_pronunciation { 120.0 } else { 472.0 };
                     visual_lines(value, 14.0, width) as f64 * 20.0 + 6.0
                 });
                 let header_fixed = 28.0 + metadata_height + pronunciation_height;
-                let detail_reserve = if details_open { 72.0 } else { 0.0 };
-                let target_limit =
-                    (available_result - header_fixed - detail_reserve).max(result_line_height);
-                target_max_height = (visual_lines(&translation.target, result_font, 472.0) as f64
-                    * result_line_height)
-                    .min(target_limit);
-                let header_height = header_fixed + target_max_height;
-                if details_open {
-                    let meanings_height = dictionary_senses
-                        .iter()
-                        .map(|sense| visual_lines(&sense.definition, 15.0, 440.0) as f64 * 21.0)
-                        .sum::<f64>()
-                        + dictionary_senses.len().saturating_sub(1) as f64 * 12.0;
-                    let details_height =
-                        (meanings_height + 25.0).min((available_result - header_height).max(25.0));
-                    details_viewport_height = (details_height - 25.0).max(0.0);
-                    header_height + details_height
+                let estimated_target = visual_lines(&translation.target, result_font, 472.0) as f64
+                    * result_line_height;
+                let closed_target =
+                    estimated_target.min((available_result - header_fixed).max(result_line_height));
+                let open_target = estimated_target
+                    .min((available_result - header_fixed - 72.0).max(result_line_height));
+                let open_header = header_fixed + open_target;
+                let meanings_height = dictionary_senses
+                    .iter()
+                    .map(|sense| visual_lines(&sense.definition, 15.0, 440.0) as f64 * 21.0)
+                    .sum::<f64>()
+                    + dictionary_senses.len().saturating_sub(1) as f64 * 12.0;
+                details_height =
+                    (meanings_height + 25.0).min((available_result - open_header).max(25.0));
+                details_viewport_height = (details_height - 25.0).max(0.0);
+                // The target is independent of animation progress. Both the
+                // summary budget and detail reveal use the same eased frame.
+                target_max_height = closed_target + (open_target - closed_target) * details_reveal;
+                let target_height = if details_open {
+                    open_header + details_height
                 } else {
-                    header_height
-                }
+                    header_fixed + closed_target
+                };
+                (
+                    target_height,
+                    header_fixed + target_max_height + details_height * details_reveal,
+                )
             } else {
                 let word_metadata = if is_word { 26.0 } else { 0.0 };
-                (30.0
+                let height = (30.0
                     + notice_height
                     + pronunciation_height
                     + word_metadata
                     + visual_lines(&translation.target, result_font, 496.0) as f64
                         * result_line_height)
-                    .min(available_result)
+                    .min(available_result);
+                (height, height)
             }
         } else if self.error {
-            (visual_lines(&self.status, 12.0, 502.0).min(4) as f64 * 18.0 + 4.0)
-                .min(available_result)
+            let height = (visual_lines(&self.status, 12.0, 502.0).min(4) as f64 * 18.0 + 4.0)
+                .min(available_result);
+            (height, height)
         } else {
-            0.0
+            (0.0, 0.0)
         };
+        let rendered_result_height = rendered_result_height.min(frame_result_height);
+        let details_reveal_height = details_height * details_reveal;
         let natural_height = if expanded || self.error {
             (fixed_height + result_height).clamp(184.0, 480.0)
         } else {
@@ -719,6 +769,10 @@ impl Translator {
         } else {
             natural_height
         };
+        let transition_key = u64::from(details_open)
+            | (u64::from(self.provider_picker_open) << 1)
+            | (u64::from(expanded) << 2)
+            | (u64::from(self.error) << 3);
         cx.window_title("翻译");
         cx.window_visuals(
             WindowVisuals::new()
@@ -728,19 +782,29 @@ impl Translator {
         );
         let dismiss = cx.message(Message::Dismiss);
         cx.use_effect(
-            "popup-frame",
-            (
-                expanded,
-                self.error,
-                details_open,
-                self.provider_picker_open,
-                height.round() as u32,
-            ),
+            "popup-target",
+            (transition_key, height.to_bits()),
             move || {
-                native::configure_popup(558.0, height);
+                native::configure_popup_with_key(558.0, height, transition_key);
                 native::escape_handler(move || {
                     let _ = dismiss.call(());
                 });
+                None
+            },
+        );
+        let frame = self.popup_frame;
+        let reveal = self.popup_details_reveal;
+        let committed_reveal = self.popup_committed_reveal.clone();
+        cx.use_effect(
+            "popup-frame-commit",
+            frame.map(|frame| frame.serial),
+            move || {
+                if let Some(frame) = frame
+                    && native::popup_frame_is_current(frame)
+                {
+                    native::commit_popup_frame(frame);
+                    committed_reveal.set(reveal);
+                }
                 None
             },
         );
@@ -832,7 +896,8 @@ impl Translator {
             .background(Color::transparent())
             .border_thickness(0.0)
             .border_brush(Color::transparent())
-            .min_height(60.0)
+            .height(input_viewport_height)
+            .min_height(0.0)
             .max_height(180.0)
             .horizontal_alignment(Stretch)
             .automation_name("输入单词或文本")
@@ -936,7 +1001,7 @@ impl Translator {
                         Border::new().padding(12.0).content(header_content)
                     }
                 };
-                let details: View = if details_open {
+                let details: View = if details_mounted {
                     let senses = StackPanel::new().spacing(12.0).keyed_children(
                         dictionary_senses.iter().enumerate().map(|(index, sense)| {
                             (
@@ -953,19 +1018,32 @@ impl Translator {
                             )
                         }),
                     );
-                    Border::new()
-                        .border_brush(ThemeBrush::CardStroke)
-                        .border_thickness(Thickness::new(0.0, 1.0, 0.0, 0.0))
-                        .padding(12.0)
+                    // Keep the body measured at its full size while revealing
+                    // only the viewport belonging to the current native frame.
+                    ScrollViewer::new()
+                        .height(details_reveal_height)
+                        .max_height(details_reveal_height)
+                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                         .content(
-                            ScrollViewer::new()
-                                .max_height(details_viewport_height)
-                                .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
-                                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            Border::new()
+                                .height(details_height)
+                                .vertical_alignment(VerticalAlignment::Top)
+                                .border_brush(ThemeBrush::CardStroke)
+                                .border_thickness(Thickness::new(0.0, 1.0, 0.0, 0.0))
+                                .padding(12.0)
                                 .content(
-                                    Border::new()
-                                        .padding(Thickness::new(0.0, 0.0, 10.0, 0.0))
-                                        .content(senses),
+                                    ScrollViewer::new()
+                                        .height(details_viewport_height)
+                                        .horizontal_scroll_bar_visibility(
+                                            ScrollBarVisibility::Disabled,
+                                        )
+                                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                                        .content(
+                                            Border::new()
+                                                .padding(Thickness::new(0.0, 0.0, 10.0, 0.0))
+                                                .content(senses),
+                                        ),
                                 ),
                         )
                 } else {
@@ -976,7 +1054,7 @@ impl Translator {
                     .border_brush(ThemeBrush::CardStroke)
                     .border_thickness(1.0)
                     .corner_radius(8.0)
-                    .max_height(result_height)
+                    .max_height(rendered_result_height)
                     .vertical_alignment(VerticalAlignment::Top)
                     .content(Grid::new().rows([Auto, Auto, Auto]).children((
                         header,
@@ -997,7 +1075,7 @@ impl Translator {
                     .border_thickness(1.0)
                     .corner_radius(8.0)
                     .padding(14.0)
-                    .max_height(result_height)
+                    .max_height(rendered_result_height)
                     .vertical_alignment(VerticalAlignment::Top)
                     .content(
                         StackPanel::new().spacing(6.0).children((
@@ -1008,8 +1086,11 @@ impl Translator {
                             },
                             ScrollViewer::new()
                                 .max_height(
-                                    (result_height - 30.0 - notice_height - pronunciation_height)
-                                        .max(32.0),
+                                    (rendered_result_height
+                                        - 30.0
+                                        - notice_height
+                                        - pronunciation_height)
+                                        .max(0.0),
                                 )
                                 .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
@@ -1030,7 +1111,7 @@ impl Translator {
             }
         } else if self.error {
             ScrollViewer::new()
-                .max_height(result_height)
+                .max_height(rendered_result_height)
                 .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .content(
@@ -1041,6 +1122,13 @@ impl Translator {
         } else {
             View::empty()
         };
+        let result = ScrollViewer::new()
+            .height(frame_result_height)
+            .max_height(frame_result_height)
+            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+            .vertical_alignment(VerticalAlignment::Top)
+            .content(result);
         let engine = self
             .output
             .as_ref()
@@ -1109,6 +1197,8 @@ impl Translator {
                 },
             ));
         let surface = Border::new()
+            .height(frame_height)
+            .vertical_alignment(VerticalAlignment::Top)
             .corner_radius(12.0)
             .padding(Thickness::new(14.0, 12.0, 14.0, 10.0))
             .on_pointer_pressed(cx.callback(|point: PointerEventInfo| {
@@ -1121,14 +1211,10 @@ impl Translator {
             .content(
                 Grid::new()
                     .rows([
-                        Auto,
-                        Auto,
-                        if self.provider_picker_open {
-                            Star(1.0)
-                        } else {
-                            Auto
-                        },
-                        Auto,
+                        GridLength::Pixel(44.0),
+                        GridLength::Pixel(input_viewport_height),
+                        Star(1.0),
+                        GridLength::Pixel(32.0),
                     ])
                     .row_spacing(7.0)
                     .children((
@@ -1218,10 +1304,21 @@ impl Translator {
                     .text(&self.settings.region)
                     .on_text_changed(cx.callback(Message::Region)),
             ),
-            Provider::DeepL => ToggleSwitch::new()
-                .is_on(self.settings.deepl_free)
-                .on_toggled(cx.callback(Message::DeepLFree))
-                .slot(ToggleSwitchSlot::Header, "使用 Free API"),
+            Provider::DeepL => field(
+                "免费计划",
+                ComboBox::new()
+                    .items_source([
+                        "Developer · 总量 100 万",
+                        "API Free 旧版 · 每月 50 万",
+                        "停用付费计划",
+                    ])
+                    .selected_index(match self.settings.effective_deepl_plan() {
+                        DeepLPlan::Developer => 0,
+                        DeepLPlan::LegacyFree => 1,
+                        _ => 2,
+                    })
+                    .on_selection_changed(cx.callback(Message::DeepLPlan)),
+            ),
             _ => View::empty(),
         };
         let routes = crate::routing::status(&self.settings);
@@ -1235,11 +1332,7 @@ impl Translator {
                 } else if route.cooldown_seconds > 0 {
                     format!("暂不可用 · {}", route.message)
                 } else if let Some(remaining) = route.remaining_characters {
-                    let period = if route.provider == Provider::MyMemory {
-                        "今日"
-                    } else {
-                        "本月"
-                    };
+                    let period = route.allowance_period.label();
                     format!(
                         "{period}剩余 {remaining} / {} 字符",
                         route.allowance_characters
@@ -1252,10 +1345,7 @@ impl Translator {
                     Grid::new()
                         .columns([GridLength::Pixel(90.0), Star(1.0)])
                         .column_spacing(8.0)
-                        .children((
-                            text(route.provider.name(), 13.0),
-                            muted(description).grid_column(1),
-                        )),
+                        .children((text(route.label, 13.0), muted(description).grid_column(1))),
                 )
             }));
         let order = crate::routing::candidates(&self.settings)
@@ -1513,6 +1603,10 @@ impl Component for Translator {
                     native::Action::CompositionEnded => Message::Composition(false),
                 });
             });
+            let sender = cx.sender();
+            native::install_popup_frame_handler(move |frame| {
+                let _ = sender.send(Message::PopupFrame(frame));
+            });
             if let Some(message) = native::take_startup_warning() {
                 warning = Some(message);
             }
@@ -1542,6 +1636,10 @@ impl Component for Translator {
             output: None,
             entry: None,
             details_open: false,
+            popup_frame: None,
+            popup_details_reveal: 0.0,
+            popup_details_from: 0.0,
+            popup_committed_reveal: std::rc::Rc::new(std::cell::Cell::new(0.0)),
             provider_picker_open: false,
             provider_picker_selected: None,
             provider_picker_revision: 0,
@@ -1596,6 +1694,24 @@ impl Component for Translator {
                 }
             }
             Message::Details(open) => self.details_open = open,
+            Message::PopupFrame(frame) if native::popup_frame_is_current(frame) => {
+                if self
+                    .popup_frame
+                    .is_none_or(|previous| previous.revision != frame.revision)
+                {
+                    // A reversal starts at the last viewport committed to the
+                    // HWND, including when a newer request invalidated a frame.
+                    self.popup_details_from = self.popup_committed_reveal.get();
+                }
+                let target = if frame.transition_key & 1 != 0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                self.popup_details_reveal =
+                    self.popup_details_from + (target - self.popup_details_from) * frame.progress;
+                self.popup_frame = Some(frame);
+            }
             Message::Pronounce(accent) => {
                 let Some(text) = self.pronunciation_text().map(str::to_owned) else {
                     return;
@@ -1744,6 +1860,7 @@ impl Component for Translator {
                     || settings.credentials != self.settings.credentials
                     || settings.region != self.settings.region
                     || settings.deepl_free != self.settings.deepl_free
+                    || settings.deepl_plan != self.settings.deepl_plan
                     || settings.auto_offline != self.settings.auto_offline
                     || settings.auto_pair != self.settings.auto_pair;
                 self.settings = settings;
@@ -1897,9 +2014,11 @@ impl Component for Translator {
                     self.save();
                 }
             }
-            Message::DeepLFree(value) => {
-                if self.settings.deepl_free != value {
-                    self.settings.deepl_free = value;
+            Message::DeepLPlan(Some(index)) if index < 3 => {
+                let plan = [DeepLPlan::Developer, DeepLPlan::LegacyFree, DeepLPlan::Paid][index];
+                if self.settings.effective_deepl_plan() != plan {
+                    self.settings.deepl_plan = plan;
+                    self.settings.deepl_free = plan.is_free();
                     self.save();
                 }
             }

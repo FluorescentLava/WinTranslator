@@ -38,6 +38,11 @@ fn dictionary_word(text: &str) -> Option<&str> {
     .then_some(text)
 }
 
+/// Whether this text is a single English word supported by accent phonetics.
+pub fn supports_word_phonetics(text: &str) -> bool {
+    dictionary_word(text).is_some()
+}
+
 fn phonetic_value(value: &serde_json::Value) -> String {
     let Some(value) = value.as_str() else {
         return String::new();

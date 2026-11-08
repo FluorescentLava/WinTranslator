@@ -80,15 +80,15 @@ pub fn has_credentials(settings: &Settings, provider: Provider) -> bool {
         && (provider == Provider::DeepL || !credential.id.trim().is_empty())
 }
 
-// Only services with an ongoing free allowance can receive automatic requests.
-// Tencent's discontinued offer and Youdao's introductory credit are not a budget.
+// Only explicitly free plans can receive automatic requests. DeepL Developer's
+// one-time allowance is persisted for its lifetime; paid plans are excluded.
 pub fn candidates(settings: &Settings) -> Vec<Provider> {
     if settings.provider == Provider::Offline {
         return Vec::new();
     }
     let eligible = |provider| {
         matches!(provider, Provider::Baidu | Provider::MyMemory)
-            || (provider == Provider::DeepL && settings.deepl_free)
+            || (provider == Provider::DeepL && settings.effective_deepl_plan().is_free())
     };
     let mut result = Vec::new();
     for provider in [
@@ -105,27 +105,53 @@ pub fn candidates(settings: &Settings) -> Vec<Provider> {
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllowancePeriod {
+    Daily,
+    Monthly,
+    Lifetime,
+}
+impl AllowancePeriod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "今日",
+            Self::Monthly => "本月",
+            Self::Lifetime => "总量",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Allowance {
     characters: u64,
-    monthly: bool,
+    period: AllowancePeriod,
     utc_offset: i32,
 }
-fn allowance(provider: Provider) -> Allowance {
+fn allowance(provider: Provider, deepl_plan: DeepLPlan) -> Allowance {
     match provider {
         Provider::Baidu => Allowance {
             characters: 50_000,
-            monthly: true,
+            period: AllowancePeriod::Monthly,
             utc_offset: 8 * 3600,
         },
-        Provider::DeepL => Allowance {
+        Provider::DeepL if deepl_plan == DeepLPlan::Developer => Allowance {
+            characters: 1_000_000,
+            period: AllowancePeriod::Lifetime,
+            utc_offset: 0,
+        },
+        Provider::DeepL if deepl_plan == DeepLPlan::LegacyFree => Allowance {
             characters: 500_000,
-            monthly: true,
+            period: AllowancePeriod::Monthly,
+            utc_offset: 0,
+        },
+        Provider::DeepL => Allowance {
+            characters: 0,
+            period: AllowancePeriod::Lifetime,
             utc_offset: 0,
         },
         Provider::MyMemory => Allowance {
             characters: 5_000,
-            monthly: false,
+            period: AllowancePeriod::Daily,
             utc_offset: 0,
         },
         _ => unreachable!("non-free provider cannot reserve an allowance"),
@@ -152,9 +178,11 @@ struct Usage {
 
 pub struct ProviderStatus {
     pub provider: Provider,
+    pub label: &'static str,
     pub configured: bool,
     pub eligible: bool,
     pub allowance_characters: u64,
+    pub allowance_period: AllowancePeriod,
     pub remaining_characters: Option<u64>,
     pub cooldown_seconds: u64,
     pub message: String,
@@ -174,13 +202,20 @@ pub fn status(settings: &Settings) -> Vec<ProviderStatus> {
         .into_iter()
         .map(|provider| {
             let configured = has_credentials(settings, provider);
-            let eligible = configured && (provider != Provider::DeepL || settings.deepl_free);
-            let limit = allowance(provider).characters;
+            let deepl_plan = settings.effective_deepl_plan();
+            let eligible = configured && (provider != Provider::DeepL || deepl_plan.is_free());
+            let limits = allowance(provider, deepl_plan);
             let mut result = ProviderStatus {
                 provider,
+                label: if provider == Provider::DeepL {
+                    deepl_plan.name()
+                } else {
+                    provider.name()
+                },
                 configured,
                 eligible,
-                allowance_characters: limit,
+                allowance_characters: limits.characters,
+                allowance_period: limits.period,
                 remaining_characters: None,
                 cooldown_seconds: 0,
                 message: String::new(),
@@ -193,15 +228,15 @@ pub fn status(settings: &Settings) -> Vec<ProviderStatus> {
                         .accounts
                         .get(&account)
                         .cloned()
-                        .unwrap_or_else(|| Usage::new(provider, now));
-                    usage.refresh(provider, now);
-                    result.remaining_characters = Some(limit.saturating_sub(usage.used_characters));
+                        .unwrap_or_else(|| Usage::new(limits, now));
+                    usage.refresh(limits, now);
+                    result.remaining_characters = Some(usage.remaining(limits));
                     result.cooldown_seconds =
                         usage.blocked_until.saturating_sub(now.timestamp()).max(0) as u64;
                     result.message = if !configured {
                         "尚未配置 API 凭据".into()
                     } else if !eligible {
-                        "仅 DeepL API Free 加入免费自动路由".into()
+                        "付费 DeepL 计划不加入免费路由".into()
                     } else if let Err(error) = usage.available(now) {
                         error.message
                     } else {
@@ -214,16 +249,25 @@ pub fn status(settings: &Settings) -> Vec<ProviderStatus> {
         .collect()
 }
 impl Usage {
-    fn new(provider: Provider, now: DateTime<Utc>) -> Self {
-        let limits = allowance(provider);
+    fn new(limits: Allowance, now: DateTime<Utc>) -> Self {
+        if limits.period == AllowancePeriod::Lifetime {
+            return Self {
+                period_start: 0,
+                period_end: i64::MAX,
+                used_characters: 0,
+                blocked_until: 0,
+                blocked_kind: None,
+                next_request_ms: 0,
+            };
+        }
         let offset = FixedOffset::east_opt(limits.utc_offset).unwrap();
         let date = now.with_timezone(&offset).date_naive();
-        let start = if limits.monthly {
+        let start = if limits.period == AllowancePeriod::Monthly {
             date.with_day(1).unwrap()
         } else {
             date
         };
-        let end = if limits.monthly {
+        let end = if limits.period == AllowancePeriod::Monthly {
             if start.month() == 12 {
                 chrono::NaiveDate::from_ymd_opt(start.year() + 1, 1, 1).unwrap()
             } else {
@@ -249,11 +293,14 @@ impl Usage {
             next_request_ms: 0,
         }
     }
-    fn refresh(&mut self, provider: Provider, now: DateTime<Utc>) {
+    fn refresh(&mut self, limits: Allowance, now: DateTime<Utc>) {
         // Moving the system clock backwards must not grant another allowance.
-        if now.timestamp() >= self.period_end {
-            *self = Self::new(provider, now);
+        if limits.period != AllowancePeriod::Lifetime && now.timestamp() >= self.period_end {
+            *self = Self::new(limits, now);
         }
+    }
+    fn remaining(&self, limits: Allowance) -> u64 {
+        limits.characters.saturating_sub(self.used_characters)
     }
     fn available(&self, now: DateTime<Utc>) -> Result<(), Failure> {
         if self.blocked_until <= now.timestamp() {
@@ -261,6 +308,9 @@ impl Usage {
         }
         let kind = self.blocked_kind.unwrap_or(FailureKind::Transient);
         let message = match kind {
+            FailureKind::Quota if self.period_end == i64::MAX => {
+                "DeepL Developer 总免费额度已用完，不会自动重置"
+            }
             FailureKind::Quota => "服务额度已用完，等待下个免费周期",
             FailureKind::RateLimited => "服务正在限流冷却，稍后自动重试",
             FailureKind::Auth => "凭据鉴权失败，暂时跳过此服务，请检查设置",
@@ -272,15 +322,23 @@ impl Usage {
 
 struct QuotaStore {
     directory: PathBuf,
+    deepl_plan: DeepLPlan,
 }
+
 #[derive(Debug)]
 struct Reservation {
     period_start: i64,
     remaining_characters: u64,
 }
 impl QuotaStore {
-    fn new(directory: PathBuf) -> Self {
-        Self { directory }
+    fn new(directory: PathBuf, deepl_plan: DeepLPlan) -> Self {
+        Self {
+            directory,
+            deepl_plan,
+        }
+    }
+    fn allowance(&self, provider: Provider) -> Allowance {
+        allowance(provider, self.deepl_plan)
     }
     fn account(settings: &Settings, provider: Provider) -> String {
         // Hashes separate different accounts without writing API secrets to disk.
@@ -295,8 +353,17 @@ impl QuotaStore {
                 }
             })
             .unwrap_or_else(|| "keyless".into());
+        let label = if provider == Provider::DeepL {
+            match settings.effective_deepl_plan() {
+                DeepLPlan::Developer => "DeepLDeveloper".to_owned(),
+                DeepLPlan::LegacyFree => "DeepL".to_owned(),
+                _ => "DeepLPaid".to_owned(),
+            }
+        } else {
+            format!("{provider:?}")
+        };
         format!(
-            "{provider:?}:{}",
+            "{label}:{}",
             hex::encode(Sha256::digest(identity.as_bytes()))
         )
     }
@@ -345,16 +412,15 @@ impl QuotaStore {
         now: DateTime<Utc>,
     ) -> Result<Reservation, Failure> {
         let count = text.chars().count() as u64;
+        let limits = self.allowance(provider);
         self.locked(|ledger| {
             let usage = ledger
                 .accounts
                 .entry(account.into())
-                .or_insert_with(|| Usage::new(provider, now));
-            usage.refresh(provider, now);
+                .or_insert_with(|| Usage::new(limits, now));
+            usage.refresh(limits, now);
             usage.available(now)?;
-            let remaining = allowance(provider)
-                .characters
-                .saturating_sub(usage.used_characters);
+            let remaining = usage.remaining(limits);
             if count > remaining {
                 return Err(Failure::new(
                     FailureKind::Quota,
@@ -377,19 +443,18 @@ impl QuotaStore {
         reservation: &mut Reservation,
         now: DateTime<Utc>,
     ) -> Result<u64, Failure> {
+        let limits = self.allowance(provider);
         self.locked(|ledger| {
             let usage = ledger
                 .accounts
                 .entry(account.into())
-                .or_insert_with(|| Usage::new(provider, now));
-            usage.refresh(provider, now);
+                .or_insert_with(|| Usage::new(limits, now));
+            usage.refresh(limits, now);
             usage.available(now)?;
             // A long translation can straddle a day or month boundary. Reserve
             // its unsent chunks again in the new period before sending them.
             if reservation.period_start != usage.period_start {
-                let remaining = allowance(provider)
-                    .characters
-                    .saturating_sub(usage.used_characters);
+                let remaining = usage.remaining(limits);
                 if reservation.remaining_characters > remaining {
                     return Err(Failure::new(FailureKind::Quota, "新免费周期的剩余额度不足"));
                 }
@@ -415,23 +480,24 @@ impl QuotaStore {
         failure: &Failure,
         now: DateTime<Utc>,
     ) -> Result<(), Failure> {
+        let limits = self.allowance(provider);
         self.locked(|ledger| {
             let usage = ledger
                 .accounts
                 .entry(account.into())
-                .or_insert_with(|| Usage::new(provider, now));
-            usage.refresh(provider, now);
-            let seconds = match failure.kind {
-                FailureKind::Quota => (usage.period_end - now.timestamp()).max(0),
-                FailureKind::RateLimited => {
-                    failure.retry_after_secs.unwrap_or(60).clamp(1, 300) as i64
-                }
-                FailureKind::Auth => 300,
-                FailureKind::Transient => 15,
-                _ => 0,
+                .or_insert_with(|| Usage::new(limits, now));
+            usage.refresh(limits, now);
+            let blocked_until = match failure.kind {
+                FailureKind::Quota => usage.period_end,
+                FailureKind::RateLimited => now
+                    .timestamp()
+                    .saturating_add(failure.retry_after_secs.unwrap_or(60).clamp(1, 300) as i64),
+                FailureKind::Auth => now.timestamp().saturating_add(300),
+                FailureKind::Transient => now.timestamp().saturating_add(15),
+                _ => now.timestamp(),
             };
-            if seconds > 0 && now.timestamp() + seconds > usage.blocked_until {
-                usage.blocked_until = now.timestamp() + seconds;
+            if blocked_until > now.timestamp() && blocked_until > usage.blocked_until {
+                usage.blocked_until = blocked_until;
                 usage.blocked_kind = Some(failure.kind);
             }
             Ok(())
@@ -522,7 +588,7 @@ pub fn translate_online(
         settings,
         cancelled,
         attempt,
-        &QuotaStore::new(storage::data_dir()),
+        &QuotaStore::new(storage::data_dir(), settings.effective_deepl_plan()),
         &Utc::now,
         &|event| storage::diagnostic(event),
     )
@@ -675,6 +741,9 @@ mod tests {
     struct TestStore(QuotaStore);
     impl TestStore {
         fn new() -> Self {
+            Self::with_deepl_plan(DeepLPlan::Developer)
+        }
+        fn with_deepl_plan(deepl_plan: DeepLPlan) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let directory = std::env::temp_dir().join(format!(
                 "translation-routing-{}-{}-{}",
@@ -682,7 +751,7 @@ mod tests {
                 Utc::now().timestamp_nanos_opt().unwrap(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            Self(QuotaStore::new(directory))
+            Self(QuotaStore::new(directory, deepl_plan))
         }
     }
     impl Drop for TestStore {
@@ -732,6 +801,12 @@ mod tests {
         assert!(candidates(&configured(Provider::Offline)).is_empty());
         let mut paid = configured(Provider::DeepL);
         paid.deepl_free = false;
+        paid.deepl_plan = DeepLPlan::Paid;
+        assert_eq!(candidates(&paid), vec![Provider::Baidu, Provider::MyMemory]);
+        paid.deepl_free = true;
+        assert_eq!(candidates(&paid), vec![Provider::Baidu, Provider::MyMemory]);
+        paid.deepl_plan = DeepLPlan::Auto;
+        paid.deepl_free = false;
         assert_eq!(candidates(&paid), vec![Provider::Baidu, Provider::MyMemory]);
         assert_eq!(
             candidates(&Settings {
@@ -766,7 +841,7 @@ mod tests {
             .0
             .reserve(&account, Provider::MyMemory, &"中🦀".repeat(2_500), now)
             .unwrap();
-        let reopened = QuotaStore::new(store.0.directory.clone());
+        let reopened = QuotaStore::new(store.0.directory.clone(), store.0.deepl_plan);
         assert_eq!(
             reopened
                 .reserve(&account, Provider::MyMemory, "a", now)
@@ -787,6 +862,183 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ledger.accounts[&account].used_characters, 2);
+    }
+    #[test]
+    fn developer_allowance_persists_across_reopen_months_and_years() {
+        let store = TestStore::new();
+        let settings = configured(Provider::DeepL);
+        let account = QuotaStore::account(&settings, Provider::DeepL);
+        let mut reservation = store
+            .0
+            .reserve(
+                &account,
+                Provider::DeepL,
+                &"中🦀".repeat(250_000),
+                date("2026-11-30T23:59:59Z"),
+            )
+            .unwrap();
+        reservation.remaining_characters = 3;
+        let reopened = QuotaStore::new(store.0.directory.clone(), DeepLPlan::Developer);
+        // A lifetime reservation must not be charged again at a month boundary.
+        reopened
+            .request_slot(
+                &account,
+                Provider::DeepL,
+                &mut reservation,
+                date("2026-12-01T00:00:00Z"),
+            )
+            .unwrap();
+        reopened
+            .reserve(
+                &account,
+                Provider::DeepL,
+                &"a".repeat(499_999),
+                date("2026-12-01T00:00:00Z"),
+            )
+            .unwrap();
+        reopened
+            .reserve(
+                &account,
+                Provider::DeepL,
+                "文",
+                date("2027-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        for now in [date("2026-11-01T00:00:00Z"), date("2030-01-01T00:00:00Z")] {
+            assert_eq!(
+                reopened
+                    .reserve(&account, Provider::DeepL, "x", now)
+                    .unwrap_err()
+                    .kind,
+                FailureKind::Quota
+            );
+        }
+        let ledger: Ledger = serde_json::from_slice(
+            &fs::read(store.0.directory.join("free-api-usage.json")).unwrap(),
+        )
+        .unwrap();
+        let usage = &ledger.accounts[&account];
+        assert_eq!(usage.used_characters, 1_000_000);
+        assert_eq!(usage.period_start, 0);
+        assert_eq!(usage.period_end, i64::MAX);
+    }
+    #[test]
+    fn legacy_free_keeps_old_account_usage_and_resets_at_utc_month_boundary() {
+        let store = TestStore::with_deepl_plan(DeepLPlan::LegacyFree);
+        let mut settings = configured(Provider::DeepL);
+        settings.deepl_plan = DeepLPlan::Auto;
+        settings.deepl_free = true;
+        let account = QuotaStore::account(&settings, Provider::DeepL);
+        assert_eq!(
+            account,
+            format!("DeepL:{}", hex::encode(Sha256::digest(b":test-free-key")))
+        );
+        assert!(candidates(&settings).contains(&Provider::DeepL));
+        settings.deepl_plan = DeepLPlan::LegacyFree;
+        assert_eq!(QuotaStore::account(&settings, Provider::DeepL), account);
+        settings.deepl_plan = DeepLPlan::Developer;
+        assert_ne!(QuotaStore::account(&settings, Provider::DeepL), account);
+
+        // This is the ledger schema and account label written before plan selection.
+        let old_ledger = serde_json::json!({
+            "accounts": {
+                (account.clone()): {
+                    "period_start": date("2026-11-01T00:00:00Z").timestamp(),
+                    "period_end": date("2026-12-01T00:00:00Z").timestamp(),
+                    "used_characters": 499_999
+                }
+            }
+        });
+        fs::create_dir_all(&store.0.directory).unwrap();
+        fs::write(
+            store.0.directory.join("free-api-usage.json"),
+            serde_json::to_vec(&old_ledger).unwrap(),
+        )
+        .unwrap();
+        store
+            .0
+            .reserve(
+                &account,
+                Provider::DeepL,
+                "中",
+                date("2026-11-30T15:59:59Z"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .0
+                .reserve(&account, Provider::DeepL, "x", date("2026-11-30T16:00:00Z"),)
+                .unwrap_err()
+                .kind,
+            FailureKind::Quota
+        );
+        let reopened = QuotaStore::new(store.0.directory.clone(), DeepLPlan::LegacyFree);
+        reopened
+            .reserve(
+                &account,
+                Provider::DeepL,
+                "中文",
+                date("2026-12-01T00:00:00Z"),
+            )
+            .unwrap();
+        let ledger: Ledger = serde_json::from_slice(
+            &fs::read(store.0.directory.join("free-api-usage.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ledger.accounts[&account].used_characters, 2);
+        assert_eq!(
+            ledger.accounts[&account].period_end,
+            date("2027-01-01T00:00:00Z").timestamp()
+        );
+    }
+    #[test]
+    fn deepl_quota_failure_cooldown_matches_the_selected_plan_period() {
+        let before = date("2026-11-30T23:59:59Z");
+        let after = date("2026-12-01T00:00:00Z");
+        for plan in [DeepLPlan::Developer, DeepLPlan::LegacyFree] {
+            let store = TestStore::with_deepl_plan(plan);
+            let mut settings = configured(Provider::DeepL);
+            settings.deepl_plan = plan;
+            let account = QuotaStore::account(&settings, Provider::DeepL);
+            store
+                .0
+                .reserve(&account, Provider::DeepL, "hello", before)
+                .unwrap();
+            store
+                .0
+                .record_failure(
+                    &account,
+                    Provider::DeepL,
+                    &Failure::new(FailureKind::Quota, "server quota exhausted"),
+                    before,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .0
+                    .reserve(&account, Provider::DeepL, "x", before)
+                    .unwrap_err()
+                    .kind,
+                FailureKind::Quota
+            );
+            let reopened = QuotaStore::new(store.0.directory.clone(), plan);
+            if plan == DeepLPlan::Developer {
+                let failure = reopened
+                    .reserve(&account, Provider::DeepL, "x", after)
+                    .unwrap_err();
+                assert_eq!(failure.kind, FailureKind::Quota);
+                assert!(failure.message.contains("不会自动重置"));
+                assert!(
+                    reopened
+                        .reserve(&account, Provider::DeepL, "x", date("2030-01-01T00:00:00Z"),)
+                        .is_err()
+                );
+            } else {
+                reopened
+                    .reserve(&account, Provider::DeepL, "x", after)
+                    .unwrap();
+            }
+        }
     }
     #[test]
     fn baidu_month_changes_at_beijing_midnight_and_clock_rollback_does_not_reset() {
@@ -818,7 +1070,7 @@ mod tests {
             .map(|_| {
                 let path = path.clone();
                 std::thread::spawn(move || {
-                    QuotaStore::new(path)
+                    QuotaStore::new(path, DeepLPlan::Developer)
                         .reserve(
                             "same-keyless-account",
                             Provider::MyMemory,
@@ -882,7 +1134,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        let reopened = QuotaStore::new(store.0.directory.clone());
+        let reopened = QuotaStore::new(store.0.directory.clone(), store.0.deepl_plan);
         assert_eq!(
             reopened
                 .request_slot(

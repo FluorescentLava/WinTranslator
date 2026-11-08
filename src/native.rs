@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
+    rc::Rc,
     time::Instant,
 };
 type Hwnd = *mut c_void;
@@ -99,8 +100,31 @@ struct ResizeAnimation {
     window: Hwnd,
     from: Rect,
     to: Rect,
-    started: Instant,
+    elapsed_ms: f64,
+    last_sample: Instant,
     monitor: Hwnd,
+    dpi: u32,
+    revision: u64,
+    transition_key: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopupFrame {
+    pub revision: u64,
+    pub serial: u64,
+    pub transition_key: u64,
+    pub width: f64,
+    pub height: f64,
+    pub target_height: f64,
+    pub progress: f64,
+    pub finished: bool,
+}
+#[derive(Clone, Copy)]
+struct PendingPopupFrame {
+    frame: PopupFrame,
+    window: Hwnd,
+    rectangle: Rect,
+    flags: u32,
+    transition_key: u64,
 }
 #[derive(Clone, Copy)]
 pub enum Action {
@@ -124,6 +148,15 @@ thread_local! {
     static STARTUP_WARNING: RefCell<Option<String>> = const { RefCell::new(None) };
     static PENDING_ACTION: Cell<Option<Action>> = const { Cell::new(None) };
     static RESIZE_ANIMATION: Cell<Option<ResizeAnimation>> = const { Cell::new(None) };
+    static RESIZE_REVISION: Cell<u64> = const { Cell::new(0) };
+    static FRAME_SERIAL: Cell<u64> = const { Cell::new(0) };
+    static TRANSITION_KEY: Cell<u64> = const { Cell::new(0) };
+    static PENDING_FRAME: Cell<Option<PendingPopupFrame>> = const { Cell::new(None) };
+    static FRAME_HANDLER: RefCell<Option<Rc<dyn Fn(PopupFrame)>>> = const { RefCell::new(None) };
+    static APPLYING_FRAME: Cell<bool> = const { Cell::new(false) };
+    static MANUAL_MOVE: Cell<bool> = const { Cell::new(false) };
+    static DEFER_EXTERNAL_GEOMETRY: Cell<bool> = const { Cell::new(false) };
+    static SHOW_AFTER_FRAME: Cell<bool> = const { Cell::new(false) };
     static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 #[link(name = "user32")]
@@ -155,6 +188,7 @@ unsafe extern "system" {
     ) -> i32;
     fn GetDpiForWindow(window: Hwnd) -> u32;
     fn GetWindowRect(window: Hwnd, rect: *mut Rect) -> i32;
+    fn GetClientRect(window: Hwnd, rect: *mut Rect) -> i32;
     fn IsWindowVisible(window: Hwnd) -> i32;
     fn RedrawWindow(window: Hwnd, rectangle: *const Rect, region: Hwnd, flags: u32) -> i32;
     fn SetTimer(
@@ -299,6 +333,17 @@ fn mouse_monitor() -> Hwnd {
         MonitorFromPoint(point, 2)
     }
 }
+fn monitor_dpi(window: Hwnd, monitor: Hwnd) -> u32 {
+    if unsafe { MonitorFromWindow(window, 2) } == monitor {
+        return unsafe { GetDpiForWindow(window) }.max(96);
+    }
+    let (mut x, mut y) = (96, 96);
+    if unsafe { GetDpiForMonitor(monitor, 0, &mut x, &mut y) } == 0 {
+        x.max(96)
+    } else {
+        unsafe { GetDpiForWindow(window) }.max(96)
+    }
+}
 fn placement(window: Hwnd) -> (i32, i32, i32, i32) {
     let monitor = ANCHOR.with(|value| {
         if value.get().is_null() {
@@ -316,11 +361,7 @@ fn placement(window: Hwnd) -> (i32, i32, i32, i32) {
             bottom: 720,
         };
     }
-    let (mut dx, mut dy) = (96, 96);
-    if unsafe { GetDpiForMonitor(monitor, 0, &mut dx, &mut dy) } != 0 {
-        dx = unsafe { GetDpiForWindow(window) }.max(96);
-    }
-    let scale = f64::from(dx) / 96.0;
+    let scale = f64::from(monitor_dpi(window, monitor)) / 96.0;
     let margin = (16.0 * scale).round() as i32;
     let (width, height) = SIZE.with(Cell::get);
     let width = ((width * scale).round() as i32)
@@ -334,11 +375,16 @@ fn placement(window: Hwnd) -> (i32, i32, i32, i32) {
         height,
     )
 }
-fn stop_resize(window: Hwnd) {
+fn finish_resize(window: Hwnd) {
     unsafe {
         KillTimer(window, RESIZE_TIMER);
     }
     RESIZE_ANIMATION.with(|value| value.set(None));
+}
+fn stop_resize(window: Hwnd) {
+    finish_resize(window);
+    PENDING_FRAME.with(|value| value.set(None));
+    RESIZE_REVISION.with(|value| value.set(value.get().wrapping_add(1)));
 }
 fn request_refresh(window: Hwnd) {
     if unsafe { IsWindowVisible(window) } != 0
@@ -353,6 +399,7 @@ fn set_rectangle(window: Hwnd, rectangle: Rect, flags: u32) {
     if flags == 0 && unsafe { GetWindowRect(window, &mut current) } != 0 && current == rectangle {
         return;
     }
+    let was_applying = APPLYING_FRAME.with(|value| value.replace(true));
     unsafe {
         SetWindowPos(
             window,
@@ -361,14 +408,11 @@ fn set_rectangle(window: Hwnd, rectangle: Rect, flags: u32) {
             rectangle.top,
             rectangle.right - rectangle.left,
             rectangle.bottom - rectangle.top,
-            // Keep the existing redirected surface until XAML commits the new
-            // layout. SWP_NOCOPYBITS discarded it on every animation frame,
-            // exposing the host background before the compositor was ready.
+            // The caller has already committed the corresponding XAML viewport.
             flags | 0x0004 | 0x0010 | 0x2000,
         );
     }
-    // WM_SIZE already notifies the XAML host. Forcing child-window paint while
-    // that layout is still pending presents an intermediate, cleared surface.
+    APPLYING_FRAME.with(|value| value.set(was_applying));
     if RESIZE_ANIMATION.with(Cell::get).is_none() {
         request_refresh(window);
     }
@@ -382,8 +426,108 @@ fn target_rectangle(window: Hwnd) -> Rect {
         bottom: y + height,
     }
 }
+
+/// Installs the popup's single animation-frame consumer on its UI thread.
+/// The consumer commits its fixed/cropped viewport before acknowledging a frame.
+pub fn install_popup_frame_handler(handler: impl Fn(PopupFrame) + 'static) {
+    FRAME_HANDLER.with(|value| *value.borrow_mut() = Some(Rc::new(handler)));
+    if let Some(pending) = PENDING_FRAME.with(Cell::get) {
+        publish_popup_frame(pending);
+    }
+}
+
+pub fn popup_frame_is_current(frame: PopupFrame) -> bool {
+    PENDING_FRAME.with(Cell::get).is_some_and(|pending| {
+        pending.frame == frame && RESIZE_REVISION.with(Cell::get) == frame.revision
+    })
+}
+
+fn publish_popup_frame(pending: PendingPopupFrame) {
+    PENDING_FRAME.with(|value| value.set(Some(pending)));
+    let handler = FRAME_HANDLER.with(|value| value.borrow().clone());
+    if let Some(handler) = handler {
+        handler(pending.frame);
+    } else {
+        // During bootstrap there may be no component yet. There is no second
+        // independently running HWND animation in this fallback.
+        commit_popup_frame(pending.frame);
+    }
+}
+
+fn queue_popup_frame(
+    window: Hwnd,
+    rectangle: Rect,
+    target: Rect,
+    dpi: u32,
+    revision: u64,
+    progress: f64,
+    finished: bool,
+    flags: u32,
+) {
+    let serial = FRAME_SERIAL.with(|value| {
+        let next = value.get().wrapping_add(1);
+        value.set(next);
+        next
+    });
+    let scale = f64::from(dpi.max(96)) / 96.0;
+    publish_popup_frame(PendingPopupFrame {
+        window,
+        rectangle,
+        flags,
+        transition_key: TRANSITION_KEY.with(Cell::get),
+        frame: PopupFrame {
+            revision,
+            serial,
+            transition_key: TRANSITION_KEY.with(Cell::get),
+            width: f64::from(rectangle.right - rectangle.left) / scale,
+            height: f64::from(rectangle.bottom - rectangle.top) / scale,
+            target_height: f64::from(target.bottom - target.top) / scale,
+            progress,
+            finished,
+        },
+    });
+}
+
+/// Applies only the currently outstanding frame, after the UI view has committed.
+/// Retargeting invalidates an older acknowledgement, including its physical rect.
+pub fn commit_popup_frame(frame: PopupFrame) {
+    if !popup_frame_is_current(frame) {
+        return;
+    }
+    let Some(pending) = PENDING_FRAME.with(Cell::take) else {
+        return;
+    };
+    set_rectangle(pending.window, pending.rectangle, pending.flags);
+    // Moving between monitors can synchronously raise WM_DPICHANGED and replace
+    // the request while SetWindowPos is on the stack. Its new frame owns the HWND.
+    if RESIZE_REVISION.with(Cell::get) != frame.revision {
+        return;
+    }
+    if frame.finished {
+        finish_resize(pending.window);
+        if SHOW_AFTER_FRAME.with(Cell::take) && prepare_activation(pending.window) {
+            unsafe {
+                ShowWindow(pending.window, 5);
+                SetForegroundWindow(pending.window);
+            }
+        }
+        request_refresh(pending.window);
+    } else {
+        RESIZE_ANIMATION.with(|value| {
+            if let Some(mut animation) = value.get()
+                && animation.revision == frame.revision
+            {
+                // UI commit time is backpressure, not elapsed animation time.
+                // An overloaded message queue cannot skip directly to the end.
+                animation.last_sample = Instant::now();
+                value.set(Some(animation));
+            }
+        });
+    }
+}
+
 fn resize_tick(window: Hwnd) {
-    let Some(animation) = RESIZE_ANIMATION.with(Cell::get) else {
+    let Some(mut animation) = RESIZE_ANIMATION.with(Cell::get) else {
         return;
     };
     if animation.window != window {
@@ -393,36 +537,41 @@ fn resize_tick(window: Hwnd) {
         stop_resize(window);
         return;
     }
-    let monitor = unsafe { MonitorFromWindow(window, 2) };
-    if monitor != animation.monitor {
-        stop_resize(window);
-        ANCHOR.with(|value| value.set(monitor));
-        set_rectangle(window, target_rectangle(window), 0);
+    // At most one UI frame may be in flight. HWND geometry never runs ahead of
+    // the fixed/cropped XAML viewport rendered by the frame consumer.
+    if PENDING_FRAME.with(Cell::get).is_some() {
         return;
     }
-    let progress =
-        (animation.started.elapsed().as_secs_f64() * 1000.0 / RESIZE_DURATION_MS).clamp(0.0, 1.0);
-    let eased = 1.0 - (1.0 - progress).powi(3);
+    let monitor = unsafe { MonitorFromWindow(window, 2) };
+    if monitor != animation.monitor || unsafe { GetDpiForWindow(window) }.max(96) != animation.dpi {
+        stop_resize(window);
+        ANCHOR.with(|value| value.set(monitor));
+        resize_popup(window, true);
+        return;
+    }
+    animation.elapsed_ms += (animation.last_sample.elapsed().as_secs_f64() * 1000.0).min(32.0);
+    animation.last_sample = Instant::now();
+    let progress = (animation.elapsed_ms / RESIZE_DURATION_MS).clamp(0.0, 1.0);
+    // Zero velocity at both ends avoids cubic-out's large first-frame movement.
+    let eased = progress * progress * (3.0 - 2.0 * progress);
     let start_height = animation.from.bottom - animation.from.top;
     let end_height = animation.to.bottom - animation.to.top;
     let height =
         (f64::from(start_height) + f64::from(end_height - start_height) * eased).round() as i32;
-    // Animate upward from the work area's bottom edge. Width and the right
-    // edge remain fixed, so expanding never moves the taskbar-facing edge.
-    set_rectangle(
+    RESIZE_ANIMATION.with(|value| value.set(Some(animation)));
+    queue_popup_frame(
         window,
         Rect {
             top: animation.to.bottom - height,
             ..animation.to
         },
+        animation.to,
+        animation.dpi,
+        animation.revision,
+        eased,
+        progress >= 1.0,
         0,
     );
-    if progress >= 1.0 {
-        stop_resize(window);
-        // Even if rounding reached the final height on the previous tick, queue
-        // a repaint after the synchronous WM_SIZE message stack has returned.
-        request_refresh(window);
-    }
 }
 fn resize_popup(window: Hwnd, first: bool) {
     let target = target_rectangle(window);
@@ -435,41 +584,81 @@ fn resize_popup(window: Hwnd, first: bool) {
     let visible = unsafe { IsWindowVisible(window) } != 0;
     let monitor = unsafe { MonitorFromWindow(window, 2) };
     let anchor = ANCHOR.with(Cell::get);
+    let dpi = monitor_dpi(window, anchor);
+    let transition_key = TRANSITION_KEY.with(Cell::get);
     let has_rectangle = unsafe { GetWindowRect(window, &mut current) } != 0;
+    if !first
+        && (RESIZE_ANIMATION.with(Cell::get).is_some_and(|animation| {
+            animation.window == window
+                && animation.to == target
+                && animation.dpi == dpi
+                && animation.transition_key == transition_key
+        }) || PENDING_FRAME.with(Cell::get).is_some_and(|pending| {
+            pending.window == window
+                && pending.frame.finished
+                && pending.rectangle == target
+                && pending.transition_key == transition_key
+        }))
+    {
+        return;
+    }
     let animate = !first
+        && FRAME_HANDLER.with(|value| value.borrow().is_some())
         && visible
         && has_rectangle
         && monitor == anchor
         && current.left == target.left
         && current.right == target.right
-        && current.bottom == target.bottom
-        && current.top != target.top;
-    if !animate {
-        stop_resize(window);
-        set_rectangle(window, target, if first { 0x0020 } else { 0 });
-        return;
-    }
-    if RESIZE_ANIMATION
-        .with(Cell::get)
-        .is_some_and(|animation| animation.window == window && animation.to == target)
-    {
-        return;
-    }
-    // Read the actual rectangle before cancelling an older target. An expansion
-    // or contraction interrupted midway therefore continues from its visible size.
+        && current.bottom == target.bottom;
     stop_resize(window);
+    let revision = RESIZE_REVISION.with(Cell::get);
+    if !animate {
+        queue_popup_frame(
+            window,
+            target,
+            target,
+            dpi,
+            revision,
+            1.0,
+            true,
+            if first { 0x0020 } else { 0 },
+        );
+        return;
+    }
+    // Sample committed client pixels, never an unacknowledged requested frame.
+    let mut client: Rect = unsafe { std::mem::zeroed() };
+    if unsafe { GetClientRect(window, &mut client) } != 0 {
+        current.top = current.bottom - (client.bottom - client.top);
+    }
     RESIZE_ANIMATION.with(|value| {
         value.set(Some(ResizeAnimation {
             window,
             from: current,
             to: target,
-            started: Instant::now(),
+            elapsed_ms: 0.0,
+            last_sample: Instant::now(),
             monitor,
+            dpi,
+            revision,
+            transition_key,
         }))
     });
     if unsafe { SetTimer(window, RESIZE_TIMER, RESIZE_INTERVAL_MS, None) } == 0 {
         stop_resize(window);
-        set_rectangle(window, target, 0);
+        queue_popup_frame(
+            window,
+            target,
+            target,
+            dpi,
+            RESIZE_REVISION.with(Cell::get),
+            1.0,
+            true,
+            0,
+        );
+    } else {
+        // Publish the exact starting viewport first. New content is measured
+        // at its fixed layout size before any HWND height is changed.
+        queue_popup_frame(window, current, target, dpi, revision, 0.0, false, 0);
     }
 }
 unsafe extern "system" fn popup_proc(
@@ -514,7 +703,15 @@ unsafe extern "system" fn popup_proc(
         resize_tick(window);
         return 0;
     }
-    if (message == 0x0018 && wparam == 0) || message == 0x0231 || message == 0x0082 {
+    if message == 0x0231 {
+        MANUAL_MOVE.with(|value| value.set(true));
+        stop_resize(window);
+    }
+    if message == 0x0232 {
+        MANUAL_MOVE.with(|value| value.set(false));
+    }
+    if (message == 0x0018 && wparam == 0) || message == 0x0082 {
+        SHOW_AFTER_FRAME.with(|value| value.set(false));
         stop_resize(window);
     }
     if message == 0x0046 {
@@ -527,6 +724,13 @@ unsafe extern "system" fn popup_proc(
             position.width = width;
             position.height = height;
             position.flags &= !(0x0001 | 0x0002);
+        } else if DEFER_EXTERNAL_GEOMETRY.with(Cell::get)
+            || (!APPLYING_FRAME.with(Cell::get) && !MANUAL_MOVE.with(Cell::get))
+        {
+            // Only an acknowledged popup frame owns programmatic geometry.
+            // In particular, a cached AppWindow client size or the default DPI
+            // handler must not first resize one way and then get corrected back.
+            position.flags |= 0x0001 | 0x0002;
         }
     }
     if message == 0x0010 || (message == 0x0112 && wparam & 0xfff0 == 0xf060) {
@@ -535,6 +739,7 @@ unsafe extern "system" fn popup_proc(
     }
     if message == 0x02e0 && INITIALIZED.with(Cell::get) {
         stop_resize(window);
+        let previous = DEFER_EXTERNAL_GEOMETRY.with(|value| value.replace(true));
         let result = unsafe {
             CallWindowProcW(
                 ORIGINAL_PROC.with(Cell::get),
@@ -544,23 +749,15 @@ unsafe extern "system" fn popup_proc(
                 lparam,
             )
         };
+        DEFER_EXTERNAL_GEOMETRY.with(|value| value.set(previous));
         ANCHOR.with(|v| v.set(unsafe { MonitorFromWindow(window, 2) }));
-        let (x, y, width, height) = placement(window);
-        set_rectangle(
-            window,
-            Rect {
-                left: x,
-                top: y,
-                right: x + width,
-                bottom: y + height,
-            },
-            0,
-        );
+        resize_popup(window, true);
         return result;
     }
     if INITIALIZED.with(Cell::get) && (message == 0x007e || (message == 0x001a && wparam == 0x002f))
     {
         stop_resize(window);
+        let previous = DEFER_EXTERNAL_GEOMETRY.with(|value| value.replace(true));
         let result = unsafe {
             CallWindowProcW(
                 ORIGINAL_PROC.with(Cell::get),
@@ -570,8 +767,9 @@ unsafe extern "system" fn popup_proc(
                 lparam,
             )
         };
+        DEFER_EXTERNAL_GEOMETRY.with(|value| value.set(previous));
         ANCHOR.with(|value| value.set(unsafe { MonitorFromWindow(window, 2) }));
-        set_rectangle(window, target_rectangle(window), 0);
+        resize_popup(window, true);
         return result;
     }
     let original = ORIGINAL_PROC.with(Cell::get);
@@ -662,14 +860,17 @@ unsafe extern "system" fn sink_proc(
     lparam: isize,
 ) -> isize {
     if message == 0x0312 && wparam == HOTKEY_ID as usize {
+        crate::desktop::remember_foreground();
         emit(Action::TranslateSelection);
         return 0;
     }
     if message == SHOW_MESSAGE {
+        crate::desktop::remember_foreground();
         emit(Action::Show);
         return 0;
     }
     if message == TRAY_MESSAGE {
+        crate::desktop::remember_foreground();
         if lparam as u32 == 0x0202 {
             emit(Action::Show);
         } else if matches!(lparam as u32, 0x0205 | 0x007b) {
@@ -915,8 +1116,12 @@ pub fn take_startup_selection_request() -> bool {
         }
     })
 }
-pub fn configure_popup(width: f64, height: f64) {
+pub fn configure_popup_with_key(width: f64, height: f64, transition_key: u64) {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return;
+    }
     SIZE.with(|v| v.set((width, height)));
+    TRANSITION_KEY.with(|value| value.set(transition_key));
     if let Some(window) = window("翻译") {
         unsafe {
             attach_popup(window);
@@ -943,19 +1148,40 @@ pub fn configure_popup(width: f64, height: f64) {
         }
     }
 }
+fn prepare_activation(window: Hwnd) -> bool {
+    let ready = crate::desktop::move_to_remembered_desktop(window as usize);
+    if !ready {
+        crate::storage::diagnostic(serde_json::json!({
+            "event": "desktop_activation_deferred",
+            "reason": "window_not_confirmed_on_current_desktop"
+        }));
+    }
+    ready
+}
 pub fn show_popup() {
     ANCHOR.with(|v| v.set(mouse_monitor()));
     if let Some(window) = window("翻译") {
-        stop_resize(window);
-        set_rectangle(window, target_rectangle(window), 0);
-        unsafe {
-            ShowWindow(window, 5);
-            SetForegroundWindow(window);
+        if unsafe { IsWindowVisible(window) } != 0
+            && unsafe { MonitorFromWindow(window, 2) } == ANCHOR.with(Cell::get)
+        {
+            // Re-activating an already visible popup must not snap an active
+            // expansion to its destination. Its pending UI frame remains valid.
+            if prepare_activation(window) {
+                unsafe {
+                    SetForegroundWindow(window);
+                }
+            }
+            return;
         }
-        request_refresh(window);
+        // Hidden/first/cross-monitor presentation is a single final frame, but
+        // ShowWindow still waits for the matching UI viewport to be committed.
+        SHOW_AFTER_FRAME.with(|value| value.set(true));
+        stop_resize(window);
+        resize_popup(window, true);
     }
 }
 pub fn hide_popup() {
+    SHOW_AFTER_FRAME.with(|value| value.set(false));
     if let Some(window) = window("翻译") {
         stop_resize(window);
         unsafe {
@@ -979,9 +1205,11 @@ pub fn drag_popup() {
 }
 pub fn activate_settings() -> bool {
     if let Some(window) = window("翻译设置") {
-        unsafe {
-            ShowWindow(window, 5);
-            SetForegroundWindow(window);
+        if prepare_activation(window) {
+            unsafe {
+                ShowWindow(window, 5);
+                SetForegroundWindow(window);
+            }
         }
         true
     } else {

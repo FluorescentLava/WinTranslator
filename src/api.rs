@@ -318,11 +318,13 @@ fn online(
             )
         }
         Provider::DeepL => {
-            let url = if settings.deepl_free {
-                "https://api-free.deepl.com/v2/translate"
-            } else {
-                "https://api.deepl.com/v2/translate"
-            };
+            let base = settings
+                .effective_deepl_plan()
+                .api_base_url()
+                .ok_or_else(|| {
+                    Failure::new(FailureKind::InvalidRequest, "当前 DeepL 计划不支持免费请求")
+                })?;
+            let url = format!("{base}/v2/translate");
             let mut payload = json!({"text": [text], "target_lang": to.to_uppercase()});
             if from != "auto" {
                 payload["source_lang"] = json!(from.to_uppercase());
@@ -485,10 +487,11 @@ pub fn translate_with_policy(
     let credentials_present = routing::has_credentials(&settings, settings.provider);
     let key = policy.cache_allowed().then(|| {
         format!(
-            "{:?}|{}|{}|{}|{}|{from}|{to}|{input}",
+            "{:?}|{}|{}|{}|{}|{}|{from}|{to}|{input}",
             settings.provider,
             settings.region,
             settings.deepl_free,
+            settings.effective_deepl_plan().name(),
             settings.auto_offline,
             digest(serde_json::to_vec(&settings.credentials).unwrap_or_default())
         )
