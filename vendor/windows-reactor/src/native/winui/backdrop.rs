@@ -429,7 +429,19 @@ fn set_clip_size(geometry: &CardRoundedRectangle, width: f64, height: f64) -> Re
         .ok()
     }
 }
-fn round_content(drawing: &bindings::Grid) -> Result<windows_core::EventRevoker> {
+fn overlay_corners(caster: &bindings::Border) -> Result<bindings::CornerRadius> {
+    let mut corners = bindings::CornerRadius::default();
+    // Read the resolved WinUI OverlayCornerRadius from the native Border.
+    // Its public IBorder getter is slot 8, immediately before SetCornerRadius.
+    unsafe {
+        native_method::<unsafe extern "system" fn(Raw, *mut bindings::CornerRadius) -> HRESULT>(
+            caster, 8,
+        )(caster.as_raw(), &mut corners)
+        .ok()?;
+    }
+    Ok(corners)
+}
+fn round_content(drawing: &bindings::Grid, radius: f64) -> Result<windows_core::EventRevoker> {
     // Clip the material/content/stroke, while keeping the caster and its native
     // ThemeShadow outside the clip. Composition owns a real rounded geometry;
     // only layout size changes update its bounds, never an animation timer.
@@ -442,7 +454,10 @@ fn round_content(drawing: &bindings::Grid) -> Result<windows_core::EventRevoker>
             &geometry, 1,
         )(
             geometry.as_raw(),
-            windows_numerics::Vector2 { x: 12.0, y: 12.0 },
+            windows_numerics::Vector2 {
+                x: radius as f32,
+                y: radius as f32,
+            },
         )
         .ok()?;
     }
@@ -542,9 +557,10 @@ impl WindowHost {
             r#"<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="Transparent" IsHitTestVisible="False"/>"#,
         )?.cast::<bindings::Grid>()?;
         let caster = XamlReader::Load(
-            r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="Transparent" CornerRadius="12" Translation="0,0,32"><Border.Shadow><ThemeShadow/></Border.Shadow></Border>"#,
+            r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="Transparent" CornerRadius="{ThemeResource OverlayCornerRadius}" Translation="0,0,32"><Border.Shadow><ThemeShadow/></Border.Shadow></Border>"#,
         )?.cast::<bindings::Border>()?;
         set_card_inset(&caster, inset)?;
+        let corners = overlay_corners(&caster)?;
         let shadow =
             native_object(&caster.cast::<IUIElement>()?, 105)?.cast::<CardThemeShadow>()?;
         native_object(&shadow, 0)?
@@ -552,18 +568,18 @@ impl WindowHost {
             .Append(&receiver.cast::<UIElement>()?)?;
         let drawing = bindings::Grid::new()?;
         let content = bindings::Grid::new()?;
-        let (element, mica) = create_backdrop_element()?;
+        let (element, mica) = create_backdrop_element(corners)?;
         // Draw the one-DIP theme stroke as an overlay, so adding it does not
         // reduce the application's content viewport or add internal padding.
         let stroke = XamlReader::Load(
-            r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" BorderBrush="{ThemeResource SurfaceStrokeColorFlyoutBrush}" BorderThickness="1" CornerRadius="12" IsHitTestVisible="False"/>"#,
+            r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" BorderBrush="{ThemeResource SurfaceStrokeColorFlyoutBrush}" BorderThickness="1" CornerRadius="{ThemeResource OverlayCornerRadius}" IsHitTestVisible="False"/>"#,
         )?.cast::<UIElement>()?;
         let drawing_children = drawing.cast::<IPanel>()?.Children()?;
         drawing_children.Append(&element.cast::<UIElement>()?)?;
         drawing_children.Append(&content.cast::<UIElement>()?)?;
         drawing_children.Append(&stroke)?;
         caster.SetChild(&drawing.cast::<UIElement>()?)?;
-        let clip_size_changed = round_content(&drawing)?;
+        let clip_size_changed = round_content(&drawing, corners.top_left)?;
         let surface_children = surface.cast::<IPanel>()?.Children()?;
         surface_children.Append(&receiver.cast::<UIElement>()?)?;
         surface_children.Append(&caster.cast::<UIElement>()?)?;
@@ -641,7 +657,9 @@ fn move_children(from: &bindings::Grid, to: &bindings::Grid) -> Result<()> {
     }
     Ok(())
 }
-fn create_backdrop_element() -> Result<(BackdropElement, SystemBackdrop)> {
+fn create_backdrop_element(
+    corners: bindings::CornerRadius,
+) -> Result<(BackdropElement, SystemBackdrop)> {
     let factory = windows_core::imp::load_factory::<BackdropElementClass, ElementFactory>()?;
     let mut inner = std::ptr::null_mut();
     let mut raw = std::ptr::null_mut();
@@ -660,16 +678,7 @@ fn create_backdrop_element() -> Result<(BackdropElement, SystemBackdrop)> {
     let element = unsafe { IUnknown::from_raw(raw) }.cast::<BackdropElement>()?;
     let mica = MicaBackdrop::new()?.cast::<SystemBackdrop>()?;
     unsafe {
-        (element.vtable().set_corners)(
-            element.as_raw(),
-            bindings::CornerRadius {
-                top_left: 12.0,
-                top_right: 12.0,
-                bottom_right: 12.0,
-                bottom_left: 12.0,
-            },
-        )
-        .ok()?;
+        (element.vtable().set_corners)(element.as_raw(), corners).ok()?;
         (element.vtable().set_backdrop)(element.as_raw(), mica.as_raw()).ok()?;
     }
     Ok((element, mica))

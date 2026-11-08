@@ -831,28 +831,9 @@ impl Translator {
             }
         });
         let result_line_height = if result_font == 15.0 { 21.0 } else { 32.0 };
-        let pronunciation_width = self.phonetics.as_ref().map_or(104.0, |phonetics| {
-            [&phonetics.british, &phonetics.american]
-                .into_iter()
-                .map(|value| {
-                    let length = value.trim().trim_matches('/').chars().count();
-                    let phonetic = if length == 0 {
-                        0.0
-                    } else {
-                        (length + 2) as f64 * 8.4
-                    };
-                    (48.0 + phonetic).min(160.0)
-                })
-                .sum::<f64>()
-                + 8.0
-        });
-        let inline_pronunciation = self.pronunciation_text().is_some()
-            && self.entry.is_some()
-            && pronunciation_width <= POPUP_CONTENT_WIDTH - 180.0
-            && self.output.as_ref().is_some_and(|translation| {
-                visual_lines(&translation.target, result_font, 120.0) == 1
-            });
-        let pronunciation_height = if self.pronunciation_text().is_some() && !inline_pronunciation {
+        // Keep pronunciation on its own row, including while IPA is loading.
+        // Short words and longer words must share the same summary layout.
+        let pronunciation_height = if self.pronunciation_text().is_some() {
             40.0
         } else {
             0.0
@@ -882,12 +863,7 @@ impl Translator {
         let (result_height, rendered_result_height) = if let Some(translation) = &self.output {
             if self.entry.is_some() {
                 let metadata_height = metadata.as_ref().map_or(0.0, |value| {
-                    let width = if inline_pronunciation {
-                        120.0
-                    } else {
-                        POPUP_CONTENT_WIDTH - 56.0
-                    };
-                    visual_lines(value, 14.0, width) as f64 * 20.0 + 6.0
+                    visual_lines(value, 14.0, POPUP_CONTENT_WIDTH - 56.0) as f64 * 20.0 + 6.0
                 });
                 let header_fixed = 28.0 + metadata_height + pronunciation_height;
                 let estimated_target =
@@ -1109,83 +1085,33 @@ impl Translator {
                     "展开词典释义"
                 };
                 let chevron = if details_open { "\u{E70E}" } else { "\u{E70D}" };
-                let header: View = if inline_pronunciation {
-                    let summary = Border::new().max_width(120.0).content(summary);
-                    let summary: View = if has_details {
-                        Button::new()
-                            .style(ButtonStyle::Subtle)
-                            .min_width(0.0)
-                            .horizontal_content_alignment(HorizontalAlignment::Left)
-                            .padding(Thickness::new(12.0, 12.0, 4.0, 12.0))
-                            .automation_name(details_label)
-                            .on_click(cx.message(Message::Details(!details_open)))
-                            .content(summary)
-                            .into()
-                    } else {
-                        Border::new()
-                            .padding(Thickness::new(12.0, 12.0, 4.0, 12.0))
-                            .content(summary)
-                    };
-                    Grid::new()
-                        .columns([Auto, Auto, Star(1.0), Auto])
-                        .column_spacing(8.0)
-                        .children((
-                            summary,
-                            Border::new()
-                                .vertical_alignment(VerticalAlignment::Bottom)
-                                .margin(Thickness::new(0.0, 0.0, 0.0, 12.0))
+                let header_content = Grid::new()
+                    .columns([Star(1.0), Auto])
+                    .column_spacing(8.0)
+                    .children((
+                        summary,
+                        if has_details {
+                            icon(chevron)
+                                .opacity(0.6)
+                                .vertical_alignment(Center)
                                 .grid_column(1)
-                                .content(self.pronunciation_controls(cx)),
-                            if has_details {
-                                Button::new()
-                                    .style(ButtonStyle::Subtle)
-                                    .min_width(0.0)
-                                    .width(32.0)
-                                    .height(32.0)
-                                    .padding(6.0)
-                                    .margin(Thickness::new(0.0, 0.0, 8.0, 12.0))
-                                    .vertical_alignment(VerticalAlignment::Bottom)
-                                    .horizontal_content_alignment(HorizontalAlignment::Center)
-                                    .vertical_content_alignment(Center)
-                                    .automation_name(details_label)
-                                    .on_click(cx.message(Message::Details(!details_open)))
-                                    .grid_column(3)
-                                    .content(icon(chevron).opacity(0.6))
-                                    .into()
-                            } else {
-                                View::empty()
-                            },
-                        ))
+                                .into()
+                        } else {
+                            View::empty()
+                        },
+                    ));
+                let header: View = if has_details {
+                    Button::new()
+                        .style(ButtonStyle::Subtle)
+                        .horizontal_alignment(Stretch)
+                        .horizontal_content_alignment(Stretch)
+                        .padding(12.0)
+                        .automation_name(details_label)
+                        .on_click(cx.message(Message::Details(!details_open)))
+                        .content(header_content)
                         .into()
                 } else {
-                    let header_content = Grid::new()
-                        .columns([Star(1.0), Auto])
-                        .column_spacing(8.0)
-                        .children((
-                            summary,
-                            if has_details {
-                                icon(chevron)
-                                    .opacity(0.6)
-                                    .vertical_alignment(Center)
-                                    .grid_column(1)
-                                    .into()
-                            } else {
-                                View::empty()
-                            },
-                        ));
-                    if has_details {
-                        Button::new()
-                            .style(ButtonStyle::Subtle)
-                            .horizontal_alignment(Stretch)
-                            .horizontal_content_alignment(Stretch)
-                            .padding(12.0)
-                            .automation_name(details_label)
-                            .on_click(cx.message(Message::Details(!details_open)))
-                            .content(header_content)
-                            .into()
-                    } else {
-                        Border::new().padding(12.0).content(header_content)
-                    }
+                    Border::new().padding(12.0).content(header_content)
                 };
                 let details: View = if details_mounted {
                     let senses = StackPanel::new().spacing(12.0).keyed_children(
@@ -1406,10 +1332,9 @@ impl Translator {
             .element_ref(&self.popup_surface)
             .opacity(0.0)
             .vertical_alignment(VerticalAlignment::Stretch)
-            .corner_radius(12.0)
             .padding(Thickness::new(16.0, 12.0, 16.0, 10.0))
             .on_pointer_pressed(cx.callback(|point: PointerEventInfo| {
-                if point.window_y < 8.0 {
+                if point.window_y < f64::from(native::POPUP_SHADOW_INSET) + 8.0 {
                     Message::Drag
                 } else {
                     Message::Warmed
