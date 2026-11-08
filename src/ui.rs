@@ -1371,15 +1371,25 @@ impl Translator {
                 let description = if !route.configured {
                     "未配置".to_owned()
                 } else if !route.eligible {
-                    "未启用 Free API".to_owned()
+                    format!("未启用 · {}", route.message)
                 } else if route.cooldown_seconds > 0 {
                     format!("暂不可用 · {}", route.message)
                 } else if let Some(remaining) = route.remaining_characters {
                     let period = route.allowance_period.label();
-                    format!(
-                        "{period}剩余 {remaining} / {} 字符",
+                    let description = format!(
+                        "{period}剩余 {remaining} / {} 字符（本程序估算）",
                         route.allowance_characters
-                    )
+                    );
+                    if let Some(expires_at) = route.expires_at {
+                        format!(
+                            "{description} · 到期 {}",
+                            expires_at
+                                .with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M")
+                        )
+                    } else {
+                        description
+                    }
                 } else {
                     route.message
                 };

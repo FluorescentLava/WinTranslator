@@ -615,6 +615,52 @@ pub fn translate_with_policy(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires locally configured credentials and a confirmed free allowance"]
+    fn configured_provider_translates_through_the_free_router() {
+        let provider = match std::env::var("TRANSLATION_VERIFY_PROVIDER").as_deref() {
+            Ok("Tencent") => Provider::Tencent,
+            Ok("Youdao") => Provider::Youdao,
+            Ok("Baidu") => Provider::Baidu,
+            Ok("DeepL") => Provider::DeepL,
+            _ => panic!("set TRANSLATION_VERIFY_PROVIDER to the provider to verify"),
+        };
+        let (mut settings, _, warning) = storage::load();
+        assert!(warning.is_none(), "local settings could not be loaded");
+        settings.provider = provider;
+        assert!(
+            routing::candidates(&settings).contains(&provider),
+            "provider has no usable configured free allowance"
+        );
+        for (source, from, to) in [("snake", "en", "zh"), ("你好", "zh", "en")] {
+            let result = routing::translate_online(
+                source,
+                from,
+                to,
+                &settings,
+                &|| false,
+                |candidate, chunk, timeout| {
+                    if candidate != provider {
+                        return Err(Failure::new(
+                            FailureKind::InvalidRequest,
+                            "fallback disabled during provider verification",
+                        ));
+                    }
+                    online(candidate, chunk, from, to, &settings, timeout)
+                },
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message()));
+            assert_eq!(result.provider, provider);
+            assert!(!result.target.trim().is_empty());
+            if source == "snake" {
+                assert!(result.target.contains('蛇'));
+            } else {
+                let target = result.target.to_ascii_lowercase();
+                assert!(target.contains("hello") || target.contains("hi"));
+            }
+            println!("{}: {source} → {}", provider.name(), result.target);
+        }
+    }
+    #[test]
     fn youdao_v3_truncates_unicode_by_characters() {
         let input = "一二三四五六七八九十一二三四五六七八九十一二三";
         assert_eq!(

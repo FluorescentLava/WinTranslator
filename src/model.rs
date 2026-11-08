@@ -115,6 +115,17 @@ pub struct Credential {
     pub key: String,
 }
 
+// A manually verified, finite free grant. A cash balance or an advertised trial
+// alone is not permission to send requests; the usable character count and its
+// absolute expiry must first be confirmed for this account.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FreeGrant {
+    pub grant_id: String,
+    pub quota_characters: u64,
+    pub expires_at: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeepLPlan {
@@ -157,6 +168,8 @@ pub struct Settings {
     pub deepl_free: bool,
     #[serde(default)]
     pub deepl_plan: DeepLPlan,
+    pub tencent_free_grant: Option<FreeGrant>,
+    pub youdao_free_grant: Option<FreeGrant>,
     pub from_index: usize,
     pub to_index: usize,
     pub auto_pair: bool,
@@ -173,6 +186,8 @@ impl Default for Settings {
             region: "ap-guangzhou".into(),
             deepl_free: true,
             deepl_plan: DeepLPlan::Developer,
+            tencent_free_grant: None,
+            youdao_free_grant: None,
             from_index: 1,
             to_index: 2,
             auto_pair: true,
@@ -182,6 +197,14 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn free_grant(&self, provider: Provider) -> Option<&FreeGrant> {
+        match provider {
+            Provider::Tencent => self.tencent_free_grant.as_ref(),
+            Provider::Youdao => self.youdao_free_grant.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn effective_deepl_plan(&self) -> DeepLPlan {
         match self.deepl_plan {
             DeepLPlan::Auto if self.deepl_free => DeepLPlan::LegacyFree,
@@ -233,6 +256,19 @@ pub struct Translation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_grants_are_disabled_in_default_and_existing_settings() {
+        for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
+            assert!(settings.tencent_free_grant.is_none());
+            assert!(settings.youdao_free_grant.is_none());
+        }
+        let empty: FreeGrant = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.quota_characters, 0);
+        assert!(empty.expires_at.is_empty());
+        assert!(empty.grant_id.is_empty());
+    }
+
     #[test]
     fn deepl_plan_migrates_old_settings_without_enabling_paid_accounts() {
         let old_free: Settings = serde_json::from_str(r#"{"deepl_free":true}"#).unwrap();
