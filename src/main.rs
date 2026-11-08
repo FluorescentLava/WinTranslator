@@ -5,6 +5,8 @@ mod dictionary;
 mod model;
 mod native;
 mod offline;
+mod routing;
+mod speech;
 mod spm;
 mod storage;
 mod ui;

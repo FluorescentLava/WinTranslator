@@ -146,6 +146,23 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn follow_bilingual_input(&mut self, text: &str) {
+        if text.trim().is_empty()
+            || !matches!(self.from_index, 0..=2)
+            || !matches!(self.to_index, 1 | 2)
+        {
+            return;
+        }
+        let direction = match detect(text) {
+            "zh" => (1, 2),
+            "en" => (2, 1),
+            _ => return,
+        };
+        self.from_index = direction.0;
+        self.to_index = direction.1;
+        self.auto_pair = true;
+    }
+
     pub fn credential(&self) -> Credential {
         self.credentials
             .get(self.provider.index())
@@ -178,5 +195,27 @@ mod tests {
         assert_eq!(detect("你好世界"), "zh");
         assert_eq!(detect("今日はいい天気"), "ja");
         assert_eq!(detect("안녕하세요"), "ko");
+    }
+
+    #[test]
+    fn editing_bilingual_input_follows_its_language_after_a_manual_swap() {
+        let mut settings = Settings {
+            from_index: 2,
+            to_index: 1,
+            auto_pair: false,
+            ..Settings::default()
+        };
+        settings.follow_bilingual_input("这是一段需要翻译的中文。");
+        assert_eq!((settings.from_index, settings.to_index), (1, 2));
+        assert!(settings.auto_pair);
+        settings.follow_bilingual_input("Now translate this English paragraph.");
+        assert_eq!((settings.from_index, settings.to_index), (2, 1));
+
+        settings.from_index = 3;
+        settings.to_index = 1;
+        settings.auto_pair = false;
+        settings.follow_bilingual_input("中文引用");
+        assert_eq!((settings.from_index, settings.to_index), (3, 1));
+        assert!(!settings.auto_pair);
     }
 }

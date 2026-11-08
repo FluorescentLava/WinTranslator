@@ -87,6 +87,7 @@ struct NotifyIcon {
 const HOTKEY_ID: i32 = 0x4854;
 const TRAY_MESSAGE: u32 = 0x8000 + 42;
 const SHOW_MESSAGE: u32 = 0x8000 + 43;
+const REFRESH_MESSAGE: u32 = 0x8000 + 44;
 const RESIZE_TIMER: usize = 0x5452_535a;
 const RESIZE_DURATION_MS: f64 = 200.0;
 const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
@@ -114,11 +115,12 @@ thread_local! {
     static ORIGINAL_PROC: Cell<isize> = const { Cell::new(0) };
     static POPUP: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
     static ANCHOR: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
-    static SIZE: Cell<(f64, f64)> = const { Cell::new((620.0, 184.0)) };
+    static SIZE: Cell<(f64, f64)> = const { Cell::new((558.0, 184.0)) };
     static TASKBAR_MESSAGE: Cell<u32> = const { Cell::new(0) };
     static STARTUP_WARNING: RefCell<Option<String>> = const { RefCell::new(None) };
     static PENDING_ACTION: Cell<Option<Action>> = const { Cell::new(None) };
     static RESIZE_ANIMATION: Cell<Option<ResizeAnimation>> = const { Cell::new(None) };
+    static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -150,6 +152,7 @@ unsafe extern "system" {
     fn GetDpiForWindow(window: Hwnd) -> u32;
     fn GetWindowRect(window: Hwnd, rect: *mut Rect) -> i32;
     fn IsWindowVisible(window: Hwnd) -> i32;
+    fn RedrawWindow(window: Hwnd, rectangle: *const Rect, region: Hwnd, flags: u32) -> i32;
     fn SetTimer(
         window: Hwnd,
         id: usize,
@@ -333,7 +336,19 @@ fn stop_resize(window: Hwnd) {
     }
     RESIZE_ANIMATION.with(|value| value.set(None));
 }
+fn request_refresh(window: Hwnd) {
+    if unsafe { IsWindowVisible(window) } != 0
+        && !REFRESH_PENDING.with(|value| value.replace(true))
+        && unsafe { PostMessageW(window, REFRESH_MESSAGE, 0, 0) } == 0
+    {
+        REFRESH_PENDING.with(|value| value.set(false));
+    }
+}
 fn set_rectangle(window: Hwnd, rectangle: Rect, flags: u32) {
+    let mut current = rectangle;
+    if flags == 0 && unsafe { GetWindowRect(window, &mut current) } != 0 && current == rectangle {
+        return;
+    }
     unsafe {
         SetWindowPos(
             window,
@@ -342,9 +357,12 @@ fn set_rectangle(window: Hwnd, rectangle: Rect, flags: u32) {
             rectangle.top,
             rectangle.right - rectangle.left,
             rectangle.bottom - rectangle.top,
-            flags | 0x0004 | 0x0010,
+            // XAML owns the composed client surface. Do not preserve old raster
+            // pixels while its content is being laid out at the new height.
+            flags | 0x0004 | 0x0010 | 0x0100 | 0x2000,
         );
     }
+    request_refresh(window);
 }
 fn target_rectangle(window: Hwnd) -> Rect {
     let (x, y, width, height) = placement(window);
@@ -392,6 +410,9 @@ fn resize_tick(window: Hwnd) {
     );
     if progress >= 1.0 {
         stop_resize(window);
+        // Even if rounding reached the final height on the previous tick, queue
+        // a repaint after the synchronous WM_SIZE message stack has returned.
+        request_refresh(window);
     }
 }
 fn resize_popup(window: Hwnd, first: bool) {
@@ -448,6 +469,22 @@ unsafe extern "system" fn popup_proc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
+    if message == REFRESH_MESSAGE {
+        REFRESH_PENDING.with(|value| value.set(false));
+        if unsafe { IsWindowVisible(window) } != 0 {
+            unsafe {
+                // Invalidate the complete composed surface and its child hosts.
+                // Do not introduce GDI background erasure over the Mica backdrop.
+                RedrawWindow(
+                    window,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0x0001 | 0x0020 | 0x0080 | 0x0100,
+                );
+            }
+        }
+        return 0;
+    }
     if message == 0x0113 && wparam == RESIZE_TIMER {
         resize_tick(window);
         return 0;
@@ -484,17 +521,16 @@ unsafe extern "system" fn popup_proc(
         };
         ANCHOR.with(|v| v.set(unsafe { MonitorFromWindow(window, 2) }));
         let (x, y, width, height) = placement(window);
-        unsafe {
-            SetWindowPos(
-                window,
-                std::ptr::null_mut(),
-                x,
-                y,
-                width,
-                height,
-                0x0010 | 0x0004,
-            );
-        }
+        set_rectangle(
+            window,
+            Rect {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height,
+            },
+            0,
+        );
         return result;
     }
     if INITIALIZED.with(Cell::get) && (message == 0x007e || (message == 0x001a && wparam == 0x002f))
@@ -841,13 +877,16 @@ pub fn configure_popup(width: f64, height: f64) {
         unsafe {
             attach_popup(window);
             let style = GetWindowLongPtrW(window, -16);
-            SetWindowLongPtrW(
-                window,
-                -16,
-                style & !(0x00C00000 | 0x00040000 | 0x00080000 | 0x00030000),
-            );
-            let round: u32 = 2;
-            DwmSetWindowAttribute(window, 33, &round as *const _ as _, 4);
+            let popup_style = style & !(0x00C00000 | 0x00040000 | 0x00080000 | 0x00030000);
+            if style != popup_style {
+                SetWindowLongPtrW(window, -16, popup_style);
+            }
+            if !INITIALIZED.with(Cell::get) {
+                let round: u32 = 2;
+                DwmSetWindowAttribute(window, 33, &round as *const _ as _, 4);
+                let border: u32 = 0xffff_fffe; // DWMWA_COLOR_NONE: Mica keeps its rounded edge.
+                DwmSetWindowAttribute(window, 34, &border as *const _ as _, 4);
+            }
             resize_popup(window, !INITIALIZED.with(Cell::get));
             INITIALIZED.with(|v| v.set(true));
         }
@@ -857,20 +896,12 @@ pub fn show_popup() {
     ANCHOR.with(|v| v.set(mouse_monitor()));
     if let Some(window) = window("翻译") {
         stop_resize(window);
-        let (x, y, width, height) = placement(window);
+        set_rectangle(window, target_rectangle(window), 0);
         unsafe {
-            SetWindowPos(
-                window,
-                std::ptr::null_mut(),
-                x,
-                y,
-                width,
-                height,
-                0x0004 | 0x0010,
-            );
             ShowWindow(window, 5);
             SetForegroundWindow(window);
         }
+        request_refresh(window);
     }
 }
 pub fn hide_popup() {

@@ -493,6 +493,7 @@ pub mod public {
         vertical_content_alignment: Property<VerticalAlignment>,
         resource_overrides: Property<ResourceOverrides>,
         style: Property<ButtonStyle>,
+        padding: Property<Thickness>,
         key_accelerators: Property<KeyAccelerators>,
         on_click: Option<Callback<()>>,
         reference: Option<NativeElementRef>,
@@ -536,6 +537,29 @@ pub mod public {
         pub fn style(mut self, value: impl Into<Option<ButtonStyle>>) -> Self {
             let value = value.into();
             self.style = Property::from(value);
+            self
+        }
+        pub fn padding(mut self, value: impl Into<Thickness>) -> Self {
+            let value = value.into();
+            assert!(
+                value.is_finite_non_negative(),
+                "Button Padding must contain finite non-negative values"
+            );
+            self.padding = Property::Set(value);
+            self
+        }
+        pub fn padding_optional<T>(mut self, value: Option<T>) -> Self
+        where
+            T: Into<Thickness>,
+        {
+            let value = value.map(Into::into);
+            assert!(
+                value
+                    .as_ref()
+                    .is_none_or(|value| value.is_finite_non_negative()),
+                "Button Padding must contain finite non-negative values",
+            );
+            self.padding = Property::from(value);
             self
         }
         pub fn key_accelerators(mut self, value: impl Into<Option<KeyAccelerators>>) -> Self {
@@ -6464,6 +6488,7 @@ pub mod public {
                         vertical_content_alignment,
                         resource_overrides,
                         style,
+                        padding,
                         key_accelerators,
                         on_click,
                         reference,
@@ -6478,6 +6503,7 @@ pub mod public {
                             vertical_content_alignment,
                             resource_overrides,
                             style,
+                            padding,
                             key_accelerators,
                             on_click,
                         })),
@@ -8276,6 +8302,7 @@ pub mod public {
                         && value.vertical_content_alignment == mounted.vertical_content_alignment
                         && value.resource_overrides == mounted.resource_overrides
                         && value.style == mounted.style
+                        && value.padding == mounted.padding
                         && value.key_accelerators == mounted.key_accelerators
                         && value.on_click == mounted.on_click
                 }
@@ -9515,6 +9542,13 @@ impl MountedPropsExt for MountedProps {
                     match &values.style {
                         Property::Inherited => None,
                         Property::Set(value) => Some(PropertyValueRef::ButtonStyle(*value)),
+                    },
+                );
+                visit(
+                    PropertyId::ButtonPadding,
+                    match &values.padding {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::Thickness(value)),
                     },
                 );
                 visit(
@@ -11289,7 +11323,11 @@ impl MountedPropsExt for MountedProps {
             Self::TextBox(values) => ThemeStyle::new([
                 values.background.as_set().copied().and_then(Brush::theme),
                 values.border_brush.as_set().copied().and_then(Brush::theme),
-                values.placeholder_foreground.as_set().copied().and_then(Brush::theme),
+                values
+                    .placeholder_foreground
+                    .as_set()
+                    .copied()
+                    .and_then(Brush::theme),
                 None,
             ]),
             Self::AutoSuggestBox(_) => ThemeStyle::default(),
@@ -12695,6 +12733,7 @@ pub(crate) struct ButtonMountedProps {
     vertical_content_alignment: Property<VerticalAlignment>,
     resource_overrides: Property<ResourceOverrides>,
     style: Property<ButtonStyle>,
+    padding: Property<Thickness>,
     key_accelerators: Property<KeyAccelerators>,
     on_click: Option<Callback<()>>,
 }
@@ -12705,6 +12744,7 @@ impl PartialEq for ButtonMountedProps {
             && self.vertical_content_alignment == other.vertical_content_alignment
             && self.resource_overrides == other.resource_overrides
             && self.style == other.style
+            && self.padding == other.padding
             && self.key_accelerators == other.key_accelerators
             && self.on_click == other.on_click
     }
@@ -13914,6 +13954,7 @@ pub enum PropertyId {
     ButtonVerticalContentAlignment,
     ButtonResources,
     ButtonStyle,
+    ButtonPadding,
     ButtonKeyboardAccelerators,
     HyperlinkButtonNavigateUri,
     HyperlinkButtonIsEnabled,
@@ -14929,6 +14970,17 @@ const BUTTON_PROPERTIES: &[PropertyDescriptor] = &[
         field: "style",
         value: "ButtonStyle",
         interface: "Microsoft.UI.Xaml.IFrameworkElement",
+        clearable: true,
+        feedback: None,
+        feedback_contract: None,
+        observes_feedback: false,
+    },
+    PropertyDescriptor {
+        id: PropertyId::ButtonPadding,
+        name: "Padding",
+        field: "padding",
+        value: "Thickness",
+        interface: "Microsoft.UI.Xaml.Controls.IControl",
         clearable: true,
         feedback: None,
         feedback_contract: None,

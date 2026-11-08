@@ -2381,6 +2381,16 @@ windows_core::imp::interface_hierarchy!(
 );
 windows_core::imp::required_hierarchy!(Control, FrameworkElement, UIElement, DependencyObject);
 impl Control {
+    pub(crate) fn PaddingProperty() -> windows_core::Result<DependencyProperty> {
+        Self::IControlStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).PaddingProperty)(
+                windows_core::Interface::as_raw(this),
+                &mut result__,
+            )
+            .and_then(|| windows_core::imp::Type::from_abi(result__))
+        })
+    }
     pub(crate) fn FontSizeProperty() -> windows_core::Result<DependencyProperty> {
         Self::IControlStatics(|this| unsafe {
             let mut result__ = core::mem::zeroed();
@@ -7619,6 +7629,15 @@ impl windows_core::RuntimeType for IControl {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IControl {
+    pub(crate) fn SetPadding(&self, value: Thickness) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetPadding)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetFontSize(&self, value: f64) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetFontSize)(
@@ -7729,7 +7748,8 @@ pub struct IControl_Vtbl {
     Template: usize,
     SetTemplate: usize,
     Padding: usize,
-    SetPadding: usize,
+    pub SetPadding:
+        unsafe extern "system" fn(*mut core::ffi::c_void, Thickness) -> windows_core::HRESULT,
     HorizontalContentAlignment: usize,
     pub SetHorizontalContentAlignment: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -7788,7 +7808,10 @@ pub struct IControlStatics_Vtbl {
     ) -> windows_core::HRESULT,
     TabNavigationProperty: usize,
     TemplateProperty: usize,
-    PaddingProperty: usize,
+    pub PaddingProperty: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub HorizontalContentAlignmentProperty: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
@@ -9215,16 +9238,20 @@ impl IFrameworkElement {
         unsafe {
             let mut value = 0.0;
             (windows_core::Interface::vtable(self).Width)(
-                windows_core::Interface::as_raw(self), &mut value,
-            ).map(|| value)
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .map(|| value)
         }
     }
     pub(crate) fn Height(&self) -> windows_core::Result<f64> {
         unsafe {
             let mut value = 0.0;
             (windows_core::Interface::vtable(self).Height)(
-                windows_core::Interface::as_raw(self), &mut value,
-            ).map(|| value)
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .map(|| value)
         }
     }
     pub(crate) fn Resources(&self) -> windows_core::Result<ResourceDictionary> {
@@ -9525,7 +9552,8 @@ pub struct IFrameworkElement_Vtbl {
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
     pub Width: unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
     pub SetWidth: unsafe extern "system" fn(*mut core::ffi::c_void, f64) -> windows_core::HRESULT,
-    pub Height: unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
+    pub Height:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
     pub SetHeight: unsafe extern "system" fn(*mut core::ffi::c_void, f64) -> windows_core::HRESULT,
     MinWidth: usize,
     pub SetMinWidth:
@@ -17682,8 +17710,10 @@ impl ITextBox {
     {
         unsafe {
             (windows_core::Interface::vtable(self).SetPlaceholderForeground)(
-                windows_core::Interface::as_raw(self), value.param().abi(),
-            ).ok()
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
         }
     }
     pub(crate) fn Text(&self) -> windows_core::Result<String> {
@@ -17840,7 +17870,10 @@ pub struct ITextBox_Vtbl {
     CharacterCasing: usize,
     SetCharacterCasing: usize,
     PlaceholderForeground: usize,
-    pub SetPlaceholderForeground: unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub SetPlaceholderForeground: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CanPasteClipboardContent: usize,
     CanUndo: usize,
     CanRedo: usize,
@@ -17918,7 +17951,10 @@ pub struct ITextBoxStatics_Vtbl {
     SelectionHighlightColorWhenNotFocusedProperty: usize,
     HorizontalTextAlignmentProperty: usize,
     CharacterCasingProperty: usize,
-    pub PlaceholderForegroundProperty: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub PlaceholderForegroundProperty: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ITextChangedEventArgs,
@@ -19065,23 +19101,29 @@ impl IUIElement {
         unsafe {
             let mut value = false;
             (windows_core::Interface::vtable(self).IsHitTestVisible)(
-                windows_core::Interface::as_raw(self), &mut value,
-            ).map(|| value)
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .map(|| value)
         }
     }
     pub(crate) fn CompositeMode(&self) -> windows_core::Result<i32> {
         unsafe {
             let mut value = 0;
             (windows_core::Interface::vtable(self).CompositeMode)(
-                windows_core::Interface::as_raw(self), &mut value,
-            ).map(|| value)
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .map(|| value)
         }
     }
     pub(crate) fn SetCompositeMode(&self, value: i32) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetCompositeMode)(
-                windows_core::Interface::as_raw(self), value,
-            ).ok()
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
         }
     }
     pub(crate) fn SetAllowDrop(&self, value: bool) -> windows_core::Result<()> {
@@ -19604,7 +19646,8 @@ pub struct IUIElement_Vtbl {
     SetTransform3D: usize,
     RenderTransformOrigin: usize,
     SetRenderTransformOrigin: usize,
-    pub IsHitTestVisible: unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    pub IsHitTestVisible:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
     SetIsHitTestVisible: usize,
     Visibility: usize,
     SetVisibility: usize,
@@ -19630,8 +19673,10 @@ pub struct IUIElement_Vtbl {
     PointerCaptures: usize,
     ContextFlyout: usize,
     SetContextFlyout: usize,
-    pub CompositeMode: unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> windows_core::HRESULT,
-    pub SetCompositeMode: unsafe extern "system" fn(*mut core::ffi::c_void, i32) -> windows_core::HRESULT,
+    pub CompositeMode:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> windows_core::HRESULT,
+    pub SetCompositeMode:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i32) -> windows_core::HRESULT,
     Lights: usize,
     CanBeScrollAnchor: usize,
     SetCanBeScrollAnchor: usize,
@@ -27560,8 +27605,10 @@ impl TextBox {
         Self::ITextBoxStatics(|this| unsafe {
             let mut result = core::ptr::null_mut();
             (windows_core::Interface::vtable(this).PlaceholderForegroundProperty)(
-                windows_core::Interface::as_raw(this), &mut result,
-            ).and_then(|| windows_core::imp::Type::from_abi(result))
+                windows_core::Interface::as_raw(this),
+                &mut result,
+            )
+            .and_then(|| windows_core::imp::Type::from_abi(result))
         })
     }
     pub(crate) fn new() -> windows_core::Result<Self> {

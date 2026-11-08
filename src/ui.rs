@@ -26,6 +26,8 @@ pub enum Message {
         Option<crate::dictionary::Entry>,
     ),
     Details(bool),
+    Pronounce(crate::speech::Accent),
+    Pronounced(u64, Result<(), String>),
     ColorScheme(ColorScheme),
     RepairCaret(u8),
     RetryCaret(u8),
@@ -40,7 +42,8 @@ pub enum Message {
     Tab(Option<String>),
     Swap,
     Provider(Option<usize>),
-    CycleProvider,
+    ProviderPicker(bool),
+    CloseProviderPicker(u64),
     Source(Option<usize>),
     Target(Option<usize>),
     AutoPair(bool),
@@ -63,9 +66,14 @@ pub struct Translator {
     settings_open: bool,
     tab: String,
     text: String,
+    force_online_for_long_text: bool,
+    pending_provider: Option<Provider>,
     output: Option<Translation>,
     entry: Option<crate::dictionary::Entry>,
     details_open: bool,
+    provider_picker_open: bool,
+    provider_picker_selected: Option<Provider>,
+    provider_picker_revision: u64,
     color_scheme: ColorScheme,
     settings: Settings,
     history: Vec<Translation>,
@@ -73,6 +81,9 @@ pub struct Translator {
     busy: bool,
     revision: u64,
     task: Option<ComponentTask>,
+    speech_task: Option<ComponentTask>,
+    speech_revision: u64,
+    speech_error: Option<String>,
     status: String,
     error: bool,
     input: ElementRef<TextBox>,
@@ -85,6 +96,83 @@ fn text(value: impl Into<String>, size: f64) -> TextBlock {
 }
 fn muted(value: impl Into<String>) -> TextBlock {
     text(value, 12.0).opacity(0.6)
+}
+fn popup_language(language: &Language) -> &'static str {
+    if language.code == "zh" {
+        "中文"
+    } else {
+        language.label
+    }
+}
+fn meaning_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+fn meaning_parts(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split([',', '，', ';', '；', '、', '\n'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+}
+fn chinese_senses(entry: &crate::dictionary::Entry) -> Vec<crate::dictionary::Sense> {
+    let mut seen = std::collections::HashSet::new();
+    let mut senses = Vec::new();
+    for sense in &entry.senses {
+        let definition = meaning_parts(&sense.definition)
+            .filter(|part| part.chars().any(|c| ('\u{3400}'..='\u{9fff}').contains(&c)))
+            .filter(|part| seen.insert((sense.part_of_speech.clone(), meaning_key(part))))
+            .collect::<Vec<_>>()
+            .join("，");
+        if !definition.is_empty() {
+            senses.push(crate::dictionary::Sense {
+                part_of_speech: sense.part_of_speech.clone(),
+                definition,
+            });
+        }
+    }
+    senses
+}
+fn visual_lines(value: &str, font_size: f64, width: f64) -> usize {
+    value
+        .split('\n')
+        .map(|line| {
+            let mut lines = 1;
+            let mut used = 0.0;
+            for c in line.chars().filter(|c| *c != '\r') {
+                let advance = if c == '\t' {
+                    font_size * 2.0
+                } else if c.is_whitespace() {
+                    font_size * 0.35
+                } else if c >= '\u{1100}' {
+                    font_size
+                } else {
+                    font_size * 0.6
+                };
+                if used + advance > width && used > 0.0 {
+                    lines += 1;
+                    used = 0.0;
+                }
+                used += advance;
+            }
+            lines
+        })
+        .sum::<usize>()
+        .max(1)
+}
+fn dictionary_metadata(entry: &crate::dictionary::Entry) -> String {
+    let phonetic = entry.phonetic.trim().trim_matches('/');
+    let pos = entry.parts_of_speech.join(" · ");
+    [
+        (!phonetic.is_empty()).then(|| format!("/{phonetic}/")),
+        (!pos.is_empty()).then_some(pos),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("   ·   ")
 }
 fn at(view: impl Into<View>, row: i32, column: i32) -> View {
     Grid::new()
@@ -100,6 +188,31 @@ const HISTORY: &str = "\u{E81C}";
 fn icon(path: &str) -> FontIcon {
     FontIcon::new().glyph(path)
 }
+fn provider_icon(provider: Provider) -> Image {
+    let data: &'static [u8] = match provider {
+        Provider::Tencent => include_bytes!("../assets/providers/tencent.png"),
+        Provider::Baidu => include_bytes!("../assets/providers/baidu.png"),
+        Provider::Youdao => include_bytes!("../assets/providers/youdao.png"),
+        Provider::DeepL => include_bytes!("../assets/providers/deepl.png"),
+        Provider::Offline => include_bytes!("../assets/providers/local.png"),
+        Provider::MyMemory => include_bytes!("../assets/providers/mymemory.png"),
+    };
+    Image::new()
+        .source_data(EncodedImage::from_static(data))
+        .width(18.0)
+        .height(18.0)
+        .stretch(windows_reactor::Stretch::Uniform)
+}
+fn provider_configured(settings: &Settings, provider: Provider) -> bool {
+    !provider.needs_key()
+        || settings
+            .credentials
+            .get(provider.index())
+            .is_some_and(|credential| {
+                !credential.key.trim().is_empty()
+                    && (provider == Provider::DeepL || !credential.id.trim().is_empty())
+            })
+}
 fn field(label: &str, control: impl Into<View>) -> View {
     StackPanel::new()
         .spacing(5.0)
@@ -110,7 +223,9 @@ fn icon_button(path: &str, name: &str, message: Message, cx: &ViewContext<Transl
         .style(ButtonStyle::Subtle)
         .width(44.0)
         .height(44.0)
-        .resource_overrides(ResourceOverrides::new().set("ButtonPadding", Thickness::uniform(6.0)))
+        .padding(6.0)
+        .horizontal_content_alignment(HorizontalAlignment::Center)
+        .vertical_content_alignment(Center)
         .automation_name(name)
         .on_click(cx.message(message))
         .content(icon(path))
@@ -124,6 +239,28 @@ fn theme(settings: &Settings) -> WindowTheme {
     }
 }
 impl Translator {
+    fn cancel_speech(&mut self) {
+        self.speech_revision = self.speech_revision.wrapping_add(1);
+        if let Some(task) = self.speech_task.take() {
+            task.cancel();
+        }
+        self.speech_error = None;
+        crate::speech::stop();
+    }
+
+    fn pronunciation_text(&self) -> Option<&str> {
+        let (from, _) = self.language_indices();
+        if LANGUAGES[from].code == "en" && !self.text.trim().is_empty() {
+            Some(self.text.trim())
+        } else {
+            self.output
+                .as_ref()
+                .filter(|translation| translation.to == "en")
+                .map(|translation| translation.target.trim())
+                .filter(|value| !value.is_empty())
+        }
+    }
+
     fn invalidate(&mut self) {
         self.revision += 1;
         self.busy = false;
@@ -182,9 +319,19 @@ impl Translator {
         }
         self.invalidate();
         self.busy = true;
+        self.pending_provider = Some(
+            if self.text.chars().count() > api::ONLINE_TEXT_LIMIT
+                && !self.force_online_for_long_text
+            {
+                Provider::Offline
+            } else {
+                self.settings.provider
+            },
+        );
         let revision = self.revision;
         let text = self.text.clone();
         let settings = self.settings.clone();
+        let force_online_for_long_text = self.force_online_for_long_text;
         let (source, target) = self.language_indices();
         let from = LANGUAGES[source].code.to_owned();
         let to = LANGUAGES[target].code.to_owned();
@@ -194,11 +341,14 @@ impl Translator {
             } else {
                 None
             };
-            Message::Finished(
-                revision,
-                api::translate_cancellable(text, from, to, settings, &|| cancel.is_cancelled()),
-                entry,
-            )
+            let result = if force_online_for_long_text {
+                api::translate_with_policy(text, from, to, settings, true, &|| {
+                    cancel.is_cancelled()
+                })
+            } else {
+                api::translate_cancellable(text, from, to, settings, &|| cancel.is_cancelled())
+            };
+            Message::Finished(revision, result, entry)
         }));
     }
     fn card(&self, content: impl Into<View>) -> View {
@@ -209,6 +359,66 @@ impl Translator {
             .corner_radius(8.0)
             .padding(14.0)
             .content(content)
+    }
+    fn provider_choices(&self, selected: Provider, compact: bool, cx: &ViewContext<Self>) -> View {
+        NavigationView::new()
+            .width(320.0)
+            .height(264.0)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .pane_display_mode(NavigationViewPaneDisplayMode::Left)
+            .open_pane_length(320.0)
+            .is_pane_open(true)
+            .is_pane_toggle_button_visible(false)
+            .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
+            .is_settings_visible(false)
+            .always_show_header(false)
+            .on_selected_tag_changed(cx.callback(|tag: Option<String>| {
+                Message::Provider(tag.and_then(|value| value.parse::<usize>().ok()))
+            }))
+            .slots([SlotView::collection(
+                NavigationViewSlot::MenuItems,
+                Provider::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        let configured = provider_configured(&self.settings, provider);
+                        let selectable = !compact || configured;
+                        let label = if configured {
+                            provider.name().to_owned()
+                        } else {
+                            format!("{} · 未配置", provider.name())
+                        };
+                        (
+                            index,
+                            NavigationViewItem::new()
+                                .tag(index.to_string())
+                                .is_selected(provider == selected)
+                                .selects_on_invoked(selectable)
+                                .opacity(if selectable { 1.0 } else { 0.45 })
+                                .automation_name(label.clone())
+                                .slot(
+                                    NavigationViewItemSlot::Content,
+                                    StackPanel::new()
+                                        .orientation(Orientation::Horizontal)
+                                        .spacing(10.0)
+                                        .children((
+                                            provider_icon(provider).vertical_alignment(Center),
+                                            text(label, 14.0)
+                                                .text_wrapping(TextWrapping::NoWrap)
+                                                .vertical_alignment(Center),
+                                        )),
+                                ),
+                        )
+                    }),
+            )])
+    }
+    fn close_provider_picker(&mut self) {
+        self.provider_picker_open = false;
+        self.provider_picker_selected = None;
+        self.provider_picker_revision = self.provider_picker_revision.wrapping_add(1);
+        if !self.settings_window {
+            let _ = self.input.request_focus();
+        }
     }
     fn open_settings(&mut self, cx: &ComponentContext<Self>) {
         if self.settings_open && native::activate_settings() {
@@ -245,28 +455,144 @@ impl Translator {
             Color::argb(90, 0, 0, 0)
         };
         let expanded = self.output.is_some();
-        let height = if expanded && self.details_open {
-            450.0
-        } else if expanded {
-            300.0
+        let dictionary_senses = self
+            .output
+            .as_ref()
+            .and(self.entry.as_ref())
+            .map(chinese_senses)
+            .unwrap_or_default();
+        let details_open = self.details_open && !dictionary_senses.is_empty();
+        let is_word = self.output.as_ref().is_some_and(|translation| {
+            !translation.source.trim().is_empty()
+                && translation
+                    .source
+                    .trim()
+                    .chars()
+                    .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'')
+        });
+        let long_input = self.text.chars().count() > 80
+            || visual_lines(&self.text, 23.0, 502.0) > 2
+            || self
+                .text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                > 1;
+        let input_font = if long_input { 15.0 } else { 23.0 };
+        let input_line_height = if long_input { 21.0 } else { 32.0 };
+        let input_height = (visual_lines(&self.text, input_font, 502.0) as f64 * input_line_height
+            + 12.0)
+            .clamp(60.0, 180.0);
+        let fixed_height = 119.0 + input_height;
+        let available_result = (480.0 - fixed_height).max(80.0);
+        let result_font = self.output.as_ref().map_or(23.0, |translation| {
+            if long_input
+                || translation.target.chars().count() > 80
+                || visual_lines(&translation.target, 23.0, 472.0) > 2
+                || translation
+                    .target
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .count()
+                    > 1
+            {
+                15.0
+            } else {
+                23.0
+            }
+        });
+        let result_line_height = if result_font == 15.0 { 21.0 } else { 32.0 };
+        let result_notice = self.output.as_ref().and_then(|translation| {
+            if translation.note.contains("后续内容未翻译") {
+                Some("在线仅翻译前5000字符，后续内容未翻译")
+            } else if translation.note.contains("在线不可用，已使用本地翻译全文") {
+                Some("在线不可用，已使用本地翻译全文")
+            } else if translation.note.contains("长文本已自动使用本地翻译") {
+                Some("长文本已自动使用本地翻译")
+            } else {
+                None
+            }
+        });
+        let notice_height = result_notice.map_or(0.0, |notice| {
+            visual_lines(notice, 12.0, 496.0) as f64 * 18.0 + 6.0
+        });
+        let metadata = self
+            .entry
+            .as_ref()
+            .map(dictionary_metadata)
+            .filter(|value| !value.is_empty());
+        let mut target_max_height = available_result;
+        let mut details_viewport_height = 0.0;
+        let result_height = if let Some(translation) = &self.output {
+            if self.entry.is_some() {
+                let metadata_height = metadata.as_ref().map_or(0.0, |value| {
+                    visual_lines(value, 14.0, 472.0) as f64 * 20.0 + 6.0
+                });
+                let header_fixed = 28.0 + metadata_height;
+                let detail_reserve = if details_open { 72.0 } else { 0.0 };
+                let target_limit =
+                    (available_result - header_fixed - detail_reserve).max(result_line_height);
+                target_max_height = (visual_lines(&translation.target, result_font, 472.0) as f64
+                    * result_line_height)
+                    .min(target_limit);
+                let header_height = header_fixed + target_max_height;
+                if details_open {
+                    let meanings_height = dictionary_senses
+                        .iter()
+                        .map(|sense| visual_lines(&sense.definition, 15.0, 440.0) as f64 * 21.0)
+                        .sum::<f64>()
+                        + dictionary_senses.len().saturating_sub(1) as f64 * 12.0;
+                    let details_height =
+                        (meanings_height + 25.0).min((available_result - header_height).max(25.0));
+                    details_viewport_height = (details_height - 25.0).max(0.0);
+                    header_height + details_height
+                } else {
+                    header_height
+                }
+            } else {
+                let word_metadata = if is_word { 26.0 } else { 0.0 };
+                (30.0
+                    + notice_height
+                    + word_metadata
+                    + visual_lines(&translation.target, result_font, 496.0) as f64
+                        * result_line_height)
+                    .min(available_result)
+            }
         } else if self.error {
-            208.0
+            (visual_lines(&self.status, 12.0, 502.0).min(4) as f64 * 18.0 + 4.0)
+                .min(available_result)
         } else {
-            184.0
+            0.0
+        };
+        let natural_height = if expanded || self.error {
+            (fixed_height + result_height).clamp(184.0, 480.0)
+        } else {
+            fixed_height.max(184.0).min(480.0)
+        };
+        let height = if self.provider_picker_open {
+            natural_height.max(322.0)
+        } else {
+            natural_height
         };
         cx.window_title("翻译");
         cx.window_visuals(
             WindowVisuals::new()
-                .client_size(620.0, 184.0)
+                .client_size(558.0, 184.0)
                 .backdrop(WindowBackdrop::Mica)
                 .theme(theme(&self.settings)),
         );
         let dismiss = cx.message(Message::Dismiss);
         cx.use_effect(
             "popup-frame",
-            (expanded, self.error, self.details_open),
+            (
+                expanded,
+                self.error,
+                details_open,
+                self.provider_picker_open,
+                height.round() as u32,
+            ),
             move || {
-                native::configure_popup(620.0, height);
+                native::configure_popup(558.0, height);
                 native::escape_handler(move || {
                     let _ = dismiss.call(());
                 });
@@ -289,10 +615,11 @@ impl Translator {
             .column_spacing(4.0)
             .children((
                 icon(TRANSLATE)
-                    .vertical_alignment(Center)
-                    .margin(Thickness::new(4.0, 0.0, 10.0, 0.0)),
+                    .width(20.0)
+                    .height(20.0)
+                    .vertical_alignment(Center),
                 ComboBox::new()
-                    .items_source(LANGUAGES.iter().map(|l| l.label))
+                    .items_source(LANGUAGES.iter().map(popup_language))
                     .selected_index(from)
                     .width(144.0)
                     .height(34.0)
@@ -301,7 +628,7 @@ impl Translator {
                     .grid_column(1),
                 at(icon_button(SWAP, "交换语言", Message::Swap, cx), 0, 2),
                 ComboBox::new()
-                    .items_source(LANGUAGES.iter().skip(1).map(|l| l.label))
+                    .items_source(LANGUAGES.iter().skip(1).map(popup_language))
                     .selected_index(to - 1)
                     .width(132.0)
                     .height(34.0)
@@ -316,7 +643,7 @@ impl Translator {
             ));
         let input = TextBox::new()
             .element_ref(&self.input)
-            .font_size(23.0)
+            .font_size(input_font)
             .resource_overrides(
                 [
                     "TextControlBackground",
@@ -353,103 +680,162 @@ impl Translator {
             .background(Color::transparent())
             .border_thickness(0.0)
             .border_brush(Color::transparent())
-            .height(60.0)
+            .min_height(60.0)
+            .max_height(180.0)
             .horizontal_alignment(Stretch)
             .automation_name("输入单词或文本")
             .on_text_changed(cx.callback(Message::Text));
-        let result: View = if let Some(t) = &self.output {
-            let is_word = t
-                .source
-                .trim()
-                .chars()
-                .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'');
-            let pos = self
-                .entry
-                .as_ref()
-                .map(|entry| entry.parts_of_speech.join(" · "))
-                .filter(|s| !s.is_empty());
-            let summary = StackPanel::new()
-                .spacing(8.0)
-                .margin(Thickness::new(0.0, 10.0, 0.0, 10.0))
-                .children((
-                    text(&t.target, 23.0).is_text_selection_enabled(self.entry.is_none()),
-                    if is_word {
-                        muted(pos.unwrap_or_else(|| "词性未收录".into())).into()
+        let result: View = if let Some(translation) = &self.output {
+            if let Some(entry) = &self.entry {
+                let summary = StackPanel::new().spacing(6.0).children((
+                    if let Some(value) = &metadata {
+                        text(value, 14.0).opacity(0.64).tooltip(&entry.word)
                     } else {
                         View::empty()
                     },
+                    ScrollViewer::new()
+                        .max_height(target_max_height)
+                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .content(text(&translation.target, result_font)),
                 ));
-            if let Some(entry) = &self.entry {
-                let senses = StackPanel::new().spacing(10.0).keyed_children(
-                    entry.senses.iter().enumerate().map(|(i, sense)| {
-                        (
-                            i,
-                            StackPanel::new().spacing(3.0).children((
-                                muted(if sense.part_of_speech.is_empty() {
-                                    "词性未收录"
-                                } else {
-                                    &sense.part_of_speech
-                                }),
-                                text(&sense.definition, 15.0).is_text_selection_enabled(true),
-                            )),
-                        )
-                    }),
-                );
-                ScrollViewer::new()
-                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                    .content(
-                        Expander::new()
-                            .horizontal_alignment(Stretch)
-                            .is_expanded(self.details_open)
-                            .automation_name("详细释义")
-                            .on_is_expanded_changed(cx.callback(Message::Details))
-                            .slots([
-                                SlotView::new(ExpanderSlot::Header, summary),
-                                SlotView::new(
-                                    ExpanderSlot::Content,
-                                    StackPanel::new()
-                                        .spacing(12.0)
-                                        .margin(Thickness::new(0.0, 12.0, 0.0, 12.0))
-                                        .children((
-                                            text(
-                                                if entry.phonetic.is_empty() {
-                                                    entry.word.clone()
-                                                } else {
-                                                    format!("{}  /{}/", entry.word, entry.phonetic)
-                                                },
-                                                14.0,
-                                            ),
-                                            senses,
-                                            muted("ECDICT · 本地词典"),
-                                        )),
+                let has_details = !dictionary_senses.is_empty();
+                let header_content = Grid::new()
+                    .columns([Star(1.0), Auto])
+                    .column_spacing(8.0)
+                    .children((
+                        summary,
+                        if has_details {
+                            icon(if details_open { "\u{E70E}" } else { "\u{E70D}" })
+                                .opacity(0.6)
+                                .vertical_alignment(Center)
+                                .grid_column(1)
+                                .into()
+                        } else {
+                            View::empty()
+                        },
+                    ));
+                let header: View = if has_details {
+                    Button::new()
+                        .style(ButtonStyle::Subtle)
+                        .horizontal_alignment(Stretch)
+                        .horizontal_content_alignment(Stretch)
+                        .padding(12.0)
+                        .automation_name(if details_open {
+                            "收起词典释义"
+                        } else {
+                            "展开词典释义"
+                        })
+                        .on_click(cx.message(Message::Details(!details_open)))
+                        .content(header_content)
+                        .into()
+                } else {
+                    Border::new().padding(12.0).content(header_content)
+                };
+                let details: View = if details_open {
+                    let senses = StackPanel::new().spacing(12.0).keyed_children(
+                        dictionary_senses.iter().enumerate().map(|(index, sense)| {
+                            (
+                                index,
+                                Grid::new()
+                                    .columns([GridLength::Pixel(42.0), Star(1.0)])
+                                    .column_spacing(8.0)
+                                    .children((
+                                        text(&sense.part_of_speech, 14.0).opacity(0.6),
+                                        text(&sense.definition, 15.0)
+                                            .is_text_selection_enabled(true)
+                                            .grid_column(1),
+                                    )),
+                            )
+                        }),
+                    );
+                    Border::new()
+                        .border_brush(ThemeBrush::CardStroke)
+                        .border_thickness(Thickness::new(0.0, 1.0, 0.0, 0.0))
+                        .padding(12.0)
+                        .content(
+                            ScrollViewer::new()
+                                .max_height(details_viewport_height)
+                                .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                                .content(
+                                    Border::new()
+                                        .padding(Thickness::new(0.0, 0.0, 10.0, 0.0))
+                                        .content(senses),
                                 ),
-                            ]),
+                        )
+                } else {
+                    View::empty()
+                };
+                Border::new()
+                    .background(ThemeBrush::CardBackground)
+                    .border_brush(ThemeBrush::CardStroke)
+                    .border_thickness(1.0)
+                    .corner_radius(8.0)
+                    .max_height(result_height)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .content(
+                        Grid::new()
+                            .rows([Auto, Auto])
+                            .children((header, at(details, 1, 0))),
                     )
             } else {
-                self.card(
-                    ScrollViewer::new()
-                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                        .content(summary),
-                )
+                Border::new()
+                    .background(ThemeBrush::CardBackground)
+                    .border_brush(ThemeBrush::CardStroke)
+                    .border_thickness(1.0)
+                    .corner_radius(8.0)
+                    .padding(14.0)
+                    .max_height(result_height)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .content(
+                        StackPanel::new().spacing(6.0).children((
+                            if let Some(notice) = result_notice {
+                                text(notice, 12.0).opacity(0.75).into()
+                            } else {
+                                View::empty()
+                            },
+                            ScrollViewer::new()
+                                .max_height((result_height - 30.0 - notice_height).max(32.0))
+                                .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                                .content(
+                                    StackPanel::new().spacing(6.0).children((
+                                        if is_word {
+                                            text("词性未收录", 14.0).opacity(0.64).into()
+                                        } else {
+                                            View::empty()
+                                        },
+                                        text(&translation.target, result_font)
+                                            .is_text_selection_enabled(true),
+                                    )),
+                                ),
+                        )),
+                    )
             }
         } else if self.error {
-            text(&self.status, 12.0)
-                .margin(Thickness::new(12.0, 2.0, 12.0, 0.0))
-                .opacity(0.8)
-                .into()
+            ScrollViewer::new()
+                .max_height(result_height)
+                .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .content(
+                    text(&self.status, 12.0)
+                        .opacity(0.8)
+                        .margin(Thickness::new(6.0, 2.0, 6.0, 2.0)),
+                )
         } else {
             View::empty()
         };
         let engine = self
             .output
             .as_ref()
-            .map(|t| {
+            .map(|translation| {
                 format!(
                     "{}{}",
-                    t.provider.name(),
-                    if t.note.contains("尚未配置") {
+                    translation.provider.name(),
+                    if translation.note.contains("尚未配置") {
                         " · 未配置密钥"
-                    } else if t.note.contains("网络") {
+                    } else if translation.note.contains("网络") {
                         " · 网络不可用"
                     } else {
                         ""
@@ -457,53 +843,99 @@ impl Translator {
                 )
             })
             .unwrap_or_else(|| self.settings.provider.name().into());
-        let provider = self
+        let actual_provider = self
             .output
             .as_ref()
-            .map_or(self.settings.provider, |t| t.provider);
-        let provider_data: &'static [u8] = match provider {
-            Provider::Tencent => include_bytes!("../assets/providers/tencent.png"),
-            Provider::Baidu => include_bytes!("../assets/providers/baidu.png"),
-            Provider::Youdao => include_bytes!("../assets/providers/youdao.png"),
-            Provider::DeepL => include_bytes!("../assets/providers/deepl.png"),
-            Provider::Offline => include_bytes!("../assets/providers/local.png"),
-            Provider::MyMemory => include_bytes!("../assets/providers/mymemory.png"),
-        };
-        let provider_icon: View = Image::new()
-            .source_data(EncodedImage::from_static(provider_data))
-            .width(18.0)
-            .height(18.0)
-            .stretch(windows_reactor::Stretch::Uniform)
-            .into();
-        let state_content = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(8.0)
-            .margin(Thickness::new(12.0, 0.0, 0.0, 0.0))
-            .children((
-                provider_icon,
-                muted(if self.busy {
-                    "翻译中…".into()
-                } else {
-                    engine
-                })
-                .vertical_alignment(Center),
-            ));
+            .map_or(self.settings.provider, |translation| translation.provider);
+        let provider = self.pending_provider.unwrap_or(actual_provider);
         let state = Button::new()
             .style(ButtonStyle::Subtle)
+            .height(32.0)
+            .min_height(32.0)
+            .padding(Thickness::new(6.0, 4.0, 6.0, 4.0))
             .horizontal_alignment(HorizontalAlignment::Left)
-            .automation_name("切换翻译服务")
-            .resource_overrides(
-                ResourceOverrides::new().set("ButtonPadding", Thickness::new(0.0, 4.0, 8.0, 4.0)),
+            .automation_name("选择翻译服务")
+            .on_click(cx.message(Message::ProviderPicker(!self.provider_picker_open)))
+            .content(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .children((
+                        provider_icon(provider),
+                        muted(if let Some(pending) = self.pending_provider {
+                            if self.busy {
+                                format!("{} · 翻译中…", pending.name())
+                            } else {
+                                pending.name().to_owned()
+                            }
+                        } else if self.busy {
+                            "翻译中…".into()
+                        } else {
+                            engine
+                        })
+                        .vertical_alignment(Center),
+                    )),
             )
-            .on_click(cx.message(Message::CycleProvider))
-            .content(state_content)
-            .tooltip("切换翻译服务");
+            .tooltip("选择翻译服务");
         let state = Grid::new().keyed_children([(self.settings.provider.index(), state)]);
-        Border::new()
+        let can_pronounce = self.pronunciation_text().is_some();
+        let pronunciation = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(4.0)
+            .keyed_children(
+                [
+                    (crate::speech::Accent::British, "英", "英式发音"),
+                    (crate::speech::Accent::American, "美", "美式发音"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (accent, label, name))| {
+                    (
+                        index,
+                        Button::new()
+                            .style(ButtonStyle::Subtle)
+                            .width(62.0)
+                            .height(32.0)
+                            .padding(4.0)
+                            .is_enabled(can_pronounce)
+                            .horizontal_content_alignment(HorizontalAlignment::Center)
+                            .vertical_content_alignment(Center)
+                            .automation_name(name)
+                            .on_click(cx.message(Message::Pronounce(accent)))
+                            .content(
+                                StackPanel::new()
+                                    .orientation(Orientation::Horizontal)
+                                    .spacing(4.0)
+                                    .children((
+                                        icon("\u{E767}"),
+                                        text(label, 12.0).vertical_alignment(Center),
+                                    )),
+                            )
+                            .tooltip(name),
+                    )
+                }),
+            );
+        let footer = Grid::new()
+            .columns([Auto, Star(1.0), Auto])
+            .column_spacing(8.0)
+            .children((
+                state,
+                if let Some(error) = &self.speech_error {
+                    muted("语音暂不可用")
+                        .max_lines(1)
+                        .vertical_alignment(Center)
+                        .grid_column(1)
+                        .tooltip(error)
+                } else {
+                    View::empty()
+                },
+                at(pronunciation, 0, 2),
+            ));
+        let surface = Border::new()
             .corner_radius(12.0)
             .padding(Thickness::new(14.0, 12.0, 14.0, 10.0))
-            .on_pointer_pressed(cx.callback(|p: PointerEventInfo| {
-                if p.window_y < 10.0 {
+            .on_pointer_pressed(cx.callback(|point: PointerEventInfo| {
+                if point.window_y < 8.0 {
                     Message::Drag
                 } else {
                     Message::Warmed
@@ -511,15 +943,54 @@ impl Translator {
             }))
             .content(
                 Grid::new()
-                    .rows([Auto, Auto, Star(1.0), Auto])
+                    .rows([
+                        Auto,
+                        Auto,
+                        if self.provider_picker_open {
+                            Star(1.0)
+                        } else {
+                            Auto
+                        },
+                        Auto,
+                    ])
                     .row_spacing(7.0)
                     .children((
                         languages,
                         at(input, 1, 0),
                         at(result, 2, 0),
-                        at(state, 3, 0),
+                        at(footer, 3, 0),
                     )),
-            )
+            );
+        let dismiss_layer: View = if self.provider_picker_open {
+            Border::new()
+                .background(Color::transparent())
+                .on_pointer_pressed(
+                    cx.callback(|_: PointerEventInfo| Message::ProviderPicker(false)),
+                )
+                .content(View::empty())
+        } else {
+            View::empty()
+        };
+        let choices: View = if self.provider_picker_open {
+            Border::new()
+                .background(ThemeBrush::SolidBackground)
+                .border_brush(ThemeBrush::CardStroke)
+                .border_thickness(1.0)
+                .corner_radius(8.0)
+                .width(322.0)
+                .height(266.0)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .margin(Thickness::new(16.0, 0.0, 0.0, 44.0))
+                .content(self.provider_choices(
+                    self.provider_picker_selected.unwrap_or(provider),
+                    true,
+                    cx,
+                ))
+        } else {
+            View::empty()
+        };
+        Grid::new().children((surface, dismiss_layer, choices))
     }
     fn provider_settings(&self, cx: &ViewContext<Self>) -> View {
         let provider = self.settings.provider;
@@ -576,25 +1047,71 @@ impl Translator {
                 .slot(ToggleSwitchSlot::Header, "使用 Free API"),
             _ => View::empty(),
         };
-        self.card(
-            StackPanel::new().spacing(12.0).children((
-                field(
-                    "默认引擎",
-                    ComboBox::new()
-                        .items_source(Provider::ALL.iter().map(|p| p.name()))
-                        .selected_index(provider.index())
-                        .horizontal_alignment(Stretch)
-                        .automation_name("默认引擎")
-                        .on_selection_changed(cx.callback(Message::Provider)),
-                ),
-                credentials,
-                extra,
-                Button::new()
-                    .style(ButtonStyle::Accent)
-                    .on_click(cx.message(Message::Save))
-                    .content("保存凭据"),
-            )),
-        )
+        let routes = crate::routing::status(&self.settings);
+        let route_rows = StackPanel::new()
+            .spacing(10.0)
+            .keyed_children(routes.into_iter().map(|route| {
+                let description = if !route.configured {
+                    "未配置".to_owned()
+                } else if !route.eligible {
+                    "未启用 Free API".to_owned()
+                } else if route.cooldown_seconds > 0 {
+                    format!("暂不可用 · {}", route.message)
+                } else if let Some(remaining) = route.remaining_characters {
+                    let period = if route.provider == Provider::MyMemory {
+                        "今日"
+                    } else {
+                        "本月"
+                    };
+                    format!(
+                        "{period}剩余 {remaining} / {} 字符",
+                        route.allowance_characters
+                    )
+                } else {
+                    route.message
+                };
+                (
+                    route.provider.index(),
+                    Grid::new()
+                        .columns([GridLength::Pixel(90.0), Star(1.0)])
+                        .column_spacing(8.0)
+                        .children((
+                            text(route.provider.name(), 13.0),
+                            muted(description).grid_column(1),
+                        )),
+                )
+            }));
+        let order = crate::routing::candidates(&self.settings)
+            .iter()
+            .map(|provider| provider.name())
+            .collect::<Vec<_>>()
+            .join(" → ");
+        let order = if order.is_empty() {
+            "当前为手动离线".to_owned()
+        } else if self.settings.auto_offline {
+            format!("{order} → 本地离线")
+        } else {
+            order
+        };
+        StackPanel::new().spacing(10.0).children((
+            self.card(
+                StackPanel::new().spacing(12.0).children((
+                    field("默认引擎", self.provider_choices(provider, false, cx)),
+                    credentials,
+                    extra,
+                    Button::new()
+                        .style(ButtonStyle::Accent)
+                        .on_click(cx.message(Message::Save))
+                        .content("保存凭据"),
+                )),
+            ),
+            self.card(StackPanel::new().spacing(10.0).children((
+                text("在线路由", 14.0),
+                muted(order),
+                route_rows,
+                muted("只记录本程序的用量；免费额度不足时自动换服务。"),
+            ))),
+        ))
     }
     fn general_settings(&self, cx: &ViewContext<Self>) -> View {
         StackPanel::new().spacing(10.0).children((
@@ -701,13 +1218,27 @@ impl Translator {
                 )
             })
             .collect();
-        StackPanel::new().spacing(10.0).children((
-            TextBox::new()
-                .text(&self.query)
-                .placeholder_text("搜索记录")
-                .on_text_changed(cx.callback(Message::Search)),
-            StackPanel::new().spacing(8.0).keyed_children(entries),
-        ))
+        Grid::new()
+            .rows([Auto, Star(1.0)])
+            .row_spacing(10.0)
+            .children((
+                TextBox::new()
+                    .text(&self.query)
+                    .placeholder_text("搜索记录")
+                    .on_text_changed(cx.callback(Message::Search)),
+                at(
+                    ScrollViewer::new()
+                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .content(
+                            Border::new()
+                                .padding(Thickness::new(0.0, 0.0, 12.0, 0.0))
+                                .content(StackPanel::new().spacing(8.0).keyed_children(entries)),
+                        ),
+                    1,
+                    0,
+                ),
+            ))
     }
     fn settings_view(&self, cx: &mut ViewContext<Self>) -> View {
         cx.window_title("翻译设置");
@@ -735,6 +1266,14 @@ impl Translator {
             "providers" => self.provider_settings(cx),
             "history" => self.history_view(cx),
             _ => self.general_settings(cx),
+        };
+        let content = if self.tab == "history" {
+            content
+        } else {
+            ScrollViewer::new()
+                .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .content(content)
         };
         NavigationView::new()
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
@@ -769,13 +1308,7 @@ impl Translator {
                         .margin(16.0)
                         .children((
                             text(title, 23.0).font_weight(FontWeight::SEMI_BOLD),
-                            at(
-                                ScrollViewer::new()
-                                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                                    .content(content),
-                                1,
-                                0,
-                            ),
+                            at(content, 1, 0),
                             muted(&self.status).grid_row(2),
                         )),
                 ),
@@ -822,9 +1355,14 @@ impl Component for Translator {
                 input.tab.clone()
             },
             text: String::new(),
+            force_online_for_long_text: false,
+            pending_provider: None,
             output: None,
             entry: None,
             details_open: false,
+            provider_picker_open: false,
+            provider_picker_selected: None,
+            provider_picker_revision: 0,
             color_scheme: ColorScheme::Light,
             settings,
             history,
@@ -832,6 +1370,9 @@ impl Component for Translator {
             busy: false,
             revision: 0,
             task: None,
+            speech_task: None,
+            speech_revision: 0,
+            speech_error: None,
             status: warning.clone().unwrap_or_default(),
             error: warning.is_some(),
             input: ElementRef::new(),
@@ -841,7 +1382,15 @@ impl Component for Translator {
         match message {
             Message::Text(value) => {
                 if self.text != value {
+                    self.cancel_speech();
                     self.text = value;
+                    let previously_followed_input = self.settings.auto_pair;
+                    self.settings.follow_bilingual_input(&self.text);
+                    if !previously_followed_input && self.settings.auto_pair {
+                        let _ = storage::save_settings(&self.settings);
+                    }
+                    self.force_online_for_long_text = false;
+                    self.pending_provider = None;
                     self.schedule(cx);
                 }
             }
@@ -860,6 +1409,23 @@ impl Component for Translator {
                 }
             }
             Message::Details(open) => self.details_open = open,
+            Message::Pronounce(accent) => {
+                let Some(text) = self.pronunciation_text().map(str::to_owned) else {
+                    return;
+                };
+                self.cancel_speech();
+                let revision = self.speech_revision;
+                self.speech_task = Some(cx.spawn_background(move |cancel| {
+                    Message::Pronounced(
+                        revision,
+                        crate::speech::pronounce(&text, accent, &|| cancel.is_cancelled()),
+                    )
+                }));
+            }
+            Message::Pronounced(revision, result) if revision == self.speech_revision => {
+                self.speech_task = None;
+                self.speech_error = result.err();
+            }
             Message::ColorScheme(scheme) => self.color_scheme = scheme,
             Message::RepairCaret(attempt) => self.repair_caret(cx, attempt),
             Message::RetryCaret(attempt) => {
@@ -870,6 +1436,7 @@ impl Component for Translator {
             }
             Message::Finished(revision, result, entry) if revision == self.revision => {
                 self.busy = false;
+                self.pending_provider = None;
                 self.task = None;
                 self.entry = entry;
                 match result {
@@ -909,10 +1476,16 @@ impl Component for Translator {
                 }
             }
             Message::Dismiss => {
-                self.invalidate();
-                native::hide_popup();
+                if self.provider_picker_open {
+                    self.close_provider_picker();
+                } else {
+                    self.cancel_speech();
+                    self.invalidate();
+                    native::hide_popup();
+                }
             }
             Message::Show => {
+                self.close_provider_picker();
                 native::show_popup();
                 let _ = self.input.request_focus();
                 self.repair_caret(cx, 0);
@@ -926,6 +1499,7 @@ impl Component for Translator {
                 }
             }
             Message::Quit => {
+                self.cancel_speech();
                 self.invalidate();
                 native::quit();
             }
@@ -961,37 +1535,59 @@ impl Component for Translator {
                     self.history = storage::load().1;
                 }
             }
-            Message::CycleProvider => {
-                let available: Vec<_> = Provider::ALL
-                    .iter()
-                    .copied()
-                    .filter(|p| {
-                        !p.needs_key()
-                            || self.settings.credentials.get(p.index()).is_some_and(|c| {
-                                !c.key.trim().is_empty()
-                                    && (*p == Provider::DeepL || !c.id.trim().is_empty())
-                            })
-                    })
-                    .collect();
-                let current = self
-                    .output
-                    .as_ref()
-                    .map_or(self.settings.provider, |t| t.provider);
-                let next = available
-                    .iter()
-                    .position(|p| *p == current)
-                    .map_or(0, |i| (i + 1) % available.len());
-                self.settings.provider = available[next];
-                self.save();
-                self.schedule(cx);
+            Message::ProviderPicker(open) => {
+                if open {
+                    self.provider_picker_revision = self.provider_picker_revision.wrapping_add(1);
+                    self.provider_picker_selected =
+                        Some(self.pending_provider.unwrap_or_else(|| {
+                            self.output
+                                .as_ref()
+                                .map_or(self.settings.provider, |translation| translation.provider)
+                        }));
+                    self.provider_picker_open = true;
+                } else {
+                    self.close_provider_picker();
+                }
             }
-            Message::Provider(Some(i))
-                if i < Provider::ALL.len() && self.settings.provider != Provider::ALL[i] =>
-            {
-                self.settings.provider = Provider::ALL[i];
-                self.save();
+            Message::CloseProviderPicker(revision) if revision == self.provider_picker_revision => {
+                self.close_provider_picker()
+            }
+            Message::Provider(Some(i)) if i < Provider::ALL.len() => {
+                let provider = Provider::ALL[i];
+                let selected_from_picker = self.provider_picker_open;
+                if !self.settings_window
+                    && (!provider_configured(&self.settings, provider)
+                        || (self.provider_picker_open
+                            && self.provider_picker_selected == Some(provider)))
+                {
+                    return;
+                }
+                let force_online = self.text.chars().count() > api::ONLINE_TEXT_LIMIT
+                    && provider != Provider::Offline;
+                let policy_changed = self.force_online_for_long_text != force_online;
+                self.force_online_for_long_text = force_online;
+                let changed = self.settings.provider != Provider::ALL[i];
+                if changed {
+                    self.settings.provider = Provider::ALL[i];
+                    self.save();
+                }
                 if !self.settings_window {
-                    self.schedule(cx);
+                    if self.provider_picker_open {
+                        self.provider_picker_selected = Some(provider);
+                        self.provider_picker_revision =
+                            self.provider_picker_revision.wrapping_add(1);
+                        let revision = self.provider_picker_revision;
+                        cx.spawn_background(move |_| {
+                            std::thread::sleep(std::time::Duration::from_millis(180));
+                            Message::CloseProviderPicker(revision)
+                        });
+                    } else {
+                        let _ = self.input.request_focus();
+                    }
+                    if changed || policy_changed || selected_from_picker {
+                        self.pending_provider = Some(provider);
+                        self.schedule(cx);
+                    }
                 }
             }
             Message::Source(Some(i)) if i < LANGUAGES.len() => {
@@ -1119,6 +1715,9 @@ impl Component for Translator {
 }
 impl Drop for Translator {
     fn drop(&mut self) {
+        if !self.settings_window {
+            self.cancel_speech();
+        }
         if let Some(task) = self.task.take() {
             task.cancel();
         }

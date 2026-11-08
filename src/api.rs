@@ -1,4 +1,9 @@
-use crate::{model::*, offline, storage};
+use crate::{
+    model::*,
+    offline,
+    routing::{self, Failure, FailureKind},
+    storage,
+};
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -8,48 +13,105 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug)]
-enum Failure {
-    Network(String),
-    Api(String),
-}
-impl Failure {
-    fn message(&self) -> &str {
-        match self {
-            Self::Network(v) | Self::Api(v) => v,
-        }
-    }
-}
+pub const ONLINE_TEXT_LIMIT: usize = 5_000;
+const LONG_LOCAL_NOTICE: &str = "长文本已自动使用本地翻译";
+const LONG_FALLBACK_NOTICE: &str = "在线不可用，已使用本地翻译全文";
+const PARTIAL_ONLINE_NOTICE: &str = "在线仅翻译前5000字符，后续内容未翻译";
+
 static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 fn client() -> &'static reqwest::blocking::Client {
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_millis(1500))
-            .timeout(Duration::from_secs(6))
+            .connect_timeout(Duration::from_millis(900))
+            .timeout(Duration::from_secs(3))
             .pool_idle_timeout(Duration::from_secs(90))
             .user_agent("TranslationTool/0.1")
             .build()
             .expect("HTTP client initialization failed")
     })
 }
-fn send(request: reqwest::blocking::RequestBuilder) -> Result<Value, Failure> {
-    let response = request.send().map_err(|_| {
+fn send(request: reqwest::blocking::RequestBuilder, timeout: Duration) -> Result<Value, Failure> {
+    let response = request.timeout(timeout).send().map_err(|_| {
         storage::diagnostic(json!({"event":"http_error", "reason":"connection_or_timeout"}));
-        Failure::Network("网络连接失败或请求超时".into())
+        Failure::new(FailureKind::Transient, "网络连接失败或请求超时")
     })?;
     let status = response.status();
     storage::diagnostic(
         json!({"event":"http_response", "host":response.url().host_str(), "status":status.as_u16()}),
     );
-    let body: Value = response
-        .json()
-        .map_err(|_| Failure::Api(format!("服务返回了无效数据（HTTP {status}）")))?;
+    let retry_after_secs = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let body = response.json::<Value>();
     if !status.is_success() {
-        return Err(Failure::Api(format!(
-            "服务请求失败（HTTP {status}），请检查密钥和配额"
-        )));
+        let mut failure = http_failure(status.as_u16());
+        failure.retry_after_secs = retry_after_secs;
+        return Err(failure);
     }
-    Ok(body)
+    body.map_err(|_| {
+        Failure::new(
+            FailureKind::Transient,
+            format!("服务返回了无效数据（HTTP {status}）"),
+        )
+    })
+}
+
+fn http_failure(status: u16) -> Failure {
+    let (kind, message) = match status {
+        402 | 456 => (FailureKind::Quota, "服务免费额度已用完"),
+        429 => (FailureKind::RateLimited, "服务请求过于频繁"),
+        401 | 403 => (FailureKind::Auth, "服务鉴权失败，请检查 API 凭据"),
+        408 | 500..=599 => (FailureKind::Transient, "服务暂不可用或请求超时"),
+        _ => (FailureKind::InvalidRequest, "服务不支持本次请求"),
+    };
+    Failure::new(kind, format!("{message}（HTTP {status}）"))
+}
+
+fn provider_failure(provider: Provider, code: &str, message: &str) -> Failure {
+    let lower = format!("{code} {message}").to_ascii_lowercase();
+    let kind = match provider {
+        Provider::Baidu => match code {
+            "54004" => FailureKind::Quota,
+            "54003" | "54005" => FailureKind::RateLimited,
+            "52003" | "54001" | "58000" | "58002" | "90107" => FailureKind::Auth,
+            "52001" | "52002" => FailureKind::Transient,
+            _ => FailureKind::InvalidRequest,
+        },
+        Provider::MyMemory
+            if lower.contains("daily")
+                || lower.contains("quota")
+                || lower.contains("used all")
+                || lower.contains("next available") =>
+        {
+            FailureKind::Quota
+        }
+        Provider::MyMemory if code == "429" || lower.contains("too many") => {
+            FailureKind::RateLimited
+        }
+        Provider::MyMemory if code.starts_with('5') => FailureKind::Transient,
+        Provider::MyMemory => FailureKind::InvalidRequest,
+        Provider::Tencent if lower.contains("requestlimit") => FailureKind::RateLimited,
+        Provider::Tencent
+            if lower.contains("limitexceeded")
+                || lower.contains("balance")
+                || lower.contains("resourceunavailable") =>
+        {
+            FailureKind::Quota
+        }
+        Provider::Tencent if lower.contains("authfailure") => FailureKind::Auth,
+        Provider::Youdao if code == "401" => FailureKind::Quota,
+        Provider::Youdao if matches!(code, "411" | "412") => FailureKind::RateLimited,
+        Provider::Youdao if matches!(code, "108" | "110" | "111" | "202" | "203") => {
+            FailureKind::Auth
+        }
+        _ => FailureKind::Transient,
+    };
+    storage::diagnostic(json!({
+        "event":"provider_error", "provider":provider, "code":code, "category":kind
+    }));
+    Failure::new(kind, format!("{code} · {message}"))
 }
 fn digest(data: impl AsRef<[u8]>) -> String {
     hex::encode(Sha256::digest(data))
@@ -111,20 +173,25 @@ pub fn youdao_input(text: &str) -> String {
     }
 }
 fn online(
+    p: Provider,
     text: &str,
     from: &str,
     to: &str,
     settings: &Settings,
+    timeout: Duration,
 ) -> Result<(String, String), Failure> {
-    let p = settings.provider;
-    let cred = settings.credential();
+    let cred = settings
+        .credentials
+        .get(p.index())
+        .cloned()
+        .unwrap_or_default();
     if p.needs_key()
         && (cred.key.trim().is_empty() || (p != Provider::DeepL && cred.id.trim().is_empty()))
     {
-        return Err(Failure::Api(format!(
-            "请先在设置中填写{}的 API 凭据",
-            p.name()
-        )));
+        return Err(Failure::new(
+            FailureKind::Auth,
+            format!("请先在设置中填写{}的 API 凭据", p.name()),
+        ));
     }
     let timestamp = chrono::Utc::now().timestamp();
     storage::diagnostic(
@@ -145,14 +212,15 @@ fn online(
                     .header("X-TC-Timestamp", timestamp.to_string())
                     .header("X-TC-Region", &settings.region)
                     .body(payload),
+                timeout,
             )?;
             let r = &value["Response"];
             if let Some(code) = r["Error"]["Code"].as_str() {
-                storage::diagnostic(json!({"event":"provider_error", "provider":p, "code":code}));
-                return Err(Failure::Api(format!(
-                    "腾讯翻译：{code} · {}",
-                    r["Error"]["Message"].as_str().unwrap_or("请求失败")
-                )));
+                return Err(provider_failure(
+                    p,
+                    code,
+                    r["Error"]["Message"].as_str().unwrap_or("请求失败"),
+                ));
             }
             storage::diagnostic(
                 json!({"event":"provider_response", "provider":p, "parsed_field":"Response.TargetText", "target_characters":r["TargetText"].as_str().unwrap_or("").chars().count(), "request_id":r["RequestId"].as_str()}),
@@ -182,12 +250,14 @@ fn online(
                         ("salt", &salt),
                         ("sign", &sign),
                     ]),
+                timeout,
             )?;
             if let Some(code) = value["error_code"].as_str() {
-                return Err(Failure::Api(format!(
-                    "百度翻译：{code} · {}",
-                    value["error_msg"].as_str().unwrap_or("请求失败")
-                )));
+                return Err(provider_failure(
+                    p,
+                    code,
+                    value["error_msg"].as_str().unwrap_or("请求失败"),
+                ));
             }
             (
                 value["trans_result"]
@@ -199,7 +269,7 @@ fn online(
                             .join("\n")
                     })
                     .unwrap_or_default(),
-                from.into(),
+                value["from"].as_str().unwrap_or(from).to_owned(),
             )
         }
         Provider::Youdao => {
@@ -214,18 +284,25 @@ fn online(
                 youdao_input(text),
                 cred.key.trim()
             ));
-            let value = send(client().post("https://openapi.youdao.com/api").form(&[
-                ("q", text),
-                ("from", mapped(p, from)),
-                ("to", mapped(p, to)),
-                ("appKey", cred.id.trim()),
-                ("salt", &salt),
-                ("sign", &sign),
-                ("signType", "v3"),
-                ("curtime", &curtime),
-            ]))?;
+            let value = send(
+                client().post("https://openapi.youdao.com/api").form(&[
+                    ("q", text),
+                    ("from", mapped(p, from)),
+                    ("to", mapped(p, to)),
+                    ("appKey", cred.id.trim()),
+                    ("salt", &salt),
+                    ("sign", &sign),
+                    ("signType", "v3"),
+                    ("curtime", &curtime),
+                ]),
+                timeout,
+            )?;
             if value["errorCode"].as_str() != Some("0") {
-                return Err(Failure::Api(format!("有道翻译：{}", value["errorCode"])));
+                return Err(provider_failure(
+                    p,
+                    value["errorCode"].as_str().unwrap_or("unknown"),
+                    "请求失败",
+                ));
             }
             (
                 value["translation"]
@@ -258,6 +335,7 @@ fn online(
                         format!("DeepL-Auth-Key {}", cred.key.trim()),
                     )
                     .json(&payload),
+                timeout,
             )?;
             (
                 value["translations"][0]["text"]
@@ -272,8 +350,9 @@ fn online(
         }
         Provider::MyMemory => {
             if text.len() > 450 {
-                return Err(Failure::Api(
-                    "免密钥试用单次限 450 个 UTF-8 字节，请缩短文本或选择其他服务".into(),
+                return Err(Failure::new(
+                    FailureKind::InvalidRequest,
+                    "免密钥试用单次限 450 个 UTF-8 字节",
                 ));
             }
             let actual = if from == "auto" { detect(text) } else { from };
@@ -281,13 +360,13 @@ fn online(
                 client()
                     .get("https://api.mymemory.translated.net/get")
                     .query(&[("q", text), ("langpair", &format!("{actual}|{to}"))]),
+                timeout,
             )?;
             if value["responseStatus"].as_i64() != Some(200) {
-                return Err(Failure::Api(
-                    value["responseDetails"]
-                        .as_str()
-                        .unwrap_or("试用服务额度已用完")
-                        .into(),
+                return Err(provider_failure(
+                    p,
+                    &value["responseStatus"].to_string(),
+                    value["responseDetails"].as_str().unwrap_or("服务请求失败"),
                 ));
             }
             (
@@ -303,20 +382,77 @@ fn online(
         Provider::Offline => unreachable!(),
     };
     if translated.trim().is_empty() {
-        return Err(Failure::Api("服务没有返回译文".into()));
+        return Err(Failure::new(FailureKind::Transient, "服务没有返回译文"));
     }
     Ok((translated, detected))
 }
 static CACHE: OnceLock<Mutex<HashMap<String, Translation>>> = OnceLock::new();
-#[cfg(test)]
-pub fn translate(
-    text: String,
-    from: String,
-    to: String,
-    settings: Settings,
-) -> Result<Translation, String> {
-    translate_cancellable(text, from, to, settings, &|| false)
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextRoute {
+    Standard,
+    FullLocal,
+    OnlinePrefix,
 }
+
+#[derive(Debug)]
+struct TextPolicy<'a> {
+    source: &'a str,
+    input: &'a str,
+    route: TextRoute,
+}
+impl TextPolicy<'_> {
+    fn cache_allowed(&self) -> bool {
+        self.route == TextRoute::Standard
+    }
+    fn fallback_input(&self) -> &str {
+        // A failed online attempt must not limit a capable local engine to the
+        // prefix that was eligible for the online request.
+        self.source
+    }
+    fn result_note(&self, actual_provider: Provider, note: String) -> String {
+        match self.route {
+            TextRoute::FullLocal => LONG_LOCAL_NOTICE.into(),
+            TextRoute::OnlinePrefix if actual_provider == Provider::Offline => {
+                LONG_FALLBACK_NOTICE.into()
+            }
+            TextRoute::OnlinePrefix if note.is_empty() => PARTIAL_ONLINE_NOTICE.into(),
+            TextRoute::OnlinePrefix => format!("{note}；{PARTIAL_ONLINE_NOTICE}"),
+            TextRoute::Standard => note,
+        }
+    }
+}
+
+fn choose_text_policy(
+    text: &str,
+    selected_provider: Provider,
+    force_online_for_long_text: bool,
+) -> TextPolicy<'_> {
+    // The first character beyond the limit gives a safe UTF-8 boundary without
+    // allocating a truncated document or imposing a new local document limit.
+    let Some((online_end, _)) = text.char_indices().nth(ONLINE_TEXT_LIMIT) else {
+        let text = text.trim();
+        return TextPolicy {
+            source: text,
+            input: text,
+            route: TextRoute::Standard,
+        };
+    };
+    if !force_online_for_long_text || selected_provider == Provider::Offline {
+        TextPolicy {
+            source: text,
+            input: text,
+            route: TextRoute::FullLocal,
+        }
+    } else {
+        TextPolicy {
+            source: text,
+            input: &text[..online_end],
+            route: TextRoute::OnlinePrefix,
+        }
+    }
+}
+
 pub fn translate_cancellable(
     text: String,
     from: String,
@@ -324,36 +460,54 @@ pub fn translate_cancellable(
     settings: Settings,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Translation, String> {
+    translate_with_policy(text, from, to, settings, false, cancelled)
+}
+
+pub fn translate_with_policy(
+    text: String,
+    from: String,
+    to: String,
+    settings: Settings,
+    force_online_for_long_text: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Translation, String> {
     if cancelled() {
         return Err("已取消".into());
     }
-    let text = text.trim();
-    if text.is_empty() {
+    if text.trim().is_empty() {
         return Err("请输入要翻译的文本".into());
-    }
-    if text.chars().count() > 5000 {
-        return Err("单次最多支持 5000 个字符".into());
     }
     if from == to {
         return Err("请选择不同的源语言和目标语言".into());
     }
-    let credential = settings.credential();
-    let credentials_present = !settings.provider.needs_key()
-        || (!credential.key.trim().is_empty()
-            && (settings.provider == Provider::DeepL || !credential.id.trim().is_empty()));
-    let key = format!(
-        "{:?}|{}|{}|{}|{}|{from}|{to}|{text}",
-        settings.provider,
-        settings.region,
-        settings.deepl_free,
-        settings.auto_offline,
-        digest(format!("{}:{}", credential.id, credential.key))
-    );
+    let policy = choose_text_policy(&text, settings.provider, force_online_for_long_text);
+    let input = policy.input;
+    let credentials_present = routing::has_credentials(&settings, settings.provider);
+    let key = policy.cache_allowed().then(|| {
+        format!(
+            "{:?}|{}|{}|{}|{}|{from}|{to}|{input}",
+            settings.provider,
+            settings.region,
+            settings.deepl_free,
+            settings.auto_offline,
+            digest(serde_json::to_vec(&settings.credentials).unwrap_or_default())
+        )
+    });
     storage::diagnostic(
-        json!({"event":"translation_start", "selected_provider":settings.provider, "credentials_present":credentials_present, "from":from, "to":to, "characters":text.chars().count()}),
+        json!({"event":"translation_start", "selected_provider":settings.provider, "credentials_present":credentials_present, "from":from, "to":to, "characters":policy.source.chars().count(), "input_characters":input.chars().count(), "long_text_route":match policy.route { TextRoute::Standard => "standard", TextRoute::FullLocal => "local_full_document", TextRoute::OnlinePrefix => "online_prefix" }}),
     );
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(mut cached) = cache.lock().unwrap().get(&key).cloned() {
+    let cached = key.as_ref().and_then(|key| {
+        CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+    });
+    if let Some(mut cached) = cached {
+        if cancelled() {
+            return Err("已取消".into());
+        }
         cached.note = "来自本次会话缓存".into();
         cached.elapsed_ms = 0;
         storage::diagnostic(
@@ -362,45 +516,71 @@ pub fn translate_cancellable(
         return Ok(cached);
     }
     let start = Instant::now();
-    let actual = if from == "auto" { detect(text) } else { &from };
-    let mut provider = settings.provider;
+    let actual = if from == "auto" { detect(input) } else { &from };
+    let mut provider = if policy.route == TextRoute::FullLocal {
+        Provider::Offline
+    } else {
+        settings.provider
+    };
     let mut note = String::new();
     let (target, detected) = if provider == Provider::Offline {
         (
-            offline::translate_cancellable(text, actual, &to, cancelled)
+            offline::translate_cancellable(input, actual, &to, cancelled)
                 .map_err(|e| format!("离线翻译失败：{e}"))?,
             actual.to_owned(),
         )
     } else {
-        let cred = settings.credential();
-        let no_credentials = provider.needs_key()
-            && (cred.key.trim().is_empty()
-                || (provider != Provider::DeepL && cred.id.trim().is_empty()));
-        let result = if no_credentials && settings.auto_offline {
-            Err(Failure::Network("尚未配置 API，使用本地离线翻译".into()))
-        } else {
-            online(text, &from, &to, &settings)
-        };
+        let result = routing::translate_online(
+            input,
+            &from,
+            &to,
+            &settings,
+            cancelled,
+            |candidate, chunk, timeout| {
+                let source = if candidate == Provider::MyMemory && from == "auto" {
+                    actual
+                } else {
+                    &from
+                };
+                online(candidate, chunk, source, &to, &settings, timeout)
+            },
+        );
         match result {
-            Ok(v) => v,
-            Err(Failure::Network(reason)) if settings.auto_offline => {
+            Ok(result) => {
+                provider = result.provider;
+                note = result.note;
+                (result.target, result.detected)
+            }
+            Err(error) if error.cancelled => return Err("已取消".into()),
+            Err(error) if settings.auto_offline => {
+                if cancelled() {
+                    return Err("已取消".into());
+                }
+                let reason = error.message();
                 storage::diagnostic(
-                    json!({"event":"offline_fallback", "selected_provider":settings.provider, "reason":if no_credentials { "credentials_missing" } else { "network_unavailable" }, "online_attempted":!no_credentials}),
+                    json!({"event":"offline_fallback", "selected_provider":settings.provider, "reason":"all_free_online_unavailable"}),
                 );
-                let translated = offline::translate_cancellable(text, actual, &to, cancelled)
-                    .map_err(|e| format!("{reason}；离线翻译不可用：{e}"))?;
+                let fallback_input = policy.fallback_input();
+                let fallback_actual = if from == "auto" {
+                    detect(fallback_input)
+                } else {
+                    &from
+                };
+                let translated =
+                    offline::translate_cancellable(fallback_input, fallback_actual, &to, cancelled)
+                        .map_err(|e| format!("{reason}；离线翻译不可用：{e}"))?;
                 provider = Provider::Offline;
                 note = reason;
-                (translated, actual.to_owned())
+                (translated, fallback_actual.to_owned())
             }
-            Err(e) => return Err(e.message().to_owned()),
+            Err(error) => return Err(error.message()),
         }
     };
     if cancelled() {
         return Err("已取消".into());
     }
     let translation = Translation {
-        source: text.into(),
+        source: policy.source.into(),
         target,
         from: detected,
         to,
@@ -408,14 +588,18 @@ pub fn translate_cancellable(
         elapsed_ms: start.elapsed().as_millis() as u64,
         created: chrono::Local::now().format("%m-%d %H:%M").to_string(),
         starred: false,
-        note,
+        note: policy.result_note(provider, note),
     };
     storage::diagnostic(
         json!({"event":"translation_result", "selected_provider":settings.provider, "actual_provider":provider, "cache_hit":false, "elapsed_ms":translation.elapsed_ms, "target_characters":translation.target.chars().count()}),
     );
-    // Only cache the selected engine's results so offline fallbacks don't mask later network recovery.
-    if provider == settings.provider {
-        let mut c = cache.lock().unwrap();
+    // Alternative online engines and offline fallbacks must not hide recovery of
+    // the preferred provider on the next translation.
+    if let Some(key) = key.filter(|_| provider == settings.provider) {
+        let mut c = CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
         if c.len() >= 128 {
             c.clear();
         }
@@ -447,38 +631,82 @@ mod tests {
         );
     }
     #[test]
-    fn missing_credentials_without_fallback_reports_the_selected_service() {
-        let settings = Settings {
-            provider: Provider::Tencent,
-            auto_offline: false,
-            ..Settings::default()
-        };
-        let result = translate("sad".into(), "en".into(), "zh".into(), settings);
-        assert!(result.err().unwrap().contains("腾讯翻译"));
+    fn http_errors_keep_quota_rate_and_auth_distinct() {
+        assert_eq!(http_failure(456).kind, FailureKind::Quota);
+        assert_eq!(http_failure(429).kind, FailureKind::RateLimited);
+        assert_eq!(http_failure(403).kind, FailureKind::Auth);
+        assert_eq!(http_failure(503).kind, FailureKind::Transient);
     }
     #[test]
-    #[ignore = "requires the downloaded local ONNX runtime and models"]
-    fn missing_tencent_credentials_returns_true_offline_provenance() {
-        let result = translate(
+    fn cancelled_translation_makes_no_request() {
+        let result = translate_cancellable(
             "sad".into(),
             "en".into(),
             "zh".into(),
-            Settings {
-                provider: Provider::Tencent,
-                ..Settings::default()
-            },
-        )
-        .unwrap();
-        println!(
-            "selected=Tencent; actual={:?}; note={}; target={}",
-            result.provider, result.note, result.target
+            Settings::default(),
+            &|| true,
         );
-        assert_eq!(result.provider, Provider::Offline);
-        assert!(result.note.contains("尚未配置 API"));
-        assert!(
-            ["悲伤", "难过", "伤心", "哀伤", "忧愁", "悲哀"]
-                .iter()
-                .any(|word| result.target.contains(word))
+        assert_eq!(result.err().unwrap(), "已取消");
+    }
+    #[test]
+    fn exactly_five_thousand_unicode_characters_keep_the_standard_route() {
+        let text = "中🦀".repeat(ONLINE_TEXT_LIMIT / 2);
+        for force in [false, true] {
+            let policy = choose_text_policy(&text, Provider::MyMemory, force);
+            assert_eq!(policy.route, TextRoute::Standard);
+            assert_eq!(policy.input, text);
+            assert!(policy.cache_allowed());
+            assert_eq!(policy.result_note(Provider::MyMemory, String::new()), "");
+        }
+    }
+    #[test]
+    fn long_documents_default_to_complete_local_input_without_an_extra_limit() {
+        let text = format!("\n  {}\nend\n", "文".repeat(100_000));
+        let policy = choose_text_policy(&text, Provider::Baidu, false);
+        assert_eq!(policy.route, TextRoute::FullLocal);
+        assert_eq!(policy.input, text);
+        assert_eq!(policy.source, text);
+        assert_eq!(policy.fallback_input(), text);
+        assert!(!policy.cache_allowed());
+        assert_eq!(
+            policy.result_note(Provider::Offline, String::new()),
+            LONG_LOCAL_NOTICE
         );
+    }
+    #[test]
+    fn forced_online_uses_a_unicode_safe_prefix_and_preserves_the_document() {
+        let prefix = "中🦀".repeat(ONLINE_TEXT_LIMIT / 2);
+        let text = format!("{prefix}后续文档\n");
+        let policy = choose_text_policy(&text, Provider::Baidu, true);
+        assert_eq!(policy.route, TextRoute::OnlinePrefix);
+        assert_eq!(policy.input, prefix);
+        assert_eq!(policy.input.chars().count(), ONLINE_TEXT_LIMIT);
+        assert_eq!(policy.source, text);
+        assert!(!policy.cache_allowed());
+        assert_eq!(
+            policy.result_note(Provider::Baidu, String::new()),
+            PARTIAL_ONLINE_NOTICE
+        );
+        let switched = policy.result_note(Provider::MyMemory, "已切换服务".into());
+        assert!(switched.contains("已切换服务"));
+        assert!(switched.contains(PARTIAL_ONLINE_NOTICE));
+    }
+    #[test]
+    fn forced_online_failure_falls_back_to_the_whole_document_with_a_truthful_note() {
+        let text = format!("{}这是后续内容", "a".repeat(ONLINE_TEXT_LIMIT));
+        let policy = choose_text_policy(&text, Provider::MyMemory, true);
+        assert_eq!(policy.input.chars().count(), ONLINE_TEXT_LIMIT);
+        assert_eq!(policy.fallback_input(), text);
+        let note = policy.result_note(Provider::Offline, "在线服务失败".into());
+        assert_eq!(note, LONG_FALLBACK_NOTICE);
+        assert!(!note.contains("后续内容未翻译"));
+    }
+    #[test]
+    fn explicit_local_selection_keeps_full_document_even_with_online_force() {
+        let text = "x".repeat(ONLINE_TEXT_LIMIT + 1);
+        let policy = choose_text_policy(&text, Provider::Offline, true);
+        assert_eq!(policy.route, TextRoute::FullLocal);
+        assert_eq!(policy.input, text);
+        assert_eq!(policy.source, text);
     }
 }

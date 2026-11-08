@@ -938,6 +938,21 @@ pub fn set_property(
             let element = control.cast::<IFrameworkElement>().map_err(native_error)?;
             set_resource_style(&element, resource)
         }
+        (Handle::Button(control), PropertyId::ButtonPadding, PropertyValue::Thickness(value)) => {
+            control
+                .cast::<IControl>()
+                .map_err(native_error)?
+                .SetPadding({
+                    let [left, top, right, bottom] = value.values();
+                    bindings::Thickness {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    }
+                })
+                .map_err(native_error)
+        }
         (
             Handle::Button(_),
             PropertyId::ButtonKeyboardAccelerators,
@@ -1215,9 +1230,17 @@ pub fn set_property(
             PropertyValue::Brush(crate::Brush::Solid(color)),
         ) => {
             let brush = SolidColorBrush::new().map_err(native_error)?;
-            brush.SetColor(bindings::Color { a: color.a, r: color.r, g: color.g, b: color.b })
+            brush
+                .SetColor(bindings::Color {
+                    a: color.a,
+                    r: color.r,
+                    g: color.g,
+                    b: color.b,
+                })
                 .map_err(native_error)?;
-            control.SetPlaceholderForeground(&brush).map_err(native_error)
+            control
+                .SetPlaceholderForeground(&brush)
+                .map_err(native_error)
         }
         (Handle::TextBox(_), PropertyId::TextBoxResources, PropertyValue::ResourceOverrides(_)) => {
             Err(RuntimeError::UnsupportedKind)
@@ -3023,6 +3046,9 @@ pub fn clear_property(handle: &Handle, property: PropertyId) -> Result<(), Runti
         (Handle::Button(_), PropertyId::ButtonStyle) => dependency_object
             .ClearValue(&bindings::FrameworkElement::StyleProperty().map_err(native_error)?)
             .map_err(native_error),
+        (Handle::Button(_), PropertyId::ButtonPadding) => dependency_object
+            .ClearValue(&bindings::Control::PaddingProperty().map_err(native_error)?)
+            .map_err(native_error),
         (Handle::Button(_), PropertyId::ButtonKeyboardAccelerators) => {
             Err(RuntimeError::UnsupportedKind)
         }
@@ -4436,7 +4462,10 @@ pub fn theme_style_info(kind: MountedKind) -> Option<(&'static str, &'static [&'
         MountedKind::TextBlock => Some(("TextBlock", &["Foreground"])),
         MountedKind::Border => Some(("Border", &["Background", "BorderBrush"])),
         MountedKind::Grid => Some(("Grid", &["Background"])),
-        MountedKind::TextBox => Some(("TextBox", &["Background", "BorderBrush", "PlaceholderForeground"])),
+        MountedKind::TextBox => Some((
+            "TextBox",
+            &["Background", "BorderBrush", "PlaceholderForeground"],
+        )),
         MountedKind::Rectangle => Some(("Rectangle", &["Fill", "Stroke"])),
         MountedKind::Ellipse => Some(("Ellipse", &["Fill", "Stroke"])),
         MountedKind::Line => Some(("Line", &["Stroke"])),
