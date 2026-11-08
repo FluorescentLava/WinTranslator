@@ -99,6 +99,9 @@ const RESIZE_DURATION_MS: f64 = 200.0;
 // A 16 ms USER timer can be rounded up to two default clock ticks. Request
 // the supported minimum and use elapsed time, rather than timer counts, below.
 const RESIZE_INTERVAL_MS: u32 = 10;
+// The transparent host reaches the taskbar. The visible Mica card keeps this
+// inset, so its complete surface can slide through the gap below its final edge.
+pub const POPUP_BOTTOM_INSET: u16 = 16;
 const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
 const APP_NAME: &str = "WinTranslater";
 const SETTINGS_TITLE: &str = "WinTranslater 设置";
@@ -473,18 +476,41 @@ fn placement(window: Hwnd) -> (i32, i32, i32, i32) {
         };
     }
     let scale = f64::from(monitor_dpi(window, monitor)) / 96.0;
-    let margin = (16.0 * scale).round() as i32;
     let (width, height) = SIZE.with(Cell::get);
-    let width = ((width * scale).round() as i32)
-        .min((info.work.right - info.work.left - 2 * margin).max(1));
-    let height = ((height * scale).round() as i32)
-        .min((info.work.bottom - info.work.top - 2 * margin).max(1));
+    let bounds = popup_bounds(info.work, scale, width, height);
     (
-        info.work.right - margin - width,
-        info.work.bottom - margin - height,
-        width,
-        height,
+        bounds.left,
+        bounds.top,
+        bounds.right - bounds.left,
+        bounds.bottom - bounds.top,
     )
+}
+fn popup_bounds(work: Rect, scale: f64, width: f64, height: f64) -> Rect {
+    let margin = (f64::from(POPUP_BOTTOM_INSET) * scale).round() as i32;
+    let width = ((width * scale).round() as i32).min((work.right - work.left - 2 * margin).max(1));
+    let height =
+        ((height * scale).round() as i32).min((work.bottom - work.top - 2 * margin).max(1));
+    Rect {
+        left: work.right - margin - width,
+        top: work.bottom - margin - height,
+        right: work.right - margin,
+        bottom: work.bottom,
+    }
+}
+fn popup_viewport_height(physical_height: i32, scale: f64) -> f64 {
+    let inset = (f64::from(POPUP_BOTTOM_INSET) * scale).round() as i32;
+    f64::from((physical_height - inset).max(1)) / scale
+}
+/// Distance from the card's resting top to the taskbar edge, in XAML DIPs.
+/// Read the committed viewport rather than a pending translation result size.
+pub fn popup_slide_distance() -> f32 {
+    let popup = POPUP.with(Cell::get);
+    let mut client: Rect = unsafe { std::mem::zeroed() };
+    if !popup.is_null() && unsafe { GetClientRect(popup, &mut client) } != 0 {
+        let scale = f64::from(unsafe { GetDpiForWindow(popup) }.max(96)) / 96.0;
+        return (f64::from(client.bottom - client.top) / scale).max(1.0) as f32;
+    }
+    (SIZE.with(Cell::get).1 + f64::from(POPUP_BOTTOM_INSET)).max(1.0) as f32
 }
 fn finish_resize(window: Hwnd) {
     unsafe {
@@ -666,8 +692,8 @@ fn queue_popup_frame(
             serial,
             transition_key: TRANSITION_KEY.with(Cell::get),
             width: f64::from(rectangle.right - rectangle.left) / scale,
-            height: f64::from(rectangle.bottom - rectangle.top) / scale,
-            target_height: f64::from(target.bottom - target.top) / scale,
+            height: popup_viewport_height(rectangle.bottom - rectangle.top, scale),
+            target_height: popup_viewport_height(target.bottom - target.top, scale),
             progress,
             finished,
         },
@@ -860,14 +886,8 @@ unsafe extern "system" fn popup_proc(
             // This popup has no caption or resize frame. Keep its client area
             // equal to the whole HWND, rather than letting the overlapped
             // presenter reintroduce top/bottom frame insets during a resize.
-            // DWM continues to own the rounded edge and shadow.
+            // The rounded Mica card is inside the transparent WinUI host.
             return 0;
-        }
-        if message == 0x0014 {
-            // The configured popup is covered by the native Mica/composition
-            // surface. A class-background GDI erase would flash through the
-            // newly exposed band while XAML is preparing its next frame.
-            return 1;
         }
     }
     if message == REFRESH_MESSAGE {
@@ -1363,9 +1383,9 @@ pub fn configure_popup_with_key(width: f64, height: f64, transition_key: u64) {
             }
             let first = !INITIALIZED.with(Cell::get);
             if first {
-                let round: u32 = 2;
+                let round: u32 = 1; // DWMWCP_DONOTROUND: round the animated card in XAML.
                 DwmSetWindowAttribute(window, 33, &round as *const _ as _, 4);
-                let border: u32 = 0xffff_fffe; // DWMWA_COLOR_NONE: Mica keeps its rounded edge.
+                let border: u32 = 0xffff_fffe; // DWMWA_COLOR_NONE: no stationary host edge.
                 DwmSetWindowAttribute(window, 34, &border as *const _ as _, 4);
             }
             // Activate the frameless client calculation before FRAMECHANGED
@@ -1916,6 +1936,47 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
+
+    #[test]
+    fn transparent_slide_track_reaches_taskbar_without_changing_card_size() {
+        let work = Rect {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let bounds = popup_bounds(work, scale, 480.0, 320.0);
+            let margin = (16.0 * scale).round() as i32;
+            assert_eq!(bounds.bottom, work.bottom);
+            assert_eq!(bounds.right, work.right - margin);
+            assert_eq!(bounds.right - bounds.left, (480.0 * scale).round() as i32);
+            assert_eq!(
+                bounds.top,
+                work.bottom - margin - (320.0 * scale).round() as i32
+            );
+            assert_eq!(
+                popup_viewport_height(bounds.bottom - bounds.top, scale),
+                320.0
+            );
+        }
+    }
+
+    #[test]
+    fn large_popup_fits_work_area_and_excludes_track_from_content_viewport() {
+        let work = Rect {
+            left: 100,
+            top: -900,
+            right: 1380,
+            bottom: -180,
+        };
+        let bounds = popup_bounds(work, 1.5, 1600.0, 1200.0);
+        assert_eq!(bounds.left, work.left + 24);
+        assert_eq!(bounds.top, work.top + 24);
+        assert_eq!(bounds.bottom, work.bottom);
+        let viewport = popup_viewport_height(bounds.bottom - bounds.top, 1.5);
+        assert_eq!(viewport, (720.0 - 48.0) / 1.5);
+    }
 
     #[test]
     fn an_old_hide_completion_cannot_hide_a_reopened_popup() {

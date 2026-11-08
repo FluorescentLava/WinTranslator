@@ -29,10 +29,11 @@ mod bindings;
 pub use bindings::*;
 mod app_shim;
 pub use app_shim::*;
+mod backdrop;
 mod bootstrap;
 mod caret;
-mod slide;
 mod content_dialog;
+mod slide;
 #[cfg(feature = "test")]
 pub(crate) use content_dialog::LiveContentDialogState;
 use content_dialog::{ContentDialogAction, ContentDialogScheduler};
@@ -181,7 +182,7 @@ pub struct WinUiRuntime {
     virtuals: HashMap<NodeId, element_factory::VirtualHandle>,
     window_closed: Rc<Cell<bool>>,
     window_observations: HashMap<NodeId, WindowObservationFlags>,
-    window_hosts: HashMap<NodeId, bindings::Grid>,
+    window_hosts: HashMap<NodeId, backdrop::WindowHost>,
     window_observation_subscriptions: HashMap<NodeId, Vec<windows_core::EventRevoker>>,
     window_subscriptions: HashMap<NodeId, windows_core::EventRevoker>,
     window_title_bars: HashMap<NodeId, (NodeId, WindowTitleBarHeight)>,
@@ -772,7 +773,8 @@ impl WinUiRuntime {
         let window = self
             .windows
             .get(&node)
-            .ok_or(RuntimeError::MissingNode(node))?;
+            .ok_or(RuntimeError::MissingNode(node))?
+            .clone();
         let window_2 = window.cast::<IWindow2>().map_err(native_error)?;
         let changes = window_visual_changes(self.window_visuals.get(&node).copied(), visuals);
         let mut hwnd = None;
@@ -794,7 +796,18 @@ impl WinUiRuntime {
         };
 
         if changes.backdrop {
+            let host = self
+                .window_hosts
+                .get_mut(&node)
+                .ok_or(RuntimeError::MissingNode(node))?;
+            if let WindowBackdrop::MicaCard { bottom_inset } = visuals.backdrop {
+                host.enable_card(&window, bottom_inset)
+                    .map_err(native_error)?;
+            } else {
+                host.disable_card(&window).map_err(native_error)?;
+            }
             match visuals.backdrop {
+                WindowBackdrop::MicaCard { .. } => {}
                 WindowBackdrop::None => window_2
                     .SetSystemBackdrop(None::<&SystemBackdrop>)
                     .map_err(native_error)?,
@@ -837,7 +850,7 @@ impl WinUiRuntime {
                 .map_err(native_error)?;
 
             if let Some(host) = self.window_hosts.get(&node) {
-                Self::apply_window_theme(host, visuals.theme)?;
+                Self::apply_window_theme(&host.host, visuals.theme)?;
             }
         }
 
@@ -1158,6 +1171,7 @@ impl WinUiRuntime {
             .window_hosts
             .get(&node)
             .ok_or(RuntimeError::MissingNode(node))?
+            .host
             .cast::<IFrameworkElement>()
             .map_err(native_error)?;
         let sink = self.event_sink()?;
@@ -1339,9 +1353,9 @@ impl WinUiRuntime {
                     return Err(RuntimeError::DuplicateNode(*node));
                 }
                 let window = Window::new().map_err(native_error)?;
-                let host = bindings::Grid::new().map_err(native_error)?;
+                let host = backdrop::WindowHost::new().map_err(native_error)?;
                 window
-                    .SetContent(&host.cast::<UIElement>().map_err(native_error)?)
+                    .SetContent(&host.host.cast::<UIElement>().map_err(native_error)?)
                     .map_err(native_error)?;
                 let closed = Rc::clone(&self.window_closed);
                 let identity = self.identity.get().unwrap();
@@ -1364,6 +1378,11 @@ impl WinUiRuntime {
                     .map_err(native_error)?;
             }
             Command::CloseWindow { node } => {
+                if let (Some(host), Some(window)) =
+                    (self.window_hosts.get_mut(node), self.windows.get(node))
+                {
+                    host.disconnect(window);
+                }
                 self.windows
                     .get(node)
                     .ok_or(RuntimeError::MissingNode(*node))?
@@ -1873,15 +1892,42 @@ impl WinUiRuntime {
                 self.observation_subscriptions
                     .remove(&(*node, *observation));
             }
-            Command::SlideY { node, revision, animation, completion } => {
+            Command::SlideY {
+                node,
+                revision,
+                animation,
+                completion,
+            } => {
                 let sink = self.event_sink()?;
                 let result = self.ui_element(*node).and_then(|element| {
-                    slide::request(&self.slides, *node, *revision, &element, *animation,
-                        completion.clone(), sink.clone())
+                    let surface = self
+                        .window_hosts
+                        .values()
+                        .find(|host| host.root == Some(*node))
+                        .and_then(backdrop::WindowHost::animated_surface);
+                    let animated = if let Some(surface) = surface {
+                        // The application root's startup opacity hides its own content only.
+                        // Move that gate to the card so Mica and controls enter together.
+                        element.SetOpacity(1.0).map_err(native_error)?;
+                        surface.cast::<UIElement>().map_err(native_error)?
+                    } else {
+                        element
+                    };
+                    slide::request(
+                        &self.slides,
+                        *node,
+                        *revision,
+                        &animated,
+                        *animation,
+                        completion.clone(),
+                        sink.clone(),
+                    )
                 });
                 if let Err(error) = result {
                     sink.enqueue_host(HostEvent::ElementSlideCompleted {
-                        node: *node, completion: completion.clone(), result: Err(error),
+                        node: *node,
+                        completion: completion.clone(),
+                        result: Err(error),
                     });
                 }
             }
@@ -1920,13 +1966,7 @@ impl WinUiRuntime {
                         return Err(RuntimeError::UnsupportedKind);
                     };
                     return match value {
-                        PropertyValue::I32(1) => {
-                            if let Some(layout) = self.navigation_menu_layouts.remove(node) {
-                                layout.restore().map_err(native_error)?;
-                            }
-                            Ok(())
-                        }
-                        PropertyValue::I32(columns) if *columns > 1 => {
+                        PropertyValue::I32(columns) if *columns >= 1 => {
                             navigation_layout::set_columns(
                                 control,
                                 *columns,
@@ -2629,7 +2669,8 @@ impl WinUiRuntime {
         let host = self
             .window_hosts
             .get(&node)
-            .ok_or(RuntimeError::MissingNode(node))?;
+            .ok_or(RuntimeError::MissingNode(node))?
+            .content();
         let children = host
             .cast::<IPanel>()
             .and_then(|host| host.Children())
@@ -2644,6 +2685,7 @@ impl WinUiRuntime {
         index: usize,
     ) -> Result<(), RuntimeError> {
         let parent_id = parent;
+        let child_id = child;
         let child = self.ui_element(child)?;
         if self.windows.contains_key(&parent) {
             if index != 0 {
@@ -2657,6 +2699,7 @@ impl WinUiRuntime {
             if let Some(observations) = self.window_observations.get(&parent).copied() {
                 self.set_window_observations(parent, observations)?;
             }
+            self.window_hosts.get_mut(&parent).unwrap().root = Some(child_id);
             Ok(())
         } else {
             let parent = self
@@ -2936,6 +2979,9 @@ impl WinUiRuntime {
         let child = self.ui_element(child)?;
         if let Some((_, children)) = self.window_children(parent)? {
             children.Clear().map_err(native_error)?;
+            if let Some(host) = self.window_hosts.get_mut(&parent) {
+                host.root = None;
+            }
             Ok(())
         } else {
             let parent = self
@@ -2956,6 +3002,9 @@ impl WinUiRuntime {
     fn reset_children(&mut self, parent: NodeId) -> Result<(), RuntimeError> {
         if let Some((_, children)) = self.window_children(parent)? {
             children.Clear().map_err(native_error)?;
+            if let Some(host) = self.window_hosts.get_mut(&parent) {
+                host.root = None;
+            }
             Ok(())
         } else {
             let parent = self
@@ -3789,6 +3838,11 @@ impl NativeRuntime for WinUiRuntime {
                 _ => {}
             }
         }
+        for (node, host) in &mut self.window_hosts {
+            if let Some(window) = self.windows.get(node) {
+                host.disconnect(window);
+            }
+        }
         if self.window_closed.get() {
             for (_, subscription) in self.window_subscriptions.drain() {
                 subscription.into_token();
@@ -3831,6 +3885,11 @@ impl NativeRuntime for WinUiRuntime {
             _ = self.cancel_retirement(root);
         }
         self.clear_async_ingress();
+        for (node, host) in &mut self.window_hosts {
+            if let Some(window) = self.windows.get(node) {
+                host.disconnect(window);
+            }
+        }
         self.window_observation_subscriptions.clear();
         self.window_title_revisions.borrow_mut().clear();
         for (_, subscription) in self.window_subscriptions.drain() {
@@ -4198,7 +4257,12 @@ impl WinUiRuntime {
 
     fn remove_node_state(&mut self, node: NodeId) -> Result<(), RuntimeError> {
         if let Ok(sink) = self.event_sink() {
-            slide::cancel(&self.slides, node, Err(RuntimeError::MissingNode(node)), &sink);
+            slide::cancel(
+                &self.slides,
+                node,
+                Err(RuntimeError::MissingNode(node)),
+                &sink,
+            );
         }
         self.release_encoded_image_source(node);
         self.subscriptions
@@ -4207,6 +4271,11 @@ impl WinUiRuntime {
         self.window_subscriptions.remove(&node);
         self.window_observation_subscriptions.remove(&node);
         self.window_observations.remove(&node);
+        if let (Some(host), Some(window)) =
+            (self.window_hosts.get_mut(&node), self.windows.get(&node))
+        {
+            host.disconnect(window);
+        }
         self.window_hosts.remove(&node);
         self.window_title_bars.remove(&node);
         self.window_title_revisions.borrow_mut().remove(&node);

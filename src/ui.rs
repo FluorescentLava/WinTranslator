@@ -10,6 +10,7 @@ pub struct WindowInput {
     pub tab: String,
     pub parent: Option<LocalSender<Message>>,
     pub initial_text: String,
+    pub initial_configuration: Option<(Settings, Vec<Translation>, Option<String>)>,
 }
 impl PartialEq for WindowInput {
     fn eq(&self, other: &Self) -> bool {
@@ -291,24 +292,53 @@ fn icon_button(path: &str, name: &str, message: Message, cx: &ViewContext<Transl
         )
         .tooltip(name)
 }
-fn swap_button(cx: &ViewContext<Translator>) -> View {
+fn swap_button(cx: &ViewContext<Translator>, dark: bool) -> View {
+    let foreground = if dark {
+        Color::rgb(255, 255, 255)
+    } else {
+        Color::rgb(0, 0, 0)
+    };
     Button::new()
         .style(ButtonStyle::Subtle)
         .width(32.0)
         .height(32.0)
         .min_width(0.0)
         .min_height(32.0)
-        .padding(6.0)
+        .padding(5.0)
+        .resource_overrides(
+            [
+                "TextFillColorPrimaryBrush",
+                "TextFillColorSecondaryBrush",
+                "ButtonForeground",
+                "ButtonForegroundPointerOver",
+                "ButtonForegroundPressed",
+            ]
+            .into_iter()
+            .fold(ResourceOverrides::new(), |resources, key| {
+                resources.set(key, ResourceValue::Brush(foreground))
+            }),
+        )
         .horizontal_content_alignment(HorizontalAlignment::Center)
         .vertical_content_alignment(Center)
         .automation_name("交换语言")
         .on_click(cx.message(Message::Swap))
         .content(
-            PathIcon::new()
-                .data(include_str!("../assets/icons/arrow-swap.path"))
+            Viewbox::new()
                 .width(20.0)
                 .height(20.0)
-                .opacity(0.45),
+                .stretch(windows_reactor::Stretch::Uniform)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(Center)
+                .slot(
+                    ViewboxSlot::Child,
+                    Border::new().width(24.0).height(24.0).content(
+                        PathIcon::new()
+                            .data(include_str!("../assets/icons/arrow-swap.path"))
+                            .width(24.0)
+                            .height(24.0)
+                            .opacity(1.0),
+                    ),
+                ),
         )
         .tooltip("交换语言")
 }
@@ -586,13 +616,13 @@ impl Translator {
     }
     fn provider_choices(&self, selected: Provider, compact: bool, cx: &ViewContext<Self>) -> View {
         NavigationView::new()
-            .width(if compact { 248.0 } else { 420.0 })
-            .height(if compact { 248.0 } else { 144.0 })
+            .width(if compact { 224.0 } else { 420.0 })
+            .height(if compact { 224.0 } else { 144.0 })
             .min_width(0.0)
             .min_height(0.0)
             .horizontal_alignment(HorizontalAlignment::Left)
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
-            .open_pane_length(if compact { 248.0 } else { 420.0 })
+            .open_pane_length(if compact { 224.0 } else { 420.0 })
             .menu_columns(if compact { 1 } else { 3 })
             .is_pane_open(true)
             .is_pane_toggle_button_visible(false)
@@ -655,20 +685,22 @@ impl Translator {
                                         )),
                                 ))
                         };
-                        (
-                            index,
-                            NavigationViewItem::new()
-                                .tag(index.to_string())
-                                .is_selected(provider == selected)
-                                .selects_on_invoked(selectable)
-                                .opacity(if selectable { 1.0 } else { 0.45 })
-                                .automation_name(if compact {
-                                    label
-                                } else {
-                                    format!("{}，{status}", provider.name())
-                                })
-                                .slot(NavigationViewItemSlot::Content, content),
-                        )
+                        let item = NavigationViewItem::new()
+                            .tag(index.to_string())
+                            .is_selected(provider == selected)
+                            .selects_on_invoked(selectable)
+                            .opacity(if selectable { 1.0 } else { 0.45 })
+                            .automation_name(if compact {
+                                label
+                            } else {
+                                format!("{}，{status}", provider.name())
+                            });
+                        let item = if compact {
+                            item.height(36.0).min_height(36.0).margin(0.0)
+                        } else {
+                            item
+                        };
+                        (index, item.slot(NavigationViewItemSlot::Content, content))
                     }),
             )])
     }
@@ -690,6 +722,7 @@ impl Translator {
             tab: "general".into(),
             parent: Some(cx.sender()),
             initial_text: String::new(),
+            initial_configuration: None,
         }));
     }
     fn repair_caret(&self, cx: &ComponentContext<Self>, attempt: u8) {
@@ -924,7 +957,9 @@ impl Translator {
         cx.window_visuals(
             WindowVisuals::new()
                 .client_size(POPUP_WIDTH, 172.0)
-                .backdrop(WindowBackdrop::Mica)
+                .backdrop(WindowBackdrop::MicaCard {
+                    bottom_inset: native::POPUP_BOTTOM_INSET,
+                })
                 .theme(theme(&self.settings)),
         );
         let dismiss = cx.message(Message::Dismiss);
@@ -995,7 +1030,7 @@ impl Translator {
                     .automation_name("源语言")
                     .on_selection_changed(cx.callback(Message::Source))
                     .grid_column(1),
-                at(swap_button(cx), 0, 2),
+                at(swap_button(cx, dark), 0, 2),
                 ComboBox::new()
                     .items_source(LANGUAGES.iter().skip(1).map(popup_language))
                     .selected_index(to - 1)
@@ -1747,10 +1782,18 @@ impl Component for Translator {
     type Input = WindowInput;
     type Message = Message;
     fn create(input: &WindowInput, cx: &ComponentContext<Self>) -> Self {
-        let (mut settings, history, mut warning) = storage::load();
+        let (mut settings, history, mut warning) = input
+            .initial_configuration
+            .clone()
+            .unwrap_or_else(storage::load);
         let settings_load_warning = warning.clone();
         storage::diagnostic(serde_json::json!({
             "event": "settings_loaded",
+            "configuration_source": if input.initial_configuration.is_some() {
+                "startup_snapshot"
+            } else {
+                "user_profile"
+            },
             "settings_window": input.settings_window,
             "selected_provider": settings.provider,
             "data_directory": storage::data_dir(),
@@ -2005,9 +2048,20 @@ impl Component for Translator {
             Message::PopupActivated(revision)
                 if native::popup_show_animation_is_current(revision) =>
             {
-                let _ = self
-                    .popup_surface
-                    .request_slide_y(24.0, 0.0, 0.0, 1.0, 160, |_| {});
+                let _ = self.popup_surface.request_slide_y(
+                    native::popup_slide_distance(),
+                    0.0,
+                    1.0,
+                    1.0,
+                    280,
+                    |result| {
+                        storage::diagnostic(serde_json::json!({
+                            "event":"popup_show_animation",
+                            "completed":matches!(result, Ok(true)),
+                            "cancelled":matches!(result, Ok(false)),
+                        }));
+                    },
+                );
             }
             Message::PopupFocusReady(revision)
                 if native::popup_show_animation_is_current(revision)
@@ -2044,13 +2098,23 @@ impl Component for Translator {
                 self.cancel_speech();
                 self.invalidate();
                 let sender = cx.sender();
-                let accepted =
-                    self.popup_surface
-                        .request_slide_y(0.0, 24.0, 1.0, 0.0, 120, move |result| {
-                            if !matches!(result, Ok(false)) {
-                                let _ = sender.send(Message::PopupHidden(revision));
-                            }
-                        });
+                let accepted = self.popup_surface.request_slide_y(
+                    0.0,
+                    native::popup_slide_distance(),
+                    1.0,
+                    1.0,
+                    220,
+                    move |result| {
+                        storage::diagnostic(serde_json::json!({
+                            "event":"popup_hide_animation",
+                            "completed":matches!(result, Ok(true)),
+                            "cancelled":matches!(result, Ok(false)),
+                        }));
+                        if !matches!(result, Ok(false)) {
+                            let _ = sender.send(Message::PopupHidden(revision));
+                        }
+                    },
+                );
                 if !accepted {
                     native::complete_popup_hide(revision);
                 }
@@ -2129,6 +2193,13 @@ impl Component for Translator {
             }
             Message::ProviderPicker(open) => {
                 if open {
+                    // Read the shared user profile when opening the picker as well.
+                    // Keep the last working credentials if a read fails mid-session.
+                    let (settings, _, warning) = storage::load();
+                    if warning.is_none() {
+                        self.settings.credentials = settings.credentials;
+                    }
+                    self.settings_load_warning = warning;
                     self.provider_picker_revision = self.provider_picker_revision.wrapping_add(1);
                     self.provider_picker_selected =
                         Some(self.pending_provider.unwrap_or_else(|| {

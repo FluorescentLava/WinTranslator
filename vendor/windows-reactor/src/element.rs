@@ -1746,6 +1746,11 @@ pub enum WindowBackdrop {
     Mica,
     MicaAlt,
     Acrylic,
+    /// Mica on a compositor-animated card over a transparent HWND. The bottom inset
+    /// is measured in DIPs and reserves a transparent track below the card.
+    MicaCard {
+        bottom_inset: u16,
+    },
 }
 
 /// Height preset for an extended window title bar.

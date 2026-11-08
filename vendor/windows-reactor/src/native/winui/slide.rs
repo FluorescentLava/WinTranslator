@@ -31,6 +31,11 @@ windows_core::imp::define_interface!(
     0x5a5f8abe_d129_5b25_8aff_8180fd9bfb22
 );
 windows_core::imp::define_interface!(
+    Easing,
+    IInspectable_Vtbl,
+    0x8e1ecd0d_57d8_5bc9_9bcd_e43d0dd733c4
+);
+windows_core::imp::define_interface!(
     Animation,
     IInspectable_Vtbl,
     0xa829ccc8_6fde_5b90_ad37_efd307e1b631
@@ -90,7 +95,44 @@ fn start(object: &SlideObject, property: &str, animation: &IUnknown) -> windows_
         .ok()
     }
 }
-fn scalar(compositor: &Compositor, to: f32, ms: u32) -> windows_core::Result<IUnknown> {
+fn easing(compositor: &Compositor, entering: bool) -> windows_core::Result<Easing> {
+    // Fluent entrance/departure curves, evaluated by native Composition.
+    let (first, second) = if entering {
+        ((0.1, 0.9), (0.2, 1.0))
+    } else {
+        ((0.7, 0.0), (1.0, 0.5))
+    };
+    let mut result = std::ptr::null_mut();
+    unsafe {
+        method::<
+            unsafe extern "system" fn(
+                Raw,
+                windows_numerics::Vector2,
+                windows_numerics::Vector2,
+                *mut Raw,
+            ) -> HRESULT,
+        >(compositor, 4)(
+            compositor.as_raw(),
+            windows_numerics::Vector2 {
+                x: first.0,
+                y: first.1,
+            },
+            windows_numerics::Vector2 {
+                x: second.0,
+                y: second.1,
+            },
+            &mut result,
+        )
+        .ok()?;
+        IUnknown::from_raw(result).cast()
+    }
+}
+fn scalar(
+    compositor: &Compositor,
+    to: f32,
+    ms: u32,
+    easing: &Easing,
+) -> windows_core::Result<IUnknown> {
     let animation = get_object(compositor, 14)?;
     let frames = animation.cast::<KeyFrames>()?;
     let scalar = animation.cast::<ScalarFrames>()?;
@@ -110,10 +152,11 @@ fn scalar(compositor: &Compositor, to: f32, ms: u32) -> windows_core::Result<IUn
             string_raw(&expression),
         )
         .ok()?;
-        method::<unsafe extern "system" fn(Raw, f32, f32) -> HRESULT>(&scalar, 0)(
+        method::<unsafe extern "system" fn(Raw, f32, f32, Raw) -> HRESULT>(&scalar, 1)(
             scalar.as_raw(),
             1.0,
             to,
+            easing.as_raw(),
         )
         .ok()?;
     }
@@ -136,6 +179,26 @@ fn opacity(visual: &SlideVisual, value: f32) -> windows_core::Result<()> {
     unsafe {
         method::<unsafe extern "system" fn(Raw, f32) -> HRESULT>(visual, 17)(visual.as_raw(), value)
             .ok()
+    }
+}
+
+fn settle(element: &UIElement, y: f32, alpha: f32) {
+    // If native keyframe construction fails, leave a usable endpoint instead
+    // of a transparent/offscreen card. Its completion still reports the error.
+    _ = element.SetOpacity(f64::from(alpha));
+    if let Ok(visual) = ElementCompositionPreview::GetElementVisual(element) {
+        if let Ok(object) = visual.cast::<SlideObject>() {
+            stop(&object, "Opacity");
+            if let Ok(properties) = get_object(&object, 1).and_then(|v| v.cast::<PropertySet>()) {
+                if let Ok(translated) = properties.cast::<SlideObject>() {
+                    stop(&translated, "Translation.Y");
+                }
+                _ = translation(&properties, y);
+            }
+        }
+        if let Ok(visual) = visual.cast::<SlideVisual>() {
+            _ = opacity(&visual, alpha);
+        }
     }
 }
 
@@ -225,11 +288,13 @@ pub(super) fn request(
                 translation(&properties, animation.from_y)?;
                 opacity(&visual_properties, animation.from_opacity.clamp(0.0, 1.0))?;
             }
-            let movement = scalar(&compositor, animation.to_y, animation.duration_ms)?;
+            let easing = easing(&compositor, animation.to_y < animation.from_y)?;
+            let movement = scalar(&compositor, animation.to_y, animation.duration_ms, &easing)?;
             let fading = scalar(
                 &compositor,
                 animation.to_opacity.clamp(0.0, 1.0),
                 animation.duration_ms,
+                &easing,
             )?;
             let mut batch_raw = std::ptr::null_mut();
             unsafe {
@@ -299,5 +364,12 @@ pub(super) fn request(
             }
             Ok(())
         })();
+    if result.is_err() {
+        settle(
+            element,
+            animation.to_y,
+            animation.to_opacity.clamp(0.0, 1.0),
+        );
+    }
     result.map_err(native_error)
 }

@@ -14,6 +14,10 @@ mod spm;
 mod storage;
 mod ui;
 fn main() {
+    if std::env::args().any(|arg| arg == "--check-configuration") {
+        let _ = storage::check_configuration();
+        return;
+    }
     std::panic::set_hook(Box::new(|info| {
         let dir = storage::data_dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -36,14 +40,17 @@ fn main() {
             return;
         }
     };
+    // Resolve and decrypt the primary window's configuration before WinUI starts.
+    // Manual launch and background activation must publish the same loaded state.
+    let mut initial_configuration = storage::load();
     let mut initial_text = String::new();
     if background {
-        let (settings, _, warning) = storage::load();
+        let (settings, _, warning) = &initial_configuration;
         storage::diagnostic(serde_json::json!({
             "event":"background_ready", "winui_started":false, "hotkey":"Ctrl+Tab",
             "selected_provider":settings.provider, "configuration_warning":warning.is_some(),
             "configured_providers":model::Provider::ALL.into_iter()
-                .filter(|provider| routing::has_credentials(&settings, *provider))
+                .filter(|provider| routing::has_credentials(settings, *provider))
                 .collect::<Vec<_>>(),
         }));
         std::thread::spawn(|| {
@@ -61,12 +68,15 @@ fn main() {
         if native::take_startup_selection_request() {
             initial_text = selection::capture(&|| false).unwrap_or_default();
         }
+        // A resident process can wait for hours before its first window opens.
+        initial_configuration = storage::load();
     }
     storage::diagnostic(
         serde_json::json!({"event":"ui_start", "trigger":if background { "explicit_open" } else { "manual_launch" }}),
     );
     if let Err(error) = App::run_component::<ui::Translator>(ui::WindowInput {
         initial_text,
+        initial_configuration: Some(initial_configuration),
         ..Default::default()
     }) {
         report_error(

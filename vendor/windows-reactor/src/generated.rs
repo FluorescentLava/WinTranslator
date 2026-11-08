@@ -1982,7 +1982,7 @@ pub mod public {
             self
         }
         /// Arranges the native left menu in uniform cells with up to this many columns.
-        /// A value of one, or clearing the property, restores the template's layout.
+        /// A value of one uses a compact single column; clearing restores the template layout.
         pub fn menu_columns(mut self, value: impl Into<Option<i32>>) -> Self {
             let value = value.into();
             assert!(
