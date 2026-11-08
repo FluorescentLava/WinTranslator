@@ -89,6 +89,9 @@ const HOTKEY_ID: i32 = 0x4854;
 const TRAY_MESSAGE: u32 = 0x8000 + 42;
 const SHOW_MESSAGE: u32 = 0x8000 + 43;
 const REFRESH_MESSAGE: u32 = 0x8000 + 44;
+const VERIFY_ACTIVATION_MESSAGE: u32 = 0x8000 + 45;
+const ACTIVATION_TIMER: usize = 0x5441_4354;
+const ACTIVATION_DELAY_MS: u32 = 30;
 const RESIZE_TIMER: usize = 0x5452_535a;
 const FOCUS_TIMER: usize = 0x5446_4353;
 const FOCUS_DELAY_MS: u32 = 60;
@@ -153,6 +156,33 @@ impl PopupPresentation {
         self.hide_revision = None;
     }
 }
+#[derive(Clone, Copy)]
+struct ActivationVerification {
+    revision: u64,
+    source: Hwnd,
+    input_time: Option<u32>,
+    retries: u8,
+    checks: u8,
+}
+impl ActivationVerification {
+    fn may_retry(
+        self,
+        presentation: PopupPresentation,
+        foreground: Hwnd,
+        input: Option<u32>,
+    ) -> bool {
+        presentation.show_is_current(self.revision)
+            && self.retries < 3
+            && (foreground.is_null() || foreground == self.source)
+            && self.input_time.is_some()
+            && self.input_time == input
+    }
+}
+#[repr(C)]
+struct LastInputInfo {
+    size: u32,
+    time: u32,
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PopupFrame {
     pub revision: u64,
@@ -176,6 +206,7 @@ struct PendingPopupFrame {
 pub enum Action {
     Show,
     PopupActivated(u64),
+    PopupFocusReady(u64),
     PopupDismissed(u64),
     TranslateSelection,
     Settings,
@@ -213,6 +244,8 @@ thread_local! {
     }) };
     static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
     static FOCUS_RECHECKS: Cell<u8> = const { Cell::new(0) };
+    static ACTIVATION_CHECK: Cell<Option<ActivationVerification>> = const { Cell::new(None) };
+    static ACTIVATION_SOURCE: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
 }
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -258,6 +291,7 @@ unsafe extern "system" {
     fn PostMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
     fn SetForegroundWindow(window: Hwnd) -> i32;
     fn GetForegroundWindow() -> Hwnd;
+    fn GetLastInputInfo(info: *mut LastInputInfo) -> i32;
     fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
     fn GetWindowThreadProcessId(window: Hwnd, process: *mut u32) -> u32;
     fn AllowSetForegroundWindow(process: u32) -> i32;
@@ -318,6 +352,7 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentThreadId() -> u32;
+    fn GetCurrentProcessId() -> u32;
     fn GetModuleHandleW(name: *const u16) -> Hwnd;
     fn CreateMutexW(attributes: Hwnd, owner: i32, name: *const u16) -> Hwnd;
     fn GetLastError() -> u32;
@@ -530,6 +565,9 @@ fn cancel_focus_check(window: Hwnd) {
     FOCUS_RECHECKS.with(|value| value.set(0));
 }
 fn schedule_focus_check() {
+    if ACTIVATION_CHECK.with(Cell::get).is_some() {
+        return;
+    }
     let popup = POPUP.with(Cell::get);
     if !popup.is_null()
         && INITIALIZED.with(Cell::get)
@@ -547,6 +585,7 @@ fn focus_check_tick(window: Hwnd) {
         KillTimer(window, FOCUS_TIMER);
     }
     if SHOW_AFTER_FRAME.with(Cell::get)
+        || ACTIVATION_CHECK.with(Cell::get).is_some()
         || !POPUP_PRESENTED.with(Cell::get)
         || !PRESENTATION.with(Cell::get).show_requested
         || unsafe { IsWindowVisible(window) } == 0
@@ -555,6 +594,9 @@ fn focus_check_tick(window: Hwnd) {
     }
     let foreground = unsafe { GetForegroundWindow() };
     if foreground_belongs_to_app(foreground, window) {
+        if foreground != window {
+            release_popup_layer(window);
+        }
         return;
     }
     // XAML can briefly have no foreground HWND while opening or closing a
@@ -851,6 +893,16 @@ unsafe extern "system" fn popup_proc(
         focus_check_tick(window);
         return 0;
     }
+    if message == VERIFY_ACTIVATION_MESSAGE {
+        verify_popup_activation(window, wparam as u64);
+        return 0;
+    }
+    if message == 0x0113 && wparam == ACTIVATION_TIMER {
+        if let Some(check) = ACTIVATION_CHECK.with(Cell::get) {
+            verify_popup_activation(window, check.revision);
+        }
+        return 0;
+    }
     if message == 0x0231 {
         MANUAL_MOVE.with(|value| value.set(true));
         stop_resize(window);
@@ -859,6 +911,7 @@ unsafe extern "system" fn popup_proc(
         MANUAL_MOVE.with(|value| value.set(false));
     }
     if (message == 0x0018 && wparam == 0) || message == 0x0082 {
+        cancel_activation_check(window);
         SHOW_AFTER_FRAME.with(|value| value.set(false));
         stop_resize(window);
         cancel_focus_check(window);
@@ -1029,16 +1082,19 @@ unsafe extern "system" fn sink_proc(
     lparam: isize,
 ) -> isize {
     if message == 0x0312 && wparam == HOTKEY_ID as usize {
+        remember_activation_source();
         crate::desktop::remember_foreground();
         emit(Action::TranslateSelection);
         return 0;
     }
     if message == SHOW_MESSAGE {
+        remember_activation_source();
         crate::desktop::remember_foreground();
         emit(Action::Show);
         return 0;
     }
     if message == TRAY_MESSAGE {
+        remember_activation_source();
         crate::desktop::remember_foreground();
         if lparam as u32 == 0x0202 {
             emit(Action::Show);
@@ -1102,6 +1158,7 @@ impl Drop for NativeSession {
     }
 }
 pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
+    remember_activation_source();
     let mutex = unsafe {
         CreateMutexW(
             std::ptr::null_mut(),
@@ -1364,29 +1421,46 @@ fn activate_window(window: Hwnd) -> bool {
         return false;
     }
     set_window_icon(window);
+    let attachment = InputQueueAttachment::new();
     unsafe {
         // Explicit visibility is independent of WinUI's initial Activate and
         // STARTUPINFO's initial show command. The desktop and final viewport
         // have both been committed before this nonactivating show.
         SetWindowPos(
             window,
-            std::ptr::null_mut(),
+            if window == POPUP.with(Cell::get) {
+                -1_isize as Hwnd // HWND_TOPMOST, only while this popup is active.
+            } else {
+                std::ptr::null_mut() // HWND_TOP
+            },
             0,
             0,
             0,
             0,
-            0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0040,
+            0x0001 | 0x0002 | 0x0010 | 0x0040,
         );
-    }
-    let attachment = InputQueueAttachment::new();
-    if unsafe { GetForegroundWindow() } != window {
-        unsafe { SetForegroundWindow(window) };
+        // WinUI's initial Activate can report foreground before the first
+        // presentation is stable. Always request activation after raising it.
+        SetForegroundWindow(window);
     }
     drop(attachment);
     (unsafe { IsWindowVisible(window) }) != 0 && unsafe { GetForegroundWindow() } == window
 }
 
 fn activate_popup(window: Hwnd) {
+    cancel_activation_check(window);
+    let revision = PRESENTATION.with(Cell::get).revision;
+    // Hold off blur hiding until the foreground handoff has crossed the UI
+    // message boundary. A revision and last-input snapshot bound every retry.
+    ACTIVATION_CHECK.with(|value| {
+        value.set(Some(ActivationVerification {
+            revision,
+            source: ACTIVATION_SOURCE.with(Cell::get),
+            input_time: last_input_time(),
+            retries: 0,
+            checks: 0,
+        }))
+    });
     let activated = activate_window(window);
     POPUP_PRESENTED.with(|value| value.set(unsafe { IsWindowVisible(window) } != 0));
     crate::storage::diagnostic(serde_json::json!({
@@ -1402,7 +1476,99 @@ fn activate_popup(window: Hwnd) {
             emit(Action::PopupActivated(presentation.revision));
         }
     }
-    if !activated {
+    if unsafe { PostMessageW(window, VERIFY_ACTIVATION_MESSAGE, revision as usize, 0) } == 0 {
+        schedule_activation_verification(window);
+    }
+}
+
+fn remember_activation_source() {
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut process = 0;
+    unsafe { GetWindowThreadProcessId(foreground, &mut process) };
+    if foreground.is_null() || process != unsafe { GetCurrentProcessId() } {
+        ACTIVATION_SOURCE.with(|value| value.set(foreground));
+    }
+}
+
+fn schedule_activation_verification(window: Hwnd) {
+    if unsafe { SetTimer(window, ACTIVATION_TIMER, ACTIVATION_DELAY_MS, None) } == 0 {
+        cancel_activation_check(window);
+        release_popup_layer(window);
+        schedule_focus_check();
+    }
+}
+
+fn last_input_time() -> Option<u32> {
+    let mut info = LastInputInfo {
+        size: std::mem::size_of::<LastInputInfo>() as u32,
+        time: 0,
+    };
+    (unsafe { GetLastInputInfo(&mut info) } != 0).then_some(info.time)
+}
+
+fn cancel_activation_check(window: Hwnd) {
+    ACTIVATION_CHECK.with(|value| value.set(None));
+    unsafe { KillTimer(window, ACTIVATION_TIMER) };
+}
+
+fn release_popup_layer(window: Hwnd) {
+    unsafe {
+        SetWindowPos(
+            window,
+            -2_isize as Hwnd,
+            0,
+            0,
+            0,
+            0,
+            0x0001 | 0x0002 | 0x0010,
+        );
+    }
+}
+
+fn verify_popup_activation(window: Hwnd, revision: u64) {
+    let Some(mut check) = ACTIVATION_CHECK.with(Cell::get) else {
+        return;
+    };
+    if check.revision != revision {
+        return;
+    }
+    unsafe { KillTimer(window, ACTIVATION_TIMER) };
+    let presentation = PRESENTATION.with(Cell::get);
+    if !presentation.show_is_current(revision) {
+        cancel_activation_check(window);
+        return;
+    }
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground == window && unsafe { IsWindowVisible(window) } != 0 {
+        if check.checks == 0 {
+            check.checks = 1;
+            ACTIVATION_CHECK.with(|value| value.set(Some(check)));
+            schedule_activation_verification(window);
+            return;
+        }
+        cancel_activation_check(window);
+        crate::storage::diagnostic(serde_json::json!({
+            "event":"popup_activation_verified", "foreground":true, "retries":check.retries,
+        }));
+        emit(Action::PopupFocusReady(revision));
+        return;
+    }
+    if check.may_retry(presentation, foreground, last_input_time()) {
+        check.retries += 1;
+        ACTIVATION_CHECK.with(|value| value.set(Some(check)));
+        activate_window(window);
+        let visible = unsafe { IsWindowVisible(window) } != 0;
+        let was_presented = POPUP_PRESENTED.with(|value| value.replace(visible));
+        if visible && !was_presented {
+            emit(Action::PopupActivated(revision));
+        }
+        schedule_activation_verification(window);
+    } else {
+        cancel_activation_check(window);
+        crate::storage::diagnostic(serde_json::json!({
+            "event":"popup_activation_verified", "foreground":false, "retries":check.retries,
+        }));
+        release_popup_layer(window);
         schedule_focus_check();
     }
 }
@@ -1433,6 +1599,7 @@ pub fn show_popup() {
     // frame. A rapid hotkey can safely reverse a native Composition hide.
     update_presentation(PopupPresentation::show);
     if let Some(window) = window(APP_NAME) {
+        cancel_activation_check(window);
         cancel_focus_check(window);
         if POPUP_PRESENTED.with(Cell::get)
             && unsafe { IsWindowVisible(window) } != 0
@@ -1456,6 +1623,8 @@ pub fn show_popup() {
 pub fn hide_popup() {
     SHOW_AFTER_FRAME.with(|value| value.set(false));
     if let Some(window) = window(APP_NAME) {
+        cancel_activation_check(window);
+        release_popup_layer(window);
         cancel_focus_check(window);
         stop_resize(window);
         let visible = unsafe { IsWindowVisible(window) } != 0;
@@ -1479,6 +1648,8 @@ pub fn complete_popup_hide(revision: u64) {
     }
     SHOW_AFTER_FRAME.with(|value| value.set(false));
     if let Some(window) = window(APP_NAME) {
+        cancel_activation_check(window);
+        release_popup_layer(window);
         cancel_focus_check(window);
         stop_resize(window);
         unsafe {
@@ -1758,5 +1929,110 @@ mod presentation_tests {
         assert!(!state.complete_hide(hide));
         assert_eq!(state.hide(false), None);
         assert!(!state.show_requested);
+    }
+
+    fn pending_activation(state: &mut PopupPresentation) -> ActivationVerification {
+        ActivationVerification {
+            revision: state.show(),
+            source: 1_usize as Hwnd,
+            input_time: Some(1_000),
+            retries: 0,
+            checks: 0,
+        }
+    }
+
+    #[test]
+    fn activation_lost_to_the_source_without_new_input_can_retry() {
+        let mut state = PopupPresentation::default();
+        let check = pending_activation(&mut state);
+
+        assert!(check.may_retry(state, check.source, check.input_time));
+        // A transient gap in the foreground handoff also belongs to this open.
+        assert!(check.may_retry(state, std::ptr::null_mut(), check.input_time));
+    }
+
+    #[test]
+    fn hiding_cancels_activation_retries_before_the_hide_animation_completes() {
+        for animate in [false, true] {
+            let mut state = PopupPresentation::default();
+            let check = pending_activation(&mut state);
+            state.hide(animate);
+
+            assert!(!check.may_retry(state, check.source, check.input_time));
+            assert!(!check.may_retry(state, std::ptr::null_mut(), check.input_time));
+        }
+    }
+
+    #[test]
+    fn reopening_cannot_revive_an_old_activation_verification() {
+        let mut state = PopupPresentation::default();
+        let old_check = pending_activation(&mut state);
+        let hide = state.hide(true).unwrap();
+        let new_check = pending_activation(&mut state);
+
+        assert!(!old_check.may_retry(state, old_check.source, old_check.input_time));
+        assert!(!state.complete_hide(hide));
+        assert!(new_check.may_retry(state, new_check.source, new_check.input_time));
+    }
+
+    #[test]
+    fn external_hiding_cancels_a_pending_activation_verification() {
+        let mut state = PopupPresentation::default();
+        let check = pending_activation(&mut state);
+        state.hidden();
+
+        assert!(!check.may_retry(state, check.source, check.input_time));
+        assert!(!check.may_retry(state, std::ptr::null_mut(), check.input_time));
+    }
+
+    #[test]
+    fn new_or_unavailable_input_cancels_activation_retries() {
+        let mut state = PopupPresentation::default();
+        let check = pending_activation(&mut state);
+
+        for input in [Some(1_001), Some(999), None] {
+            assert!(!check.may_retry(state, check.source, input));
+            assert!(!check.may_retry(state, std::ptr::null_mut(), input));
+        }
+    }
+
+    #[test]
+    fn another_foreground_window_cannot_be_displaced_by_an_activation_retry() {
+        let mut state = PopupPresentation::default();
+        let check = pending_activation(&mut state);
+        let another_window = 2_usize as Hwnd;
+
+        assert!(!check.may_retry(state, another_window, check.input_time));
+    }
+
+    #[test]
+    fn an_unavailable_initial_input_snapshot_never_authorizes_a_retry() {
+        let mut state = PopupPresentation::default();
+        let check = ActivationVerification {
+            input_time: None,
+            ..pending_activation(&mut state)
+        };
+
+        for input in [None, Some(1_000)] {
+            assert!(!check.may_retry(state, check.source, input));
+            assert!(!check.may_retry(state, std::ptr::null_mut(), input));
+        }
+    }
+
+    #[test]
+    fn activation_retries_are_bounded_per_show_request() {
+        let mut state = PopupPresentation::default();
+        let mut check = pending_activation(&mut state);
+
+        for _ in 0..3 {
+            assert!(check.may_retry(state, check.source, check.input_time));
+            check.retries += 1;
+        }
+        assert!(!check.may_retry(state, check.source, check.input_time));
+        assert!(!check.may_retry(state, std::ptr::null_mut(), check.input_time));
+
+        let next_check = pending_activation(&mut state);
+        assert!(!check.may_retry(state, check.source, check.input_time));
+        assert!(next_check.may_retry(state, next_check.source, next_check.input_time));
     }
 }

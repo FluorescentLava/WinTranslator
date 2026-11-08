@@ -41,6 +41,7 @@ pub enum Message {
     Drag,
     Show,
     PopupActivated(u64),
+    PopupFocusReady(u64),
     PopupDismissed(u64),
     PopupHidden(u64),
     CaptureSelection,
@@ -1746,6 +1747,7 @@ impl Component for Translator {
                 let _ = sender.send(match action {
                     native::Action::Show => Message::Show,
                     native::Action::PopupActivated(revision) => Message::PopupActivated(revision),
+                    native::Action::PopupFocusReady(revision) => Message::PopupFocusReady(revision),
                     native::Action::PopupDismissed(revision) => Message::PopupDismissed(revision),
                     native::Action::TranslateSelection => Message::CaptureSelection,
                     native::Action::Settings => Message::OpenSettings,
@@ -1988,6 +1990,13 @@ impl Component for Translator {
                     let _ = self.input.request_focus();
                     self.repair_caret(cx, 0);
                 }
+            }
+            Message::PopupFocusReady(revision)
+                if native::popup_show_animation_is_current(revision)
+                    && native::popup_is_foreground() =>
+            {
+                let _ = self.input.request_focus();
+                self.repair_caret(cx, 0);
             }
             Message::PopupDismissed(revision)
                 if native::popup_hide_animation_is_current(revision) =>
