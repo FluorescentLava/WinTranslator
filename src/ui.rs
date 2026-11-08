@@ -42,6 +42,8 @@ pub enum Message {
     Show,
     PopupActivated(u64),
     PopupFocusReady(u64),
+    FocusPopupInput(u64, u8),
+    InputFocusResult(u64, u8, bool),
     PopupDismissed(u64),
     PopupHidden(u64),
     CaptureSelection,
@@ -704,6 +706,26 @@ impl Translator {
                 let _ = sender.send(Message::RetryCaret(attempt + 1));
             }
         });
+    }
+    fn focus_popup_input(&self, cx: &ComponentContext<Self>, revision: u64, attempt: u8) {
+        if !native::popup_show_animation_is_current(revision)
+            || !native::prepare_popup_input_focus()
+        {
+            return;
+        }
+        let sender = cx.sender();
+        let accepted = self.input.request_focus_result(move |result| {
+            let _ = sender.send(Message::InputFocusResult(
+                revision,
+                attempt,
+                matches!(result, Ok(true)),
+            ));
+        });
+        if !accepted {
+            let _ = cx
+                .sender()
+                .send(Message::InputFocusResult(revision, attempt, false));
+        }
     }
     fn popup(&self, cx: &mut ViewContext<Self>) -> View {
         cx.on_color_scheme(cx.callback(Message::ColorScheme));
@@ -1986,17 +2008,33 @@ impl Component for Translator {
                 let _ = self
                     .popup_surface
                     .request_slide_y(24.0, 0.0, 0.0, 1.0, 160, |_| {});
-                if native::popup_is_foreground() {
-                    let _ = self.input.request_focus();
-                    self.repair_caret(cx, 0);
-                }
             }
             Message::PopupFocusReady(revision)
                 if native::popup_show_animation_is_current(revision)
                     && native::popup_is_foreground() =>
             {
-                let _ = self.input.request_focus();
-                self.repair_caret(cx, 0);
+                self.focus_popup_input(cx, revision, 0);
+            }
+            Message::FocusPopupInput(revision, attempt) => {
+                self.focus_popup_input(cx, revision, attempt);
+            }
+            Message::InputFocusResult(revision, attempt, focused)
+                if native::popup_show_animation_is_current(revision)
+                    && native::popup_is_foreground() =>
+            {
+                let keyboard_focus = native::popup_has_keyboard_focus();
+                storage::diagnostic(serde_json::json!({
+                    "event":"popup_input_focus", "attempt":attempt,
+                    "xaml_focused":focused, "keyboard_focused":keyboard_focus,
+                }));
+                if focused && keyboard_focus {
+                    self.repair_caret(cx, 0);
+                } else if attempt < 6 {
+                    cx.spawn_background(move |_| {
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        Message::FocusPopupInput(revision, attempt + 1)
+                    });
+                }
             }
             Message::PopupDismissed(revision)
                 if native::popup_hide_animation_is_current(revision) =>

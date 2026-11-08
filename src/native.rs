@@ -290,6 +290,8 @@ unsafe extern "system" {
     fn SendMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> isize;
     fn PostMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
     fn SetForegroundWindow(window: Hwnd) -> i32;
+    fn SetActiveWindow(window: Hwnd) -> Hwnd;
+    fn SetFocus(window: Hwnd) -> Hwnd;
     fn GetForegroundWindow() -> Hwnd;
     fn GetLastInputInfo(info: *mut LastInputInfo) -> i32;
     fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
@@ -1590,6 +1592,29 @@ pub fn popup_is_foreground() -> bool {
     !popup.is_null()
         && unsafe { IsWindowVisible(popup) } != 0
         && unsafe { GetForegroundWindow() } == popup
+}
+
+/// Reconnect Win32 keyboard focus before asking the XAML TextBox to focus.
+/// A successful SetForegroundWindow (especially after input-queue detachment)
+/// does not imply that this UI thread has an active input site yet.
+pub fn prepare_popup_input_focus() -> bool {
+    if !popup_is_foreground() {
+        return false;
+    }
+    let popup = POPUP.with(Cell::get);
+    unsafe {
+        SetActiveWindow(popup);
+        if !popup_has_keyboard_focus() {
+            SetFocus(popup);
+        }
+    }
+    popup_is_foreground()
+}
+
+pub fn popup_has_keyboard_focus() -> bool {
+    let popup = POPUP.with(Cell::get);
+    let focused = unsafe { GetFocus() };
+    !popup.is_null() && !focused.is_null() && unsafe { GetAncestor(focused, 2) } == popup
 }
 
 pub fn show_popup() {
