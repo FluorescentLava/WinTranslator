@@ -249,6 +249,80 @@ impl<T: ReferenceControl> ElementRef<T> {
         }
     }
 
+    /// Runs a native Composition translation and opacity animation on this element.
+    /// The compositor owns every animation frame. A newer request replaces an older one,
+    /// continuing from its current presentation value. Completion is delivered through the
+    /// host event queue: `Ok(true)` finished, `Ok(false)` was replaced or cancelled.
+    /// An unbound reference reports `Unavailable` immediately and returns false.
+    #[must_use]
+    pub fn request_slide_y(
+        &self,
+        from_y: f32,
+        to_y: f32,
+        from_opacity: f32,
+        to_opacity: f32,
+        duration_ms: u32,
+        completion: impl Fn(Result<bool, IntegrationError>) + 'static,
+    ) -> bool {
+        self.enqueue_slide_y(
+            Some(SlideYAnimation {
+                from_y,
+                to_y,
+                from_opacity,
+                to_opacity,
+                duration_ms,
+            }),
+            completion,
+        )
+    }
+
+    /// Cancels a native slide while retaining its current presentation value.
+    #[must_use]
+    pub fn request_cancel_slide_y(
+        &self,
+        completion: impl Fn(Result<bool, IntegrationError>) + 'static,
+    ) -> bool {
+        self.enqueue_slide_y(None, completion)
+    }
+
+    fn enqueue_slide_y(
+        &self,
+        animation: Option<SlideYAnimation>,
+        completion: impl Fn(Result<bool, IntegrationError>) + 'static,
+    ) -> bool {
+        let (binding, revision) = {
+            let mut target = self.target.borrow_mut();
+            let Some(binding) = target.binding.clone() else {
+                drop(target);
+                completion(Err(IntegrationError::Unavailable));
+                return false;
+            };
+            target.slide_revision = target.slide_revision.wrapping_add(1);
+            (binding, target.slide_revision)
+        };
+        let target = Rc::downgrade(&self.target);
+        binding.endpoint.enqueue(NativeWork {
+            identity: binding.identity,
+            work: ImperativeRequest::SlideY {
+                node: binding.node,
+                revision,
+                animation,
+                completion: Callback::new(move |result: Result<bool, RuntimeError>| {
+                    let current = target
+                        .upgrade()
+                        .is_some_and(|v| v.borrow().slide_revision == revision);
+                    completion(if current {
+                        result.map_err(IntegrationError::from_runtime)
+                    } else {
+                        result
+                            .map(|_| false)
+                            .map_err(IntegrationError::from_runtime)
+                    });
+                }),
+            },
+        })
+    }
+
     pub(crate) fn binding(&self) -> NativeElementRef {
         NativeElementRef(Rc::clone(&self.target))
     }
@@ -723,6 +797,7 @@ struct ReferenceBinding {
 #[derive(Default)]
 struct ReferenceTarget {
     binding: Option<ReferenceBinding>,
+    slide_revision: u64,
     observations: Vec<Weak<ObservationRegistration>>,
 }
 
@@ -880,8 +955,23 @@ impl Drop for ElementObservation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlideYAnimation {
+    pub from_y: f32,
+    pub to_y: f32,
+    pub from_opacity: f32,
+    pub to_opacity: f32,
+    pub duration_ms: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ImperativeRequest {
+    SlideY {
+        node: NodeId,
+        revision: u64,
+        animation: Option<SlideYAnimation>,
+        completion: Callback<Result<bool, RuntimeError>>,
+    },
     Focus {
         node: NodeId,
         completion: Callback<Result<bool, RuntimeError>>,
@@ -938,7 +1028,10 @@ pub(crate) enum ImperativeRequest {
 impl ImperativeRequest {
     pub(crate) fn complete_unavailable(self) {
         match self {
-            Self::Focus { node, completion }
+            Self::SlideY {
+                node, completion, ..
+            }
+            | Self::Focus { node, completion }
             | Self::HideFlyout { node, completion }
             | Self::SetTextBoxCaretColor {
                 node, completion, ..

@@ -40,7 +40,9 @@ pub enum Message {
     Dismiss,
     Drag,
     Show,
-    PopupActivated,
+    PopupActivated(u64),
+    PopupDismissed(u64),
+    PopupHidden(u64),
     CaptureSelection,
     SelectionCaptured(u64, Option<String>),
     Quit,
@@ -57,8 +59,8 @@ pub enum Message {
     Target(Option<usize>),
     AutoPair(bool),
     AutoStart(bool),
-    SetId(String),
-    SetKey(String),
+    SetId(Provider, String),
+    SetKey(Provider, String),
     Region(String),
     AutoOffline(bool),
     DeepLPlan(Option<usize>),
@@ -91,6 +93,7 @@ pub struct Translator {
     provider_picker_revision: u64,
     color_scheme: ColorScheme,
     settings: Settings,
+    settings_load_warning: Option<String>,
     history: Vec<Translation>,
     query: String,
     busy: bool,
@@ -107,6 +110,7 @@ pub struct Translator {
     error: bool,
     input: ElementRef<TextBox>,
     provider_button: ElementRef<Button>,
+    popup_surface: ElementRef<Border>,
 }
 fn text(value: impl Into<String>, size: f64) -> TextBlock {
     TextBlock::new()
@@ -137,9 +141,18 @@ fn meaning_parts(value: &str) -> impl Iterator<Item = &str> {
         .map(str::trim)
         .filter(|part| !part.is_empty())
 }
-fn display_senses(entry: &crate::dictionary::Entry) -> Vec<crate::dictionary::Sense> {
+fn display_senses(
+    entry: &crate::dictionary::Entry,
+    primary: &str,
+) -> Vec<crate::dictionary::Sense> {
     if entry.direction == crate::dictionary::LookupDirection::ChineseToEnglish {
-        return entry.senses.clone();
+        let primary = meaning_key(primary);
+        return entry
+            .senses
+            .iter()
+            .filter(|sense| meaning_key(&sense.definition) != primary)
+            .cloned()
+            .collect();
     }
     let mut seen = std::collections::HashSet::new();
     let mut senses = Vec::new();
@@ -292,7 +305,7 @@ fn swap_button(cx: &ViewContext<Translator>) -> View {
                 .data(include_str!("../assets/icons/arrow-swap.path"))
                 .width(20.0)
                 .height(20.0)
-                .opacity(0.72),
+                .opacity(0.45),
         )
         .tooltip("交换语言")
 }
@@ -466,6 +479,7 @@ impl Translator {
     fn save(&mut self) {
         match storage::save_settings(&self.settings) {
             Ok(()) => {
+                self.settings_load_warning = None;
                 self.status = "已保存".into();
                 self.error = false;
                 if let Some(parent) = &self.parent {
@@ -593,8 +607,13 @@ impl Translator {
                     .map(|(index, provider)| {
                         let configured = provider_configured(&self.settings, provider);
                         let selectable = !compact || configured;
+                        let missing_status = if self.settings_load_warning.is_some() {
+                            "读取失败"
+                        } else {
+                            "未配置"
+                        };
                         let label = if compact && !configured {
-                            format!("{} · 未配置", provider.name())
+                            format!("{} · {missing_status}", provider.name())
                         } else {
                             provider.name().to_owned()
                         };
@@ -603,7 +622,7 @@ impl Translator {
                             Provider::Offline => "未就绪",
                             Provider::MyMemory => "免密钥试用",
                             _ if configured => "已配置",
-                            _ => "未配置",
+                            _ => missing_status,
                         };
                         let content = if compact {
                             StackPanel::new()
@@ -698,8 +717,11 @@ impl Translator {
         let dictionary_senses = self
             .output
             .as_ref()
-            .and(self.entry.as_ref())
-            .map(display_senses)
+            .and_then(|translation| {
+                self.entry
+                    .as_ref()
+                    .map(|entry| display_senses(entry, &translation.target))
+            })
             .unwrap_or_default();
         let details_open = self.details_open && !dictionary_senses.is_empty();
         let details_reveal = if dictionary_senses.is_empty() {
@@ -875,7 +897,7 @@ impl Translator {
         let height = natural_height;
         let transition_key =
             u64::from(details_open) | (u64::from(expanded) << 2) | (u64::from(self.error) << 3);
-        cx.window_title("翻译");
+        cx.window_title("WinTranslater");
         cx.window_visuals(
             WindowVisuals::new()
                 .client_size(POPUP_WIDTH, 172.0)
@@ -923,7 +945,7 @@ impl Translator {
         });
         let (from, to) = self.language_indices();
         let languages = Grid::new()
-            .columns([Auto, Auto, Auto, Auto, Star(1.0), Auto])
+            .columns([Auto, Auto, Auto, Auto, Star(1.0)])
             .column_spacing(8.0)
             .children((
                 Border::new()
@@ -962,11 +984,6 @@ impl Translator {
                     .automation_name("目标语言")
                     .on_selection_changed(cx.callback(Message::Target))
                     .grid_column(3),
-                at(
-                    icon_button(SETTINGS, "设置", Message::OpenSettings, cx),
-                    0,
-                    5,
-                ),
             ));
         let input = TextBox::new()
             .element_ref(&self.input)
@@ -1308,7 +1325,7 @@ impl Translator {
                 }),
             );
         let footer = Grid::new()
-            .columns([Auto, Star(1.0)])
+            .columns([Auto, Star(1.0), Auto])
             .column_spacing(8.0)
             .children((
                 state,
@@ -1321,10 +1338,16 @@ impl Translator {
                 } else {
                     View::empty()
                 },
+                at(
+                    icon_button(SETTINGS, "设置", Message::OpenSettings, cx),
+                    0,
+                    2,
+                ),
             ));
         let surface = Border::new()
-            .height(frame_height)
-            .vertical_alignment(VerticalAlignment::Top)
+            .element_ref(&self.popup_surface)
+            .opacity(0.0)
+            .vertical_alignment(VerticalAlignment::Stretch)
             .corner_radius(12.0)
             .padding(Thickness::new(16.0, 12.0, 16.0, 10.0))
             .on_pointer_pressed(cx.callback(|point: PointerEventInfo| {
@@ -1335,20 +1358,20 @@ impl Translator {
                 }
             }))
             .content(
-                Grid::new()
-                    .rows([
-                        GridLength::Pixel(32.0),
-                        GridLength::Pixel(input_viewport_height),
-                        Star(1.0),
-                        GridLength::Pixel(32.0),
-                    ])
-                    .row_spacing(7.0)
-                    .children((
-                        languages,
-                        at(input, 1, 0),
-                        at(result, 2, 0),
-                        at(footer, 3, 0),
-                    )),
+                Grid::new().children((
+                    Grid::new()
+                        .rows([
+                            GridLength::Pixel(32.0),
+                            GridLength::Pixel(input_viewport_height),
+                            Star(1.0),
+                        ])
+                        .row_spacing(7.0)
+                        .margin(Thickness::new(0.0, 0.0, 0.0, 39.0))
+                        .children((languages, at(input, 1, 0), at(result, 2, 0))),
+                    Border::new()
+                        .vertical_alignment(VerticalAlignment::Bottom)
+                        .content(footer),
+                )),
             );
         surface.into()
     }
@@ -1371,7 +1394,9 @@ impl Translator {
                         TextBox::new()
                             .text(credential.id)
                             .automation_name("API 标识")
-                            .on_text_changed(cx.callback(Message::SetId)),
+                            .on_text_changed(
+                                cx.callback(move |value| Message::SetId(provider, value)),
+                            ),
                     )
                 },
                 field(
@@ -1383,7 +1408,9 @@ impl Translator {
                     PasswordBox::new()
                         .password(credential.key)
                         .automation_name("API 密钥")
-                        .on_password_changed(cx.callback(Message::SetKey)),
+                        .on_password_changed(
+                            cx.callback(move |value| Message::SetKey(provider, value)),
+                        ),
                 ),
             ))
         } else {
@@ -1423,7 +1450,11 @@ impl Translator {
             .spacing(10.0)
             .keyed_children(routes.into_iter().map(|route| {
                 let description = if !route.configured {
-                    "未配置".to_owned()
+                    if self.settings_load_warning.is_some() {
+                        "凭据读取失败".to_owned()
+                    } else {
+                        "未配置".to_owned()
+                    }
                 } else if !route.eligible {
                     format!("未启用 · {}", route.message)
                 } else if route.cooldown_seconds > 0 {
@@ -1471,7 +1502,7 @@ impl Translator {
             self.card(
                 StackPanel::new().spacing(12.0).children((
                     field("默认引擎", self.provider_choices(provider, false, cx)),
-                    credentials,
+                    StackPanel::new().keyed_children([(provider.index(), credentials)]),
                     extra,
                     Button::new()
                         .style(ButtonStyle::Accent)
@@ -1615,7 +1646,7 @@ impl Translator {
             ))
     }
     fn settings_view(&self, cx: &mut ViewContext<Self>) -> View {
-        cx.window_title("翻译设置");
+        cx.window_title("WinTranslater 设置");
         cx.window_visuals(
             WindowVisuals::new()
                 .client_size(760.0, 540.0)
@@ -1694,6 +1725,17 @@ impl Component for Translator {
     type Message = Message;
     fn create(input: &WindowInput, cx: &ComponentContext<Self>) -> Self {
         let (mut settings, history, mut warning) = storage::load();
+        let settings_load_warning = warning.clone();
+        storage::diagnostic(serde_json::json!({
+            "event": "settings_loaded",
+            "settings_window": input.settings_window,
+            "selected_provider": settings.provider,
+            "data_directory": storage::data_dir(),
+            "load_warning": warning.is_some(),
+            "configured_providers": Provider::ALL.into_iter()
+                .filter(|provider| provider_configured(&settings, *provider))
+                .collect::<Vec<_>>(),
+        }));
         if !input.settings_window && !input.initial_text.trim().is_empty() {
             settings.follow_bilingual_input(&input.initial_text);
             cx.spawn_background(|_| Message::Translate);
@@ -1703,7 +1745,8 @@ impl Component for Translator {
             native::install_handler(move |action| {
                 let _ = sender.send(match action {
                     native::Action::Show => Message::Show,
-                    native::Action::PopupActivated => Message::PopupActivated,
+                    native::Action::PopupActivated(revision) => Message::PopupActivated(revision),
+                    native::Action::PopupDismissed(revision) => Message::PopupDismissed(revision),
                     native::Action::TranslateSelection => Message::CaptureSelection,
                     native::Action::Settings => Message::OpenSettings,
                     native::Action::Quit => Message::Quit,
@@ -1755,6 +1798,7 @@ impl Component for Translator {
             provider_picker_revision: 0,
             color_scheme: ColorScheme::Light,
             settings,
+            settings_load_warning,
             history,
             query: String::new(),
             busy: false,
@@ -1771,6 +1815,7 @@ impl Component for Translator {
             error: warning.is_some(),
             input: ElementRef::new(),
             provider_button: ElementRef::new(),
+            popup_surface: ElementRef::new(),
         }
     }
     fn update(&mut self, message: Message, cx: &ComponentContext<Self>) {
@@ -1933,9 +1978,38 @@ impl Component for Translator {
                     self.schedule(cx);
                 }
             }
-            Message::PopupActivated if native::popup_is_foreground() => {
-                let _ = self.input.request_focus();
-                self.repair_caret(cx, 0);
+            Message::PopupActivated(revision)
+                if native::popup_show_animation_is_current(revision) =>
+            {
+                let _ = self
+                    .popup_surface
+                    .request_slide_y(24.0, 0.0, 0.0, 1.0, 160, |_| {});
+                if native::popup_is_foreground() {
+                    let _ = self.input.request_focus();
+                    self.repair_caret(cx, 0);
+                }
+            }
+            Message::PopupDismissed(revision)
+                if native::popup_hide_animation_is_current(revision) =>
+            {
+                self.close_provider_picker();
+                self.cancel_selection();
+                self.cancel_speech();
+                self.invalidate();
+                let sender = cx.sender();
+                let accepted =
+                    self.popup_surface
+                        .request_slide_y(0.0, 24.0, 1.0, 0.0, 120, move |result| {
+                            if !matches!(result, Ok(false)) {
+                                let _ = sender.send(Message::PopupHidden(revision));
+                            }
+                        });
+                if !accepted {
+                    native::complete_popup_hide(revision);
+                }
+            }
+            Message::PopupHidden(revision) => {
+                native::complete_popup_hide(revision);
             }
             Message::CaptureSelection => {
                 self.cancel_selection();
@@ -1981,10 +2055,13 @@ impl Component for Translator {
             Message::OpenSettings => self.open_settings(cx),
             Message::SettingsClosed => {
                 self.settings_open = false;
-                self.settings = storage::load().0;
+                let (settings, _, warning) = storage::load();
+                self.settings = settings;
+                self.settings_load_warning = warning;
             }
             Message::Reload => {
-                let settings = storage::load().0;
+                let (settings, _, warning) = storage::load();
+                self.settings_load_warning = warning;
                 let changed = settings.provider != self.settings.provider
                     || settings.credentials != self.settings.credentials
                     || settings.region != self.settings.region
@@ -2118,21 +2195,13 @@ impl Component for Translator {
                     }
                 }
             }
-            Message::SetId(id) => {
-                if let Some(c) = self
-                    .settings
-                    .credentials
-                    .get_mut(self.settings.provider.index())
-                {
+            Message::SetId(provider, id) => {
+                if let Some(c) = self.settings.credentials.get_mut(provider.index()) {
                     c.id = id;
                 }
             }
-            Message::SetKey(key) => {
-                if let Some(c) = self
-                    .settings
-                    .credentials
-                    .get_mut(self.settings.provider.index())
-                {
+            Message::SetKey(provider, key) => {
+                if let Some(c) = self.settings.credentials.get_mut(provider.index()) {
                     c.key = key;
                 }
             }

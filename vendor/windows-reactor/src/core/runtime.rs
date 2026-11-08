@@ -197,6 +197,11 @@ pub struct QueuedEventError {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostEvent {
+    ElementSlideCompleted {
+        node: NodeId,
+        completion: Callback<Result<bool, RuntimeError>>,
+        result: Result<bool, RuntimeError>,
+    },
     FlyoutClosed {
         owner: NodeId,
         revision: u32,
@@ -230,6 +235,12 @@ pub struct WindowObservationFlags {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    SlideY {
+        node: NodeId,
+        revision: u64,
+        animation: Option<reference::SlideYAnimation>,
+        completion: Callback<Result<bool, RuntimeError>>,
+    },
     CreateApplication {
         node: NodeId,
     },
@@ -443,7 +454,10 @@ pub enum Command {
 impl Command {
     pub(crate) fn complete_unavailable(&self) {
         match self {
-            Self::Focus { node, completion }
+            Self::SlideY {
+                node, completion, ..
+            }
+            | Self::Focus { node, completion }
             | Self::HideFlyout { node, completion }
             | Self::SetTextBoxCaretColor {
                 node, completion, ..

@@ -631,7 +631,12 @@ mod tests {
             routing::candidates(&settings).contains(&provider),
             "provider has no usable configured free allowance"
         );
-        for (source, from, to) in [("snake", "en", "zh"), ("你好", "zh", "en")] {
+        for (source, from, to) in [
+            ("snake", "en", "zh"),
+            ("你好", "zh", "en"),
+            ("apologize to me", "en", "zh"),
+            ("三梦奇缘，给我道歉", "zh", "en"),
+        ] {
             let result = routing::translate_online(
                 source,
                 from,
@@ -653,9 +658,17 @@ mod tests {
             assert!(!result.target.trim().is_empty());
             if source == "snake" {
                 assert!(result.target.contains('蛇'));
-            } else {
+            } else if source == "你好" {
                 let target = result.target.to_ascii_lowercase();
                 assert!(target.contains("hello") || target.contains("hi"));
+            } else if source == "apologize to me" {
+                assert!(result.target.contains("道歉"));
+                assert!(!result.target.contains("对不起"));
+            } else {
+                assert_ne!(
+                    result.target.trim().to_ascii_lowercase(),
+                    "apologize to me."
+                );
             }
             println!("{}: {source} → {}", provider.name(), result.target);
         }

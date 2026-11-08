@@ -734,12 +734,17 @@ pub mod public {
         capture_pointer_on_press: Property<bool>,
         drop_policy: Property<DragDropPolicy>,
         events: Option<std::rc::Rc<BorderEvents>>,
+        reference: Option<NativeElementRef>,
         element_state: Option<std::rc::Rc<ElementState>>,
         content: Option<Box<Element>>,
     }
     impl Border {
         pub fn new() -> Self {
             Self::default()
+        }
+        pub fn element_ref(mut self, reference: &ElementRef<Self>) -> Self {
+            self.reference = Some(reference.binding());
+            self
         }
         pub fn padding(mut self, value: impl Into<Thickness>) -> Self {
             let value = value.into();
@@ -968,6 +973,8 @@ pub mod public {
         }
     }
     impl sealed::Sealed for Border {}
+    impl crate::reference::sealed::Sealed for Border {}
+    impl crate::reference::ReferenceControl for Border {}
     impl sealed::NativeControl for Border {
         fn into_element(self) -> Element {
             self.into()
@@ -6590,6 +6597,7 @@ pub mod public {
                         capture_pointer_on_press,
                         drop_policy,
                         events,
+                        reference,
                         element_state,
                         content,
                     } = value;
@@ -6608,7 +6616,7 @@ pub mod public {
                             drop_policy,
                             events,
                         })),
-                        reference: None,
+                        reference,
                         element_state,
                         window_title_bar: None,
                         structure: ElementStructure::Content(content.map(|element| *element)),
@@ -8744,7 +8752,7 @@ pub mod public {
                 Self::Button(value) => value.reference.as_ref(),
                 Self::HyperlinkButton(value) => value.reference.as_ref(),
                 Self::RepeatButton(_) => None,
-                Self::Border(_) => None,
+                Self::Border(value) => value.reference.as_ref(),
                 Self::BreadcrumbBar(_) => None,
                 Self::StackPanel(_) => None,
                 Self::VariableSizedWrapGrid(_) => None,

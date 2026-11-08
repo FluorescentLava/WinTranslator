@@ -1,6 +1,6 @@
 //! Exact Chinese word entries from Youdao's Chinese-English dictionary. This
 //! supplements the offline reverse index and caches successful results locally.
-use crate::dictionary::{Entry, LookupDirection, Sense};
+use crate::dictionary::{Entry, LookupDirection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -40,6 +40,9 @@ struct CachedEntry {
 #[serde(deny_unknown_fields)]
 struct CachedSense {
     english: String,
+    // Keep reading existing cache files; Chinese glosses are no longer part of
+    // the displayed English candidate and are optional in newer responses.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     explanation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     part_of_speech: Option<String>,
@@ -163,27 +166,33 @@ fn parse_response(query: &str, value: &Value) -> Option<CachedEntry> {
                 let Some(label) = translation.get("l") else {
                     continue;
                 };
+                if label
+                    .get("#tran")
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::dictionary::foreign_language_gloss)
+                {
+                    continue;
+                }
                 let Some(english) = label.get("i").and_then(english_fragments) else {
                     continue;
                 };
-                let Some(explanation) = label
+                let explanation = label
                     .get("#tran")
                     .and_then(Value::as_str)
                     .and_then(short_explanation)
-                else {
-                    continue;
-                };
-                if !seen.insert(english.to_ascii_lowercase()) {
+                    .unwrap_or_default();
+                let part_of_speech = label
+                    .get("pos")
+                    .and_then(Value::as_str)
+                    .and_then(canonical_pos)
+                    .map(str::to_owned);
+                if !seen.insert((english.to_ascii_lowercase(), part_of_speech.clone())) {
                     continue;
                 }
                 senses.push(CachedSense {
                     english,
                     explanation,
-                    part_of_speech: label
-                        .get("pos")
-                        .and_then(Value::as_str)
-                        .and_then(canonical_pos)
-                        .map(str::to_owned),
+                    part_of_speech,
                 });
                 if senses.len() == MAX_SENSES {
                     return Some(CachedEntry {
@@ -219,7 +228,13 @@ fn english_fragments(value: &Value) -> Option<String> {
         // only #text objects would silently turn "how do you do" into one word.
         joined.push_str(fragment);
     }
-    let english = plain_text(&joined)?.replace('’', "'");
+    if crate::dictionary::foreign_language_gloss(&joined) {
+        return None;
+    }
+    let plain = plain_text(&joined)?.replace('’', "'");
+    // CE may prefix its linked English candidate with a domain label such as
+    // "[金融] bank". The domain label is metadata rather than part of the word.
+    let english = crate::dictionary::strip_annotation(&plain).to_owned();
     valid_english(&english).then_some(english)
 }
 
@@ -321,21 +336,18 @@ fn make_entry(cached: &CachedEntry, cancelled: &dyn Fn() -> bool) -> Option<Entr
         if cancelled() {
             return None;
         }
-        let part = sense.part_of_speech.clone().or_else(|| {
-            crate::dictionary::lookup(&sense.english)
-                .and_then(|source| source.parts_of_speech.first().cloned())
-        });
-        if let Some(part) = &part
-            && !entry.parts_of_speech.contains(part)
+        if crate::dictionary::foreign_language_gloss(&sense.explanation)
+            || crate::dictionary::foreign_candidate(&sense.english)
         {
-            entry.parts_of_speech.push(part.clone());
+            continue;
         }
-        entry.senses.push(Sense {
-            part_of_speech: part.unwrap_or_else(|| "—".into()),
-            definition: format!("{} · {}", sense.english, sense.explanation),
-        });
+        let parts = sense.part_of_speech.clone().map_or_else(
+            || crate::dictionary::chinese_candidate_parts_of_speech(&sense.english, &cached.query),
+            |part| vec![part],
+        );
+        crate::dictionary::append_chinese_candidate(&mut entry, &sense.english, &parts);
     }
-    (!cancelled()).then_some(entry)
+    (!cancelled() && !entry.senses.is_empty()).then_some(entry)
 }
 
 fn cache_path(query: &str) -> PathBuf {
@@ -359,14 +371,19 @@ fn valid_cache(entry: &CachedEntry, query: &str) -> bool {
     let mut seen = HashSet::new();
     entry.senses.iter().all(|sense| {
         valid_english(&sense.english)
-            && seen.insert(sense.english.to_ascii_lowercase())
+            && seen.insert((
+                sense.english.to_ascii_lowercase(),
+                sense.part_of_speech.clone(),
+            ))
             && sense
                 .part_of_speech
                 .as_deref()
                 .is_none_or(|part| canonical_pos(part) == Some(part))
-            && sense.explanation.chars().count() <= MAX_EXPLANATION_CHARS
-            && sense.explanation.chars().any(is_han)
-            && plain_text(&sense.explanation).as_deref() == Some(sense.explanation.as_str())
+            && (sense.explanation.is_empty()
+                || (sense.explanation.chars().count() <= MAX_EXPLANATION_CHARS
+                    && sense.explanation.chars().any(is_han)
+                    && plain_text(&sense.explanation).as_deref()
+                        == Some(sense.explanation.as_str())))
     })
 }
 
@@ -542,6 +559,87 @@ mod tests {
     }
 
     #[test]
+    fn candidate_labels_keep_english_words_and_discard_foreign_language_metadata() {
+        assert_eq!(
+            english_fragments(&json!(["[金融] ", {"#text": "bank"}])).as_deref(),
+            Some("bank")
+        );
+        assert_eq!(english_fragments(&json!(["", {"#text": "how"}, " ", {"#text": "do"}, " ", {"#text": "you"}, " ", {"#text": "do"}])).as_deref(), Some("how do you do"));
+        assert!(english_fragments(&json!(["（法）bonjour"])).is_none());
+        assert!(english_fragments(&json!(["<日> sayonara"])).is_none());
+        let fixture = json!({"ce": {"word": [{
+            "return-phrase": {"l": {"i": "你好"}},
+            "trs": [{"tr": [
+                {"l": {"pos": "interj.", "i": ["hello"], "#tran": "你好"}},
+                {"l": {"i": ["bonjour"], "#tran": "（法）你好"}},
+                {"l": {"i": ["ciao"], "#tran": "（意）你好；再见"}}
+            ]}]
+        }]}});
+        let entry = make_entry(&parse_response("你好", &fixture).unwrap(), &|| false).unwrap();
+        assert_eq!(entry.senses.len(), 1);
+        assert_eq!(entry.senses[0].definition, "hello");
+    }
+
+    #[test]
+    fn english_alternatives_do_not_require_chinese_glosses_and_merge_source_pos() {
+        let fixture = json!({"ce": {"word": [
+            {
+                "return-phrase": {"l": {"i": "爱"}},
+                "trs": [{"tr": [
+                    {"l": {"pos": "n.", "i": [{"#text": "love"}]}},
+                    {"l": {"pos": "vt.", "i": ["love"]}},
+                    {"l": {"pos": "n.", "i": ["LOVE"]}},
+                    {"l": {"pos": "n.", "i": ["affection"], "#tran": "感情；喜爱；影响；疾病；"}}
+                ]}]
+            },
+            {
+                "return-phrase": {"l": {"i": "可爱的"}},
+                "trs": [{"tr": [{"l": {"pos": "adj.", "i": ["lovely"], "#tran": "可爱的"}}]}]
+            }
+        ]}});
+        let parsed = parse_response("爱", &fixture).unwrap();
+        assert!(valid_cache(&parsed, "爱"));
+        let entry = make_entry(&parsed, &|| false).unwrap();
+        assert_eq!(entry.word, "爱");
+        assert_eq!(entry.direction, LookupDirection::ChineseToEnglish);
+        assert_eq!(entry.senses.len(), 2);
+        assert_eq!(entry.senses[0].definition, "love");
+        assert_eq!(entry.senses[0].part_of_speech, "n. / vt.");
+        assert_eq!(entry.senses[1].definition, "affection");
+        assert_eq!(entry.senses[1].part_of_speech, "n.");
+        assert_eq!(entry.parts_of_speech, ["n.", "vt."]);
+        assert!(parse_response("爱情", &fixture).is_none());
+    }
+
+    #[test]
+    fn existing_cache_glosses_do_not_turn_into_displayed_chinese_definitions() {
+        let cached: CachedEntry = serde_json::from_value(json!({
+            "version": 1,
+            "query": "蛇",
+            "senses": [
+                {"english": "snake", "explanation": "蛇；阴险的人；蛇形运动", "part_of_speech": "n."},
+                {"english": "serpent", "part_of_speech": "n."}
+            ]
+        })).unwrap();
+        assert!(valid_cache(&cached, "蛇"));
+        let entry = make_entry(&cached, &|| false).unwrap();
+        assert_eq!(
+            entry
+                .senses
+                .iter()
+                .map(|sense| sense.definition.as_str())
+                .collect::<Vec<_>>(),
+            ["snake", "serpent"]
+        );
+        assert!(
+            entry
+                .senses
+                .iter()
+                .all(|sense| sense.part_of_speech == "n.")
+        );
+    }
+
+    #[test]
     fn cache_checks_query_sense_count_and_display_fields() {
         let mut cached = parse_response("你好", &greeting_fixture()).unwrap();
         assert!(!valid_cache(&cached, "您好"));
@@ -597,7 +695,9 @@ mod tests {
     fn live_network_dictionary_returns_real_greetings_and_sad_and_reuses_temporary_cache() {
         for (query, expected) in [
             ("你好", &["hello", "hi", "how do you do"][..]),
-            ("伤心", &["sad"][..]),
+            ("伤心", &["sad", "heart-broken", "grieved"][..]),
+            ("蛇", &["snake", "serpent"][..]),
+            ("银行", &["bank", "banking house"][..]),
         ] {
             let fetched = fetch_entry(query, &|| false).expect(query);
             for english in expected {
@@ -619,6 +719,21 @@ mod tests {
             assert_eq!(entry.word, query);
             assert_eq!(entry.direction, LookupDirection::ChineseToEnglish);
             assert_eq!(entry.senses.len(), fetched.senses.len());
+            assert!(
+                entry.senses.iter().all(|sense| !matches!(
+                    sense.definition.as_str(),
+                    "Bonjour" | "bonjour" | "ciao"
+                ))
+            );
+            println!(
+                "{query}: {}",
+                entry
+                    .senses
+                    .iter()
+                    .map(|sense| format!("{} {}", sense.part_of_speech, sense.definition))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
             fs::remove_file(path).unwrap();
         }
     }

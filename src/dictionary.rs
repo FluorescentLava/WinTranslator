@@ -24,6 +24,8 @@ pub struct Entry {
 #[derive(Clone, Debug)]
 pub struct Sense {
     pub part_of_speech: String,
+    // Chinese lookups store the English candidate itself here. Source Chinese
+    // glosses belong to dictionary matching, not to the list of translations.
     pub definition: String,
 }
 
@@ -41,7 +43,7 @@ struct Dictionary {
 struct ReverseMatch {
     row: Range<usize>,
     sense: usize,
-    rank: (bool, u8, bool, u32),
+    rank: (u8, bool, u32),
 }
 static DICTIONARY: OnceLock<Option<Dictionary>> = OnceLock::new();
 
@@ -91,6 +93,138 @@ pub fn lookup_chinese(word: &str) -> Option<Entry> {
     reverse_entry(dictionary, key)
 }
 
+/// Resolve a candidate's POS from the matching Chinese sense. A polysemous
+/// English word must not borrow the first POS of an unrelated meaning.
+pub(crate) fn chinese_candidate_parts_of_speech(english: &str, chinese: &str) -> Vec<String> {
+    let Some(dictionary) = dictionary() else {
+        return Vec::new();
+    };
+    candidate_parts_of_speech(dictionary, english, chinese)
+}
+
+pub(crate) fn foreign_candidate(english: &str) -> bool {
+    let Some(dictionary) = dictionary() else {
+        return false;
+    };
+    let Some(fields) = normalize(english)
+        .and_then(|word| dictionary.rows.get(&word))
+        .and_then(|row| csv_fields(&dictionary.csv[row.clone()]))
+    else {
+        return false;
+    };
+    let mut source = Entry {
+        word: english.to_owned(),
+        direction: LookupDirection::EnglishToChinese,
+        phonetic: String::new(),
+        parts_of_speech: Vec::new(),
+        senses: Vec::new(),
+    };
+    append_senses(
+        &mut source,
+        fields
+            .get(dictionary.translation)
+            .map_or("", String::as_str),
+    );
+    !source.senses.is_empty()
+        && source
+            .senses
+            .iter()
+            .all(|sense| foreign_language_gloss(&sense.definition))
+}
+
+fn candidate_parts_of_speech(dictionary: &Dictionary, english: &str, chinese: &str) -> Vec<String> {
+    let Some(key) = chinese_key(chinese) else {
+        return Vec::new();
+    };
+    let Some(fields) = normalize(english)
+        .and_then(|word| dictionary.rows.get(&word))
+        .and_then(|row| csv_fields(&dictionary.csv[row.clone()]))
+    else {
+        return Vec::new();
+    };
+    let mut source = Entry {
+        word: english.to_owned(),
+        direction: LookupDirection::EnglishToChinese,
+        phonetic: String::new(),
+        parts_of_speech: Vec::new(),
+        senses: Vec::new(),
+    };
+    append_senses(
+        &mut source,
+        fields
+            .get(dictionary.translation)
+            .map_or("", String::as_str),
+    );
+    let mut parts = Vec::new();
+    for sense in &source.senses {
+        if sense.part_of_speech.is_empty() || foreign_language_gloss(&sense.definition) {
+            continue;
+        }
+        let matched = sense
+            .definition
+            .split([',', '，', ';', '；', '、', '\n'])
+            .any(|part| {
+                let Some(candidate) = chinese_key(strip_annotation(part)) else {
+                    return false;
+                };
+                candidate == key
+                    || (sense.part_of_speech == "adj." && candidate.strip_suffix('的') == Some(key))
+            });
+        if matched {
+            push_unique(&mut parts, &sense.part_of_speech);
+        }
+    }
+    if parts.is_empty()
+        && source.parts_of_speech.len() == 1
+        && source
+            .senses
+            .iter()
+            .any(|sense| !foreign_language_gloss(&sense.definition))
+    {
+        // A single annotated translation POS is unambiguous even if the local
+        // dictionary uses another Chinese synonym for this same candidate.
+        source.parts_of_speech
+    } else {
+        parts
+    }
+}
+
+pub(crate) fn append_chinese_candidate(entry: &mut Entry, english: &str, parts: &[String]) {
+    for part in parts {
+        push_unique(&mut entry.parts_of_speech, part);
+    }
+    if let Some(sense) = entry
+        .senses
+        .iter_mut()
+        .find(|sense| sense.definition.eq_ignore_ascii_case(english))
+    {
+        let mut combined = if sense.part_of_speech == "—" {
+            Vec::new()
+        } else {
+            sense
+                .part_of_speech
+                .split(" / ")
+                .map(str::to_owned)
+                .collect()
+        };
+        for part in parts {
+            push_unique(&mut combined, part);
+        }
+        if !combined.is_empty() {
+            sense.part_of_speech = combined.join(" / ");
+        }
+        return;
+    }
+    entry.senses.push(Sense {
+        part_of_speech: if parts.is_empty() {
+            "—".into()
+        } else {
+            parts.join(" / ")
+        },
+        definition: english.to_owned(),
+    });
+}
+
 fn reverse_entry(dictionary: &Dictionary, key: &str) -> Option<Entry> {
     let index = dictionary
         .reverse
@@ -108,7 +242,6 @@ fn reverse_entry(dictionary: &Dictionary, key: &str) -> Option<Entry> {
         parts_of_speech: Vec::new(),
         senses: Vec::new(),
     };
-    let mut seen = HashSet::new();
     for matched in matches {
         let Some(fields) = csv_fields(&dictionary.csv[matched.row.clone()]) else {
             continue;
@@ -132,22 +265,19 @@ fn reverse_entry(dictionary: &Dictionary, key: &str) -> Option<Entry> {
         let Some(sense) = source.senses.get(matched.sense) else {
             continue;
         };
-        if !seen.insert((english.to_ascii_lowercase(), sense.part_of_speech.clone())) {
-            continue;
-        }
-        if !sense.part_of_speech.is_empty() {
-            push_unique(&mut entry.parts_of_speech, &sense.part_of_speech);
-        }
-        entry.senses.push(Sense {
-            part_of_speech: if sense.part_of_speech.is_empty() {
-                "—".into()
+        // Keep collecting POS for candidates already admitted at the limit.
+        if entry.senses.len() < 16
+            || entry
+                .senses
+                .iter()
+                .any(|sense| sense.definition.eq_ignore_ascii_case(english))
+        {
+            let parts = if sense.part_of_speech.is_empty() {
+                Vec::new()
             } else {
-                sense.part_of_speech.clone()
-            },
-            definition: format!("{english} · {}", sense.definition),
-        });
-        if entry.senses.len() == 16 {
-            break;
+                vec![sense.part_of_speech.clone()]
+            };
+            append_chinese_candidate(&mut entry, english, &parts);
         }
     }
     (!entry.senses.is_empty()).then_some(entry)
@@ -262,27 +392,21 @@ impl Dictionary {
                 fields.get(self.translation).map_or("", String::as_str),
             );
             for (sense_index, sense) in entry.senses.iter().enumerate() {
-                let adjective = sense.part_of_speech == "adj.";
+                if foreign_language_gloss(&sense.definition) {
+                    continue;
+                }
                 let mut seen = HashSet::new();
                 for part in sense.definition.split([',', '，', ';', '；', '、', '\n']) {
                     let part = strip_annotation(part);
                     let Some(key) = chinese_key(part) else {
                         continue;
                     };
-                    for (key, alias) in std::iter::once((key, false)).chain(
-                        adjective
-                            .then(|| key.strip_suffix('的'))
-                            .flatten()
-                            .and_then(chinese_key)
-                            .map(|key| (key, true)),
-                    ) {
-                        if seen.insert(key) {
-                            index.entry(key.to_owned()).or_default().push(ReverseMatch {
-                                row: row.clone(),
-                                sense: sense_index,
-                                rank: (alias, rank.0, rank.1, rank.2),
-                            });
-                        }
+                    if seen.insert(key) {
+                        index.entry(key.to_owned()).or_default().push(ReverseMatch {
+                            row: row.clone(),
+                            sense: sense_index,
+                            rank,
+                        });
                     }
                 }
             }
@@ -310,13 +434,85 @@ fn chinese_key(word: &str) -> Option<&str> {
     .then_some(word)
 }
 
-fn strip_annotation(mut value: &str) -> &str {
+/// A parenthesized language tag identifies a foreign-language expression, not
+/// an English translation. Square [法] is ECDICT's legal-domain label.
+pub(crate) fn foreign_language_gloss(mut value: &str) -> bool {
     value = value.trim();
-    while value.starts_with(['[', '【', '(', '（']) {
+    while let Some(opening) = value.chars().next() {
+        let closing = match opening {
+            '(' => ')',
+            '（' => '）',
+            '[' => ']',
+            '【' => '】',
+            '<' => '>',
+            '〈' => '〉',
+            _ => break,
+        };
+        let Some((label, rest)) = value[opening.len_utf8()..].split_once(closing) else {
+            break;
+        };
+        let language = |label: &str| {
+            matches!(
+                label.trim().to_ascii_lowercase().as_str(),
+                "法" | "法语"
+                    | "french"
+                    | "意"
+                    | "意大利"
+                    | "意大利语"
+                    | "italian"
+                    | "德"
+                    | "德语"
+                    | "german"
+                    | "西"
+                    | "西语"
+                    | "西班牙"
+                    | "西班牙语"
+                    | "spanish"
+                    | "日"
+                    | "日语"
+                    | "japanese"
+                    | "拉"
+                    | "拉丁"
+                    | "拉丁语"
+                    | "latin"
+                    | "俄"
+                    | "俄语"
+                    | "russian"
+                    | "葡"
+                    | "葡语"
+                    | "葡萄牙语"
+                    | "portuguese"
+                    | "韩"
+                    | "韩语"
+                    | "朝鲜语"
+                    | "korean"
+                    | "阿拉伯"
+                    | "阿拉伯语"
+                    | "arabic"
+                    | "梵"
+                    | "梵语"
+                    | "sanskrit"
+            )
+        };
+        if !(matches!(opening, '[' | '【') && label.chars().count() == 1)
+            && label.split(['、', ',', '，', '/']).all(language)
+        {
+            return true;
+        }
+        value = rest.trim();
+    }
+    false
+}
+
+pub(crate) fn strip_annotation(mut value: &str) -> &str {
+    value = value.trim();
+    while value.starts_with(['[', '【', '(', '（', '<', '〈']) {
         let closing = match value.chars().next() {
             Some('[') => ']',
             Some('【') => '】',
             Some('(') => ')',
+            Some('<') => '>',
+            Some('〈') => '〉',
             _ => '）',
         };
         let Some((_, rest)) = value.split_once(closing) else {
@@ -532,8 +728,8 @@ mod tests {
         let snake = reverse_entry(&dictionary, "蛇").unwrap();
         assert_eq!(snake.direction, LookupDirection::ChineseToEnglish);
         assert_eq!(snake.senses.len(), 2);
-        assert!(snake.senses[0].definition.starts_with("snake ·"));
-        assert!(snake.senses[1].definition.starts_with("serpent ·"));
+        assert_eq!(snake.senses[0].definition, "snake");
+        assert_eq!(snake.senses[1].definition, "serpent");
         assert_eq!(snake.parts_of_speech, ["n."]);
         assert!(
             snake
@@ -541,26 +737,124 @@ mod tests {
                 .iter()
                 .all(|sense| sense.part_of_speech == "n.")
         );
-        let sad = reverse_entry(&dictionary, "伤心").unwrap();
+        let sad = reverse_entry(&dictionary, "伤心的").unwrap();
         assert_eq!(sad.senses[0].part_of_speech, "adj.");
-        assert!(sad.senses[0].definition.starts_with("sad ·"));
+        assert_eq!(sad.senses[0].definition, "sad");
+        assert!(reverse_entry(&dictionary, "伤心").is_none());
         let hello = reverse_entry(&dictionary, "你好").unwrap();
         assert_eq!(hello.senses.len(), 2);
         assert!(
             hello
                 .senses
                 .iter()
-                .any(|sense| sense.definition.starts_with("how are you ·"))
+                .any(|sense| sense.definition == "how are you")
         );
-        assert!(
-            reverse_entry(&dictionary, "银行").unwrap().senses[0]
-                .definition
-                .starts_with("bank ·")
+        assert_eq!(
+            reverse_entry(&dictionary, "银行").unwrap().senses[0].definition,
+            "bank"
         );
         assert!(reverse_entry(&dictionary, "我今天去公园").is_none());
         assert_eq!(chinese_key(" 你好！ "), Some("你好"));
         assert!(chinese_key("snake").is_none());
         assert!(chinese_key("这是一个很长的中文句子而不是一个词语").is_none());
+    }
+
+    #[test]
+    fn chinese_candidates_are_distinct_and_keep_only_matching_parts_of_speech() {
+        let dictionary = Dictionary::from_csv(
+            concat!(
+                "word,phonetic,definition,translation,pos,collins,oxford,bnc,frq\n",
+                "light,,,n. 光\\na. 轻的；明亮的\\nvt. 点燃,,3,1,500,500\n",
+                "love,,,n. 爱\\nvt. 爱,,4,1,100,100\n",
+                "affection,,,n. 爱；感情,,3,1,1000,1000\n",
+                "lovely,,,a. 可爱的,,3,1,1000,1000\n",
+                "hello,,n. a greeting,interj. 喂,,3,1,1000,1000\n",
+            )
+            .into(),
+        )
+        .unwrap();
+        let love = reverse_entry(&dictionary, "爱").unwrap();
+        assert_eq!(love.senses.len(), 2);
+        assert_eq!(love.senses[0].definition, "love");
+        assert_eq!(love.senses[0].part_of_speech, "n. / vt.");
+        assert_eq!(love.senses[1].definition, "affection");
+        assert_eq!(love.senses[1].part_of_speech, "n.");
+        assert_eq!(
+            candidate_parts_of_speech(&dictionary, "light", "明亮"),
+            ["adj."]
+        );
+        assert_eq!(
+            candidate_parts_of_speech(&dictionary, "light", "光"),
+            ["n."]
+        );
+        assert!(candidate_parts_of_speech(&dictionary, "light", "轻松").is_empty());
+        assert_eq!(
+            candidate_parts_of_speech(&dictionary, "hello", "你好"),
+            ["interj."]
+        );
+        assert!(reverse_entry(&dictionary, "光线").is_none());
+        assert!(reverse_entry(&dictionary, "我想向你表达爱").is_none());
+    }
+
+    #[test]
+    fn reverse_candidates_exclude_foreign_labels_and_do_not_shorten_chinese_glosses() {
+        let dictionary = Dictionary::from_csv(
+            concat!(
+                "word,phonetic,definition,translation,pos,collins,oxford,bnc,frq\n",
+                "hello,,,interj. 你好,,4,1,500,500\n",
+                "hi,,,interj. 你好,,4,1,600,600\n",
+                "Bonjour,,,n. （法）你好；问候,,0,0,40000,0\n",
+                "ciao,,,int. （意）你好；再见,,0,0,34000,0\n",
+                "snake,,,n. 蛇,,3,1,2000,2000\n",
+                "serpentine,,,a. 蛇的,,0,0,24000,24000\n",
+                "clause,,,n. [法] 条款,,3,1,4000,4000\n",
+                "ballet,,,n. 芭蕾舞,,2,0,4400,4400\n",
+            )
+            .into(),
+        )
+        .unwrap();
+        let greetings = reverse_entry(&dictionary, "你好").unwrap();
+        assert_eq!(
+            greetings
+                .senses
+                .iter()
+                .map(|sense| sense.definition.as_str())
+                .collect::<Vec<_>>(),
+            ["hello", "hi"]
+        );
+        assert!(reverse_entry(&dictionary, "再见").is_none());
+        let snake = reverse_entry(&dictionary, "蛇").unwrap();
+        assert_eq!(snake.senses.len(), 1);
+        assert_eq!(snake.senses[0].definition, "snake");
+        assert_eq!(
+            reverse_entry(&dictionary, "蛇的").unwrap().senses[0].definition,
+            "serpentine"
+        );
+        assert_eq!(
+            reverse_entry(&dictionary, "条款").unwrap().senses[0].definition,
+            "clause"
+        );
+        assert_eq!(
+            reverse_entry(&dictionary, "芭蕾舞").unwrap().senses[0].definition,
+            "ballet"
+        );
+        for annotated in [
+            "（法）你好",
+            "(Italian) hello",
+            "<日> 再见",
+            "[法语] 你好",
+            "（法、意）问候",
+        ] {
+            assert!(foreign_language_gloss(annotated), "{annotated}");
+        }
+        for ordinary in [
+            "[法] 条款",
+            "（英）你好",
+            "n. a French dance",
+            "（口语）你好",
+        ] {
+            assert!(!foreign_language_gloss(ordinary), "{ordinary}");
+        }
     }
 
     #[test]
@@ -575,12 +869,19 @@ mod tests {
         ] {
             let entry = lookup_chinese(query).expect(query);
             assert_eq!(entry.direction, LookupDirection::ChineseToEnglish);
-            assert!(entry.senses.len() > 1, "{query} needs alternatives");
+            assert!(
+                !entry.senses.is_empty(),
+                "{query} needs a dictionary candidate"
+            );
+            assert!(entry.senses.iter().all(|sense| !matches!(
+                sense.definition.as_str(),
+                "Bonjour" | "ciao" | "serpentine" | "snaky"
+            )));
             assert!(
                 entry
                     .senses
                     .iter()
-                    .any(|sense| sense.definition.split(" · ").next() == Some(expected)),
+                    .any(|sense| sense.definition == expected),
                 "{query} is missing {expected}"
             );
             assert!(

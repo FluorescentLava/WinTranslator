@@ -29928,3 +29928,13 @@ impl windows_core::RuntimeType for XmlnsDefinition {
         b"struct(Microsoft.UI.Xaml.Markup.XmlnsDefinition;string;string)",
     );
 }
+
+impl<TSender: windows_core::RuntimeType + 'static, TResult: windows_core::RuntimeType + 'static>
+    TypedEventHandler<TSender, TResult>
+{
+    pub(crate) fn new<F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static>(handler: F) -> Self {
+        let com = windows_core::imp::DelegateBox::<Self, F>::new(
+            &TypedEventHandlerBox::<TSender, TResult, F>::VTABLE, handler);
+        unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+    }
+}

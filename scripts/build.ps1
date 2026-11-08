@@ -9,11 +9,11 @@ try {
     & cargo @arguments
     if ($LASTEXITCODE -ne 0) { throw 'Cargo build failed.' }
     $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $project 'target' }
-    Copy-Item -LiteralPath (Join-Path $target 'release\translator.exe') -Destination (Join-Path $project '翻译.exe') -Force
+    Copy-Item -LiteralPath (Join-Path $target 'release\translator.exe') -Destination (Join-Path $project 'WinTranslater.exe') -Force
     if ($SelfContained) {
         # Setup stages the complete Windows App SDK runtime next to the release binary.
         Get-ChildItem -LiteralPath (Join-Path $target 'release') | Where-Object { $_.Extension -in @('.dll','.pri','.manifest') -or $_.Name -match '^[a-z]{2}(-[A-Za-z]+)?$' } |
             Copy-Item -Destination $project -Recurse -Force
     }
-    Write-Host "Ready: $project\翻译.exe"
+    Write-Host "Ready: $project\WinTranslater.exe"
 } finally { Pop-Location }

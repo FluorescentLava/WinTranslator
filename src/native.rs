@@ -90,11 +90,16 @@ const TRAY_MESSAGE: u32 = 0x8000 + 42;
 const SHOW_MESSAGE: u32 = 0x8000 + 43;
 const REFRESH_MESSAGE: u32 = 0x8000 + 44;
 const RESIZE_TIMER: usize = 0x5452_535a;
+const FOCUS_TIMER: usize = 0x5446_4353;
+const FOCUS_DELAY_MS: u32 = 60;
 const RESIZE_DURATION_MS: f64 = 200.0;
 // A 16 ms USER timer can be rounded up to two default clock ticks. Request
 // the supported minimum and use elapsed time, rather than timer counts, below.
 const RESIZE_INTERVAL_MS: u32 = 10;
 const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
+const APP_NAME: &str = "WinTranslater";
+const SETTINGS_TITLE: &str = "WinTranslater 设置";
+const APP_ICON_ID: usize = 1;
 #[derive(Clone, Copy)]
 struct ResizeAnimation {
     window: Hwnd,
@@ -106,6 +111,47 @@ struct ResizeAnimation {
     dpi: u32,
     revision: u64,
     transition_key: u64,
+}
+#[derive(Clone, Copy, Default)]
+struct PopupPresentation {
+    revision: u64,
+    show_requested: bool,
+    hide_revision: Option<u64>,
+}
+impl PopupPresentation {
+    fn show(&mut self) -> u64 {
+        self.revision = self.revision.wrapping_add(1);
+        self.show_requested = true;
+        self.hide_revision = None;
+        self.revision
+    }
+    fn hide(&mut self, animate: bool) -> Option<u64> {
+        if self.hide_revision.is_some() {
+            return None;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.show_requested = false;
+        self.hide_revision = animate.then_some(self.revision);
+        self.hide_revision
+    }
+    fn show_is_current(self, revision: u64) -> bool {
+        self.show_requested && self.revision == revision && self.hide_revision.is_none()
+    }
+    fn hide_is_current(self, revision: u64) -> bool {
+        !self.show_requested && self.hide_revision == Some(revision) && self.revision == revision
+    }
+    fn complete_hide(&mut self, revision: u64) -> bool {
+        if !self.hide_is_current(revision) {
+            return false;
+        }
+        self.hide_revision = None;
+        true
+    }
+    fn hidden(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.show_requested = false;
+        self.hide_revision = None;
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PopupFrame {
@@ -129,7 +175,8 @@ struct PendingPopupFrame {
 #[derive(Clone, Copy)]
 pub enum Action {
     Show,
-    PopupActivated,
+    PopupActivated(u64),
+    PopupDismissed(u64),
     TranslateSelection,
     Settings,
     Quit,
@@ -159,7 +206,13 @@ thread_local! {
     static DEFER_EXTERNAL_GEOMETRY: Cell<bool> = const { Cell::new(false) };
     static SHOW_AFTER_FRAME: Cell<bool> = const { Cell::new(false) };
     static POPUP_PRESENTED: Cell<bool> = const { Cell::new(false) };
+    static PRESENTATION: Cell<PopupPresentation> = const { Cell::new(PopupPresentation {
+        revision: 0,
+        show_requested: false,
+        hide_revision: None,
+    }) };
     static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
+    static FOCUS_RECHECKS: Cell<u8> = const { Cell::new(0) };
 }
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -292,6 +345,23 @@ unsafe extern "system" {
 }
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+fn app_icon() -> Hwnd {
+    unsafe {
+        LoadIconW(
+            GetModuleHandleW(std::ptr::null()),
+            APP_ICON_ID as *const u16,
+        )
+    }
+}
+fn set_window_icon(window: Hwnd) {
+    let icon = app_icon();
+    if !icon.is_null() {
+        unsafe {
+            SendMessageW(window, 0x0080, 0, icon as isize); // WM_SETICON / ICON_SMALL
+            SendMessageW(window, 0x0080, 1, icon as isize); // WM_SETICON / ICON_BIG
+        }
+    }
 }
 fn emit(action: Action) {
     ACTION.with(|f| {
@@ -429,6 +499,74 @@ fn target_rectangle(window: Hwnd) -> Rect {
         right: x + width,
         bottom: y + height,
     }
+}
+
+fn update_presentation<T>(update: impl FnOnce(&mut PopupPresentation) -> T) -> T {
+    PRESENTATION.with(|value| {
+        let mut presentation = value.get();
+        let result = update(&mut presentation);
+        value.set(presentation);
+        result
+    })
+}
+fn foreground_belongs_to_app(foreground: Hwnd, popup: Hwnd) -> bool {
+    if foreground.is_null() || popup.is_null() {
+        return false;
+    }
+    if foreground == popup || unsafe { GetAncestor(foreground, 3) } == popup {
+        return true;
+    }
+    let (mut foreground_process, mut popup_process) = (0, 0);
+    unsafe {
+        GetWindowThreadProcessId(foreground, &mut foreground_process);
+        GetWindowThreadProcessId(popup, &mut popup_process);
+    }
+    foreground_process != 0 && foreground_process == popup_process
+}
+fn cancel_focus_check(window: Hwnd) {
+    unsafe {
+        KillTimer(window, FOCUS_TIMER);
+    }
+    FOCUS_RECHECKS.with(|value| value.set(0));
+}
+fn schedule_focus_check() {
+    let popup = POPUP.with(Cell::get);
+    if !popup.is_null()
+        && INITIALIZED.with(Cell::get)
+        && POPUP_PRESENTED.with(Cell::get)
+        && unsafe { IsWindowVisible(popup) } != 0
+    {
+        FOCUS_RECHECKS.with(|value| value.set(0));
+        unsafe {
+            SetTimer(popup, FOCUS_TIMER, FOCUS_DELAY_MS, None);
+        }
+    }
+}
+fn focus_check_tick(window: Hwnd) {
+    unsafe {
+        KillTimer(window, FOCUS_TIMER);
+    }
+    if SHOW_AFTER_FRAME.with(Cell::get)
+        || !POPUP_PRESENTED.with(Cell::get)
+        || !PRESENTATION.with(Cell::get).show_requested
+        || unsafe { IsWindowVisible(window) } == 0
+    {
+        return;
+    }
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground_belongs_to_app(foreground, window) {
+        return;
+    }
+    // XAML can briefly have no foreground HWND while opening or closing a
+    // native Flyout. Recheck after that transient focus handoff has settled.
+    if foreground.is_null() && FOCUS_RECHECKS.with(Cell::get) < 2 {
+        FOCUS_RECHECKS.with(|value| value.set(value.get() + 1));
+        unsafe {
+            SetTimer(window, FOCUS_TIMER, FOCUS_DELAY_MS, None);
+        }
+        return;
+    }
+    hide_popup();
 }
 
 /// Installs the popup's single animation-frame consumer on its UI thread.
@@ -575,6 +713,11 @@ fn resize_tick(window: Hwnd) {
     );
 }
 fn resize_popup(window: Hwnd, first: bool) {
+    // Keep the committed viewport steady while its WinUI visual slides out.
+    // SIZE still records newer results, and reopening consumes that target.
+    if PRESENTATION.with(Cell::get).hide_revision.is_some() {
+        return;
+    }
     let target = target_rectangle(window);
     let mut current = Rect {
         left: 0,
@@ -704,6 +847,10 @@ unsafe extern "system" fn popup_proc(
         resize_tick(window);
         return 0;
     }
+    if message == 0x0113 && wparam == FOCUS_TIMER {
+        focus_check_tick(window);
+        return 0;
+    }
     if message == 0x0231 {
         MANUAL_MOVE.with(|value| value.set(true));
         stop_resize(window);
@@ -714,6 +861,9 @@ unsafe extern "system" fn popup_proc(
     if (message == 0x0018 && wparam == 0) || message == 0x0082 {
         SHOW_AFTER_FRAME.with(|value| value.set(false));
         stop_resize(window);
+        cancel_focus_check(window);
+        POPUP_PRESENTED.with(|value| value.set(false));
+        update_presentation(PopupPresentation::hidden);
     }
     if message == 0x0046 {
         let position = unsafe { &mut *(lparam as *mut WindowPos) };
@@ -787,14 +937,28 @@ fn attach_popup(window: Hwnd) {
 unsafe extern "system" fn call_hook(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 {
         let event = unsafe { &*(lparam as *const Cwp) };
+        // Observe our settings and native popup windows too: main-window blur
+        // alone misses settings -> another-app activation and internal flyouts.
+        if (event.message == 0x0006 && event.wparam & 0xffff == 0)
+            || (event.message == 0x001c && event.wparam == 0)
+            || event.message == 0x0008
+        {
+            schedule_focus_check();
+        }
         if event.message == 0x000c && event.lparam != 0 {
-            let expected = wide("翻译");
-            let matches = expected
-                .iter()
-                .enumerate()
-                .all(|(i, value)| unsafe { *((event.lparam as *const u16).add(i)) == *value });
-            if matches {
-                attach_popup(event.window);
+            for (name, popup) in [(APP_NAME, true), (SETTINGS_TITLE, false)] {
+                let expected = wide(name);
+                let matches = expected
+                    .iter()
+                    .enumerate()
+                    .all(|(i, value)| unsafe { *((event.lparam as *const u16).add(i)) == *value });
+                if matches {
+                    if popup {
+                        attach_popup(event.window);
+                    }
+                    set_window_icon(event.window);
+                    break;
+                }
             }
         }
         if matches!(event.message, 0x010d | 0x010e | 0x010f)
@@ -828,7 +992,7 @@ unsafe extern "system" fn key_hook(code: i32, wparam: usize, lparam: isize) -> i
         if message.message == 0x0100
             && message.wparam == 0x1b
             && !is_composing()
-            && let Some(popup) = window("翻译")
+            && let Some(popup) = window(APP_NAME)
             && unsafe { GetAncestor(message.window, 2) } == popup
         {
             message.message = 0;
@@ -848,8 +1012,12 @@ fn tray(window: Hwnd, operation: u32) -> bool {
     data.id = 1;
     data.flags = 1 | 2 | 4;
     data.callback = TRAY_MESSAGE;
-    data.icon = unsafe { LoadIconW(std::ptr::null_mut(), 32512_usize as *const u16) };
-    for (to, from) in data.tip.iter_mut().zip("翻译 · Ctrl+Tab".encode_utf16()) {
+    data.icon = app_icon();
+    for (to, from) in data
+        .tip
+        .iter_mut()
+        .zip("WinTranslater · Ctrl+Tab".encode_utf16())
+    {
         *to = from;
     }
     unsafe { Shell_NotifyIconW(operation, &data) != 0 }
@@ -982,7 +1150,7 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
         class_extra: 0,
         window_extra: 0,
         instance,
-        icon: std::ptr::null_mut(),
+        icon: app_icon(),
         cursor: std::ptr::null_mut(),
         background: std::ptr::null_mut(),
         menu_name: std::ptr::null(),
@@ -1023,7 +1191,7 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
     if unsafe { RegisterHotKey(session.sink, HOTKEY_ID, 0x0002 | 0x4000, 0x09) } == 0 {
         STARTUP_WARNING.with(|v| {
             *v.borrow_mut() = Some(format!(
-                "Ctrl+Tab 快捷键注册失败，可能已被其他程序占用。可从托盘打开翻译。{}",
+                "Ctrl+Tab 快捷键注册失败，可能已被其他程序占用。可从托盘打开 WinTranslater。{}",
                 std::io::Error::last_os_error()
             ))
         });
@@ -1057,7 +1225,7 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
         crate::storage::diagnostic(serde_json::json!({"event":"hotkey_registration_failed", "hotkey":"Ctrl+Tab", "message":warning}));
         let mut data: NotifyIcon = unsafe { std::mem::zeroed() }; data.size = std::mem::size_of::<NotifyIcon>() as u32; data.window = session.sink; data.id = 1; data.flags = 0x10; data.info_flags = 2;
         for (to, from) in data.info.iter_mut().take(255).zip(warning.encode_utf16()) { *to = from; }
-        for (to, from) in data.info_title.iter_mut().zip("翻译：快捷键不可用".encode_utf16()) { *to = from; }
+        for (to, from) in data.info_title.iter_mut().zip("WinTranslater：快捷键不可用".encode_utf16()) { *to = from; }
         unsafe { Shell_NotifyIconW(1, &data); }
     } });
     Ok(Some(session))
@@ -1123,9 +1291,10 @@ pub fn configure_popup_with_key(width: f64, height: f64, transition_key: u64) {
     }
     SIZE.with(|v| v.set((width, height)));
     TRANSITION_KEY.with(|value| value.set(transition_key));
-    if let Some(window) = window("翻译") {
+    if let Some(window) = window(APP_NAME) {
         unsafe {
             attach_popup(window);
+            set_window_icon(window);
             let style = GetWindowLongPtrW(window, -16);
             let popup_style =
                 (style & !(0x00C00000 | 0x00040000 | 0x00080000 | 0x00030000)) | 0x02000000;
@@ -1194,6 +1363,7 @@ fn activate_window(window: Hwnd) -> bool {
     if !prepare_activation(window) {
         return false;
     }
+    set_window_icon(window);
     unsafe {
         // Explicit visibility is independent of WinUI's initial Activate and
         // STARTUPINFO's initial show command. The desktop and final viewport
@@ -1224,11 +1394,29 @@ fn activate_popup(window: Hwnd) {
         "visible": unsafe { IsWindowVisible(window) } != 0,
         "foreground": activated,
     }));
-    if activated {
-        // WinUI must request TextBox focus after the HWND is visible and owns
-        // foreground, not while a hidden window is waiting for its final frame.
-        emit(Action::PopupActivated);
+    if POPUP_PRESENTED.with(Cell::get) {
+        // Reveal visible content even if Windows rejects foreground activation.
+        // The UI requests TextBox focus only after confirming foreground.
+        let presentation = PRESENTATION.with(Cell::get);
+        if presentation.show_requested {
+            emit(Action::PopupActivated(presentation.revision));
+        }
     }
+    if !activated {
+        schedule_focus_check();
+    }
+}
+
+/// A native Composition show request must still own this presentation when its
+/// UI message is consumed. A later hide/reopen makes an older request obsolete.
+pub fn popup_show_animation_is_current(revision: u64) -> bool {
+    PRESENTATION.with(Cell::get).show_is_current(revision)
+        && POPUP_PRESENTED.with(Cell::get)
+        && !POPUP.with(Cell::get).is_null()
+}
+
+pub fn popup_hide_animation_is_current(revision: u64) -> bool {
+    PRESENTATION.with(Cell::get).hide_is_current(revision)
 }
 
 pub fn popup_is_foreground() -> bool {
@@ -1240,11 +1428,19 @@ pub fn popup_is_foreground() -> bool {
 
 pub fn show_popup() {
     ANCHOR.with(|v| v.set(mouse_monitor()));
-    if let Some(window) = window("翻译") {
+    let reversing_hide = PRESENTATION.with(Cell::get).hide_revision.is_some();
+    // Invalidate old Completion callbacks before activating or publishing a new
+    // frame. A rapid hotkey can safely reverse a native Composition hide.
+    update_presentation(PopupPresentation::show);
+    if let Some(window) = window(APP_NAME) {
+        cancel_focus_check(window);
         if POPUP_PRESENTED.with(Cell::get)
             && unsafe { IsWindowVisible(window) } != 0
             && unsafe { MonitorFromWindow(window, 2) } == ANCHOR.with(Cell::get)
         {
+            if reversing_hide {
+                resize_popup(window, false);
+            }
             // Re-activating an already visible popup must not snap an active
             // expansion to its destination. Its pending UI frame remains valid.
             activate_popup(window);
@@ -1259,11 +1455,36 @@ pub fn show_popup() {
 }
 pub fn hide_popup() {
     SHOW_AFTER_FRAME.with(|value| value.set(false));
-    if let Some(window) = window("翻译") {
+    if let Some(window) = window(APP_NAME) {
+        cancel_focus_check(window);
+        stop_resize(window);
+        let visible = unsafe { IsWindowVisible(window) } != 0;
+        if let Some(revision) = update_presentation(|state| state.hide(visible)) {
+            // The UI starts a WinUI Composition visual animation; the HWND and
+            // its backdrop stay alive until that animation's completion arrives.
+            emit(Action::PopupDismissed(revision));
+        } else if !visible {
+            POPUP_PRESENTED.with(|value| value.set(false));
+        }
+    } else {
+        update_presentation(|state| state.hide(false));
+    }
+}
+
+/// Called on the UI thread by the native visual animation's completion callback.
+/// Only the matching hide request can remove the HWND; reopening cancels it.
+pub fn complete_popup_hide(revision: u64) {
+    if !update_presentation(|state| state.complete_hide(revision)) {
+        return;
+    }
+    SHOW_AFTER_FRAME.with(|value| value.set(false));
+    if let Some(window) = window(APP_NAME) {
+        cancel_focus_check(window);
         stop_resize(window);
         unsafe {
             ShowWindow(window, 0);
         }
+        POPUP_PRESENTED.with(|value| value.set(false));
     }
 }
 pub fn quit() {
@@ -1272,7 +1493,7 @@ pub fn quit() {
     }
 }
 pub fn drag_popup() {
-    if let Some(window) = window("翻译") {
+    if let Some(window) = window(APP_NAME) {
         stop_resize(window);
         unsafe {
             ReleaseCapture();
@@ -1281,7 +1502,7 @@ pub fn drag_popup() {
     }
 }
 pub fn activate_settings() -> bool {
-    if let Some(window) = window("翻译设置") {
+    if let Some(window) = window(SETTINGS_TITLE) {
         activate_window(window);
         true
     } else {
@@ -1494,4 +1715,48 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
         std::io::Error::from_raw_os_error(result)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn an_old_hide_completion_cannot_hide_a_reopened_popup() {
+        let mut state = PopupPresentation::default();
+        let first_show = state.show();
+        assert!(state.show_is_current(first_show));
+        let hide = state.hide(true).unwrap();
+        assert!(!state.show_is_current(first_show));
+        assert!(state.hide_is_current(hide));
+        let reopened = state.show();
+        assert!(!state.hide_is_current(hide));
+        assert!(!state.complete_hide(hide));
+        assert!(state.show_is_current(reopened));
+    }
+
+    #[test]
+    fn repeated_hides_share_one_animation_and_complete_once() {
+        let mut state = PopupPresentation::default();
+        state.show();
+        let hide = state.hide(true).unwrap();
+        assert_eq!(state.hide(true), None);
+        assert!(state.hide_is_current(hide));
+        assert!(state.complete_hide(hide));
+        assert!(!state.complete_hide(hide));
+        assert!(!state.show_requested);
+    }
+
+    #[test]
+    fn external_hiding_invalidates_queued_show_and_hide_callbacks() {
+        let mut state = PopupPresentation::default();
+        let show = state.show();
+        let hide = state.hide(true).unwrap();
+        state.hidden();
+        assert!(!state.show_is_current(show));
+        assert!(!state.hide_is_current(hide));
+        assert!(!state.complete_hide(hide));
+        assert_eq!(state.hide(false), None);
+        assert!(!state.show_requested);
+    }
 }

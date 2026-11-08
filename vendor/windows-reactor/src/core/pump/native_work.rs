@@ -40,6 +40,23 @@ impl<R: NativeRuntime> Pump<R> {
                 continue;
             }
             match queued.work {
+                ImperativeRequest::SlideY {
+                    node,
+                    revision,
+                    animation,
+                    completion,
+                } => {
+                    if self.tree.try_native(node).is_none() {
+                        _ = completion.call(Err(RuntimeError::MissingNode(node)));
+                        continue;
+                    }
+                    commands.push(Command::SlideY {
+                        node,
+                        revision,
+                        animation,
+                        completion,
+                    });
+                }
                 ImperativeRequest::Focus { node, completion } => {
                     if self.tree.try_native(node).is_none() {
                         _ = completion.call(Err(RuntimeError::MissingNode(node)));
@@ -231,6 +248,15 @@ impl<R: NativeRuntime> Pump<R> {
                 continue;
             }
             let callback_accepted = match &queued.work {
+                HostEvent::ElementSlideCompleted {
+                    node,
+                    completion,
+                    result,
+                } => completion.call(if self.tree.try_native(*node).is_some() {
+                    *result
+                } else {
+                    Err(RuntimeError::MissingNode(*node))
+                }),
                 HostEvent::FlyoutClosed { owner, revision } => {
                     let Some(callback) = self.tree.flyout_closed_callback(*owner, *revision) else {
                         continue;

@@ -31,6 +31,7 @@ mod app_shim;
 pub use app_shim::*;
 mod bootstrap;
 mod caret;
+mod slide;
 mod content_dialog;
 #[cfg(feature = "test")]
 pub(crate) use content_dialog::LiveContentDialogState;
@@ -151,6 +152,7 @@ pub struct WinUiRuntime {
     event_errors: Rc<RefCell<Vec<NativeWork<QueuedEventError>>>>,
     handles: HashMap<NodeId, Handle>,
     caret_overrides: HashMap<NodeId, caret::CaretState>,
+    slides: Rc<RefCell<HashMap<NodeId, slide::SlideState>>>,
     navigation_menu_layouts: HashMap<NodeId, navigation_layout::NavigationMenuLayout>,
     events: Rc<RefCell<Vec<NativeWork<QueuedEvent>>>>,
     host_events: Rc<RefCell<Vec<NativeWork<HostEvent>>>>,
@@ -1870,6 +1872,18 @@ impl WinUiRuntime {
             Command::RevokeObservation { node, observation } => {
                 self.observation_subscriptions
                     .remove(&(*node, *observation));
+            }
+            Command::SlideY { node, revision, animation, completion } => {
+                let sink = self.event_sink()?;
+                let result = self.ui_element(*node).and_then(|element| {
+                    slide::request(&self.slides, *node, *revision, &element, *animation,
+                        completion.clone(), sink.clone())
+                });
+                if let Err(error) = result {
+                    sink.enqueue_host(HostEvent::ElementSlideCompleted {
+                        node: *node, completion: completion.clone(), result: Err(error),
+                    });
+                }
             }
             Command::SetCompositionChildVisual {
                 node,
@@ -3793,6 +3807,7 @@ impl NativeRuntime for WinUiRuntime {
         self.window_title_revisions.borrow_mut().clear();
         self.window_visuals.clear();
         self.theme_styles.clear();
+        self.slides.borrow_mut().clear();
         self.handles.clear();
         self.virtuals.clear();
         self.application = None;
@@ -4182,6 +4197,9 @@ impl WinUiRuntime {
     }
 
     fn remove_node_state(&mut self, node: NodeId) -> Result<(), RuntimeError> {
+        if let Ok(sink) = self.event_sink() {
+            slide::cancel(&self.slides, node, Err(RuntimeError::MissingNode(node)), &sink);
+        }
         self.release_encoded_image_source(node);
         self.subscriptions
             .retain(|(subscription_node, _), _| *subscription_node != node);

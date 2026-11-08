@@ -20,6 +20,11 @@ fn main() {
         let _ = std::fs::write(dir.join("last-error.log"), info.to_string());
     }));
     let background = std::env::args().any(|arg| arg == "--background");
+    storage::diagnostic(serde_json::json!({
+        "event": "process_start",
+        "background": background,
+        "executable": std::env::current_exe().ok(),
+    }));
     if !background {
         desktop::remember_foreground();
     }
@@ -33,9 +38,14 @@ fn main() {
     };
     let mut initial_text = String::new();
     if background {
-        storage::diagnostic(
-            serde_json::json!({"event":"background_ready", "winui_started":false, "hotkey":"Ctrl+Tab"}),
-        );
+        let (settings, _, warning) = storage::load();
+        storage::diagnostic(serde_json::json!({
+            "event":"background_ready", "winui_started":false, "hotkey":"Ctrl+Tab",
+            "selected_provider":settings.provider, "configuration_warning":warning.is_some(),
+            "configured_providers":model::Provider::ALL.into_iter()
+                .filter(|provider| routing::has_credentials(&settings, *provider))
+                .collect::<Vec<_>>(),
+        }));
         std::thread::spawn(|| {
             dictionary::warm_up();
             offline::warm_up();
@@ -79,7 +89,7 @@ fn report_error(error: &str, background: bool) {
     .encode_utf16()
     .chain(Some(0))
     .collect();
-    let title: Vec<u16> = "翻译\0".encode_utf16().collect();
+    let title: Vec<u16> = "WinTranslater\0".encode_utf16().collect();
     #[link(name = "user32")]
     unsafe extern "system" {
         fn MessageBoxW(

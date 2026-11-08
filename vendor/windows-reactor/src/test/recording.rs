@@ -705,6 +705,15 @@ impl RecordingRuntime {
                     },
                 );
             }
+            Command::SlideY { node, animation, completion, .. } => {
+                self.nodes.get(node).ok_or(RuntimeError::MissingNode(*node))?;
+                self.host_events.push(NativeWork {
+                    identity: self.identity.unwrap(),
+                    work: HostEvent::ElementSlideCompleted {
+                        node: *node, completion: completion.clone(), result: Ok(animation.is_some()),
+                    },
+                });
+            }
             Command::Focus { node, completion } => {
                 self.nodes
                     .get(node)

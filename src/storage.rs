@@ -25,13 +25,23 @@ pub fn load() -> (Settings, Vec<Translation>, Option<String>) {
             warnings.push("设置文件无法读取，已使用默认设置");
             Settings::default()
         }),
-        Err(_) => Settings::default(),
-    };
-    if let Ok(data) = fs::read(dir.join("credentials.dpapi")) {
-        match unprotect(&data).and_then(|v| Ok(serde_json::from_slice(&v)?)) {
-            Ok(v) => settings.credentials = v,
-            Err(_) => warnings.push("无法解密 API 密钥，请在设置中重新填写"),
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warnings.push("设置文件读取失败，已使用默认设置");
+            }
+            Settings::default()
         }
+    };
+    match fs::read(dir.join("credentials.dpapi")) {
+        Ok(data) => match unprotect(&data) {
+            Ok(plaintext) => match serde_json::from_slice(&plaintext) {
+                Ok(credentials) => settings.credentials = credentials,
+                Err(_) => warnings.push("API 凭据文件格式有误，请检查本机配置"),
+            },
+            Err(_) => warnings.push("无法解密 API 凭据，请使用保存凭据时的 Windows 账户"),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => warnings.push("API 凭据文件读取失败，请检查文件访问权限"),
     }
     let history = fs::read(dir.join("history.json"))
         .ok()
@@ -62,6 +72,7 @@ pub fn diagnostic(mut value: serde_json::Value) {
         return;
     };
     value["time"] = chrono::Local::now().to_rfc3339().into();
+    value["process_id"] = std::process::id().into();
     let dir = data_dir();
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("translation-diagnostics.jsonl");
