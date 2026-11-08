@@ -515,6 +515,63 @@ impl WindowHost {
     pub fn animated_surface(&self) -> Option<&bindings::Grid> {
         self.card.as_ref().map(|card| &card.surface)
     }
+    pub fn prepare_slide(&self, window: &Window, entering: bool) -> Result<bool> {
+        let mut hwnd = std::ptr::null_mut();
+        unsafe {
+            window
+                .cast::<IWindowNative>()?
+                .WindowHandle(&mut hwnd)
+                .ok()?;
+        }
+        // Win32 foreground alone does not initialize WinUI's input site after
+        // the final frameless viewport has been committed. Re-enter WinUI's
+        // activation path only while this visible window still owns foreground.
+        // Its XamlRoot input-activation event drives the built-in Mica policy.
+        let activate = entering
+            && unsafe { IsWindowVisible(hwnd) } != 0
+            && unsafe { GetForegroundWindow() } == hwnd;
+        if activate {
+            window.Activate()?;
+        }
+        let element = self.host.cast::<IUIElement>()?;
+        unsafe {
+            native_method::<unsafe extern "system" fn(Raw) -> HRESULT>(&element, 214)(
+                element.as_raw(),
+            )
+            .ok()?;
+        }
+        Ok(activate)
+    }
+    pub fn slide_layout(&self, window: &Window) -> Result<Option<slide::LayoutGate>> {
+        let Some(card) = &self.card else {
+            return Ok(None);
+        };
+        let mut hwnd = std::ptr::null_mut();
+        unsafe {
+            window
+                .cast::<IWindowNative>()?
+                .WindowHandle(&mut hwnd)
+                .ok()?;
+        }
+        let mut client: Rect = unsafe { std::mem::zeroed() };
+        if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
+            return Err(Error::from_thread());
+        }
+        let scale = f64::from(unsafe { GetDpiForWindow(hwnd) }.max(96)) / 96.0;
+        let children = card.content.cast::<IPanel>()?.Children()?;
+        let card_root = if children.Size()? > 0 {
+            Some(children.GetAt(0)?.cast::<FrameworkElement>()?)
+        } else {
+            None
+        };
+        Ok(Some(slide::LayoutGate {
+            host: self.host.cast::<FrameworkElement>()?,
+            content: card.content.cast::<FrameworkElement>()?,
+            host_width: f64::from(client.right - client.left) / scale,
+            host_height: f64::from(client.bottom - client.top) / scale,
+            card_root,
+        }))
+    }
     #[cfg(feature = "test")]
     pub fn lifecycle_counts(&self) -> Option<(u32, u32)> {
         self.card.as_ref().map(|card| {
@@ -560,6 +617,11 @@ impl WindowHost {
             r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="Transparent" CornerRadius="{ThemeResource OverlayCornerRadius}" Translation="0,0,32"><Border.Shadow><ThemeShadow/></Border.Shadow></Border>"#,
         )?.cast::<bindings::Border>()?;
         set_card_inset(&caster, inset)?;
+        // The native host has a stable maximum height. The app root supplies
+        // the current card height, and this caster grows upward from its bottom.
+        caster
+            .cast::<FrameworkElement>()?
+            .SetVerticalAlignment(bindings::VerticalAlignment::Bottom)?;
         let corners = overlay_corners(&caster)?;
         let shadow =
             native_object(&caster.cast::<IUIElement>()?, 105)?.cast::<CardThemeShadow>()?;
@@ -716,6 +778,8 @@ windows_core::link!("gdi32.dll" "system" fn CreateRectRgn(left: i32, top: i32, r
 windows_core::link!("gdi32.dll" "system" fn DeleteObject(object: Raw) -> i32);
 windows_core::link!("gdi32.dll" "system" fn GetStockObject(index: i32) -> Raw);
 windows_core::link!("user32.dll" "system" fn GetClientRect(hwnd: Raw, rect: *mut Rect) -> i32);
+windows_core::link!("user32.dll" "system" fn IsWindowVisible(hwnd: Raw) -> i32);
+windows_core::link!("user32.dll" "system" fn GetForegroundWindow() -> Raw);
 windows_core::link!("user32.dll" "system" fn FillRect(dc: Raw, rect: *const Rect, brush: Raw) -> i32);
 windows_core::link!("user32.dll" "system" fn GetDC(hwnd: Raw) -> Raw);
 windows_core::link!("user32.dll" "system" fn ReleaseDC(hwnd: Raw, dc: Raw) -> i32);

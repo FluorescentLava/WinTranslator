@@ -12,6 +12,9 @@ pub(super) fn set(
     if let (PropertyId::Opacity, PropertyValue::F64(value)) = (property, value) {
         return element.SetOpacity(*value).map_err(native_error);
     }
+    if let (PropertyId::IsHitTestVisible, PropertyValue::Bool(value)) = (property, value) {
+        return element.SetIsHitTestVisible(*value).map_err(native_error);
+    }
 
     let element = element.cast::<FrameworkElement>().map_err(native_error)?;
     match (property, value) {
@@ -70,6 +73,7 @@ pub(super) fn clear(element: &UIElement, property: PropertyId) -> Result<(), Run
         PropertyId::MinHeight => FrameworkElement::MinHeightProperty(),
         PropertyId::MaxHeight => FrameworkElement::MaxHeightProperty(),
         PropertyId::Opacity => UIElement::OpacityProperty(),
+        PropertyId::IsHitTestVisible => UIElement::IsHitTestVisibleProperty(),
         PropertyId::HorizontalAlignment => FrameworkElement::HorizontalAlignmentProperty(),
         PropertyId::VerticalAlignment => FrameworkElement::VerticalAlignmentProperty(),
         PropertyId::Margin => FrameworkElement::MarginProperty(),

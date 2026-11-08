@@ -1961,6 +1961,7 @@ pub(crate) struct ElementState {
     min_height: Property<f64>,
     max_height: Property<f64>,
     opacity: Property<f64>,
+    is_hit_test_visible: Property<bool>,
     horizontal_alignment: Property<HorizontalAlignment>,
     vertical_alignment: Property<VerticalAlignment>,
     margin: Property<Thickness>,
@@ -2276,7 +2277,7 @@ impl KeyAccelerators {
     }
 }
 
-/// Applies layout, opacity, margin, and exit-transition properties to native controls.
+/// Applies layout, opacity, hit testing, margin, and exit-transition properties to native controls.
 ///
 /// Dimensions, margins, and Canvas positions use device-independent pixels (DIPs). Passing
 /// `None` to an optional property leaves it inherited or unset.
@@ -2398,6 +2399,22 @@ pub trait LayoutControl: sealed::LayoutControl {
                 .get_or_insert_with(|| Rc::new(ElementState::default())),
         )
         .opacity = Property::from(value);
+        self
+    }
+
+    /// Controls pointer hit testing for this element and its descendants.
+    ///
+    /// Passing `None` clears the local value and restores the native default (`true`).
+    /// A child cannot receive pointer input while an ancestor has hit testing disabled.
+    fn is_hit_test_visible(mut self, value: impl Into<Option<bool>>) -> Self
+    where
+        Self: Sized,
+    {
+        Rc::make_mut(
+            sealed::LayoutControl::element_state_mut(&mut self)
+                .get_or_insert_with(|| Rc::new(ElementState::default())),
+        )
+        .is_hit_test_visible = Property::from(value.into());
         self
     }
 
@@ -2784,6 +2801,13 @@ pub(crate) fn visit_element_state(
             .and_then(|value| value.opacity.as_set())
             .copied()
             .map(PropertyValueRef::F64),
+    );
+    visit(
+        PropertyId::IsHitTestVisible,
+        placement
+            .and_then(|value| value.is_hit_test_visible.as_set())
+            .copied()
+            .map(PropertyValueRef::Bool),
     );
     visit(
         PropertyId::HorizontalAlignment,

@@ -19262,6 +19262,15 @@ impl windows_core::RuntimeType for IUIElement {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IUIElement {
+    pub(crate) fn SetIsHitTestVisible(&self, value: bool) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetIsHitTestVisible)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn IsHitTestVisible(&self) -> windows_core::Result<bool> {
         unsafe {
             let mut value = false;
@@ -19840,7 +19849,8 @@ pub struct IUIElement_Vtbl {
     SetRenderTransformOrigin: usize,
     pub IsHitTestVisible:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
-    SetIsHitTestVisible: usize,
+    pub SetIsHitTestVisible:
+        unsafe extern "system" fn(*mut core::ffi::c_void, bool) -> windows_core::HRESULT,
     Visibility: usize,
     SetVisibility: usize,
     RenderSize: usize,
@@ -20219,6 +20229,15 @@ pub struct IUIElementStatics_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
     pub OpacityProperty: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    ClipProperty: usize,
+    RenderTransformProperty: usize,
+    ProjectionProperty: usize,
+    Transform3DProperty: usize,
+    RenderTransformOriginProperty: usize,
+    pub IsHitTestVisibleProperty: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
@@ -28934,6 +28953,16 @@ windows_core::imp::interface_hierarchy!(
 );
 windows_core::imp::required_hierarchy!(UIElement, DependencyObject);
 impl UIElement {
+    pub(crate) fn IsHitTestVisibleProperty() -> windows_core::Result<DependencyProperty> {
+        Self::IUIElementStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).IsHitTestVisibleProperty)(
+                windows_core::Interface::as_raw(this),
+                &mut result__,
+            )
+            .and_then(|| windows_core::imp::Type::from_abi(result__))
+        })
+    }
     pub(crate) fn AllowDropProperty() -> windows_core::Result<DependencyProperty> {
         Self::IUIElementStatics(|this| unsafe {
             let mut result__ = core::mem::zeroed();
@@ -29932,9 +29961,13 @@ impl windows_core::RuntimeType for XmlnsDefinition {
 impl<TSender: windows_core::RuntimeType + 'static, TResult: windows_core::RuntimeType + 'static>
     TypedEventHandler<TSender, TResult>
 {
-    pub(crate) fn new<F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static>(handler: F) -> Self {
+    pub(crate) fn new<F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static>(
+        handler: F,
+    ) -> Self {
         let com = windows_core::imp::DelegateBox::<Self, F>::new(
-            &TypedEventHandlerBox::<TSender, TResult, F>::VTABLE, handler);
+            &TypedEventHandlerBox::<TSender, TResult, F>::VTABLE,
+            handler,
+        );
         unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
     }
 }

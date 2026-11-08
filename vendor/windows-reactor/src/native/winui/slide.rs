@@ -204,11 +204,92 @@ fn settle(element: &UIElement, y: f32, alpha: f32) {
 
 pub(super) struct SlideState {
     revision: u64,
-    translation: SlideObject,
-    visual: SlideObject,
+    translation: Option<SlideObject>,
+    visual: Option<SlideObject>,
     completion: Callback<Result<bool, RuntimeError>>,
-    _batch: Batch,
-    _completed: windows_core::EventRevoker,
+    _batch: Option<Batch>,
+    _completed: Option<windows_core::EventRevoker>,
+    pending: Option<PendingSlide>,
+    _ready: Vec<windows_core::EventRevoker>,
+}
+#[cfg(feature = "test")]
+impl SlideState {
+    pub(super) fn has_started(&self) -> bool {
+        self.translation.is_some()
+    }
+}
+#[derive(Clone)]
+pub(super) struct LayoutGate {
+    pub host: FrameworkElement,
+    pub content: FrameworkElement,
+    pub host_width: f64,
+    pub host_height: f64,
+    pub card_root: Option<FrameworkElement>,
+}
+impl LayoutGate {
+    fn ready(&self) -> windows_core::Result<bool> {
+        let close = |actual: f64, expected: f64| (actual - expected).abs() <= 1.0;
+        let card_ready = if let Some(root) = &self.card_root {
+            let root = root.cast::<IFrameworkElement>()?;
+            let mut height = 0.0;
+            unsafe {
+                (root.vtable().Height)(root.as_raw(), &mut height).ok()?;
+            }
+            !height.is_finite() || close(self.content.ActualHeight()?, height)
+        } else {
+            true
+        };
+        Ok(close(self.host.ActualWidth()?, self.host_width)
+            && close(self.host.ActualHeight()?, self.host_height)
+            && self.content.ActualHeight()? > 0.0
+            && card_ready)
+    }
+}
+#[derive(Clone)]
+struct PendingSlide {
+    element: UIElement,
+    animation: SlideYAnimation,
+    sink: EventSink,
+    continuing: bool,
+    layout: LayoutGate,
+}
+fn start_pending(states: &Rc<RefCell<HashMap<NodeId, SlideState>>>, node: NodeId, revision: u64) {
+    let pending = states
+        .borrow()
+        .get(&node)
+        .filter(|state| state.revision == revision)
+        .and_then(|state| state.pending.clone());
+    let Some(pending) = pending else {
+        return;
+    };
+    let readiness = pending.layout.ready();
+    if matches!(readiness, Ok(false)) {
+        return;
+    }
+    let Some(state) = states.borrow_mut().remove(&node) else {
+        return;
+    };
+    let completion = state.completion.clone();
+    drop(state); // Revoke both layout and rendering gates before starting once.
+    let result = readiness.map_err(native_error).and_then(|_| {
+        start_animation(
+            states,
+            node,
+            revision,
+            &pending.element,
+            pending.animation,
+            completion.clone(),
+            pending.sink.clone(),
+            pending.continuing,
+        )
+    });
+    if let Err(error) = result {
+        pending.sink.enqueue_host(HostEvent::ElementSlideCompleted {
+            node,
+            completion,
+            result: Err(error),
+        });
+    }
 }
 pub(super) fn cancel(
     states: &Rc<RefCell<HashMap<NodeId, SlideState>>>,
@@ -218,8 +299,12 @@ pub(super) fn cancel(
 ) -> bool {
     let previous = states.borrow_mut().remove(&node);
     if let Some(previous) = previous {
-        stop(&previous.translation, "Translation.Y");
-        stop(&previous.visual, "Opacity");
+        if let Some(translation) = &previous.translation {
+            stop(translation, "Translation.Y");
+        }
+        if let Some(visual) = &previous.visual {
+            stop(visual, "Opacity");
+        }
         sink.enqueue_host(HostEvent::ElementSlideCompleted {
             node,
             completion: previous.completion.clone(),
@@ -230,6 +315,7 @@ pub(super) fn cancel(
         false
     }
 }
+#[cfg(feature = "test")]
 pub(super) fn request(
     states: &Rc<RefCell<HashMap<NodeId, SlideState>>>,
     node: NodeId,
@@ -239,12 +325,34 @@ pub(super) fn request(
     completion: Callback<Result<bool, RuntimeError>>,
     sink: EventSink,
 ) -> Result<(), RuntimeError> {
-    let continuing = cancel(states, node, Ok(false), &sink);
+    request_when_ready(
+        states, node, revision, element, animation, completion, sink, None,
+    )
+}
+pub(super) fn request_when_ready(
+    states: &Rc<RefCell<HashMap<NodeId, SlideState>>>,
+    node: NodeId,
+    revision: u64,
+    element: &UIElement,
+    animation: Option<SlideYAnimation>,
+    completion: Callback<Result<bool, RuntimeError>>,
+    sink: EventSink,
+    layout: Option<LayoutGate>,
+) -> Result<(), RuntimeError> {
+    let continuing = states
+        .borrow()
+        .get(&node)
+        .is_some_and(|state| state.translation.is_some());
+    let was_pending = states
+        .borrow()
+        .get(&node)
+        .is_some_and(|state| state.pending.is_some());
+    let cancelled = cancel(states, node, Ok(false), &sink);
     let Some(animation) = animation else {
         sink.enqueue_host(HostEvent::ElementSlideCompleted {
             node,
             completion,
-            result: Ok(continuing),
+            result: Ok(cancelled),
         });
         return Ok(());
     };
@@ -259,6 +367,81 @@ pub(super) fn request(
     {
         return Err(RuntimeError::Native(0x80070057u32 as i32));
     }
+    if was_pending && animation.to_y > animation.from_y {
+        // Hiding before the initial layout exists must not briefly reveal a
+        // full card merely to animate it away after that layout finally arrives.
+        settle(
+            element,
+            animation.to_y,
+            animation.to_opacity.clamp(0.0, 1.0),
+        );
+        sink.enqueue_host(HostEvent::ElementSlideCompleted {
+            node,
+            completion,
+            result: Ok(true),
+        });
+        return Ok(());
+    }
+    if let Some(layout) = layout {
+        if !layout.ready().map_err(native_error)? {
+            if !continuing && animation.to_y < animation.from_y {
+                element.SetOpacity(0.0).map_err(native_error)?;
+            }
+            let weak = Rc::downgrade(states);
+            let wake = Rc::new(move || {
+                if let Some(states) = weak.upgrade() {
+                    start_pending(&states, node, revision);
+                }
+            });
+            let on_host = wake.clone();
+            let on_content = wake.clone();
+            let ready = vec![
+                layout
+                    .host
+                    .SizeChanged(move |_, _| on_host())
+                    .map_err(native_error)?,
+                layout
+                    .content
+                    .SizeChanged(move |_, _| on_content())
+                    .map_err(native_error)?,
+                CompositionTarget::Rendering(move |_, _| wake()).map_err(native_error)?,
+            ];
+            states.borrow_mut().insert(
+                node,
+                SlideState {
+                    revision,
+                    translation: None,
+                    visual: None,
+                    completion,
+                    _batch: None,
+                    _completed: None,
+                    pending: Some(PendingSlide {
+                        element: element.clone(),
+                        animation,
+                        sink,
+                        continuing,
+                        layout,
+                    }),
+                    _ready: ready,
+                },
+            );
+            return Ok(());
+        }
+    }
+    start_animation(
+        states, node, revision, element, animation, completion, sink, continuing,
+    )
+}
+fn start_animation(
+    states: &Rc<RefCell<HashMap<NodeId, SlideState>>>,
+    node: NodeId,
+    revision: u64,
+    element: &UIElement,
+    animation: SlideYAnimation,
+    completion: Callback<Result<bool, RuntimeError>>,
+    sink: EventSink,
+    continuing: bool,
+) -> Result<(), RuntimeError> {
     let result =
         (|| -> windows_core::Result<()> {
             static PREVIEW: windows_core::imp::FactoryCache<
@@ -342,11 +525,13 @@ pub(super) fn request(
                 node,
                 SlideState {
                     revision,
-                    translation: translated.clone(),
-                    visual: object.clone(),
+                    translation: Some(translated.clone()),
+                    visual: Some(object.clone()),
                     completion: completion.clone(),
-                    _batch: batch.clone(),
-                    _completed: revoker,
+                    _batch: Some(batch.clone()),
+                    _completed: Some(revoker),
+                    pending: None,
+                    _ready: Vec::new(),
                 },
             );
             let running = (|| {

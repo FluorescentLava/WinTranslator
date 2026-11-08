@@ -425,9 +425,8 @@ impl Translator {
                 .into();
         }
         Grid::new()
-            .columns([Auto, Auto])
+            .columns([Star(1.0), Star(1.0)])
             .column_spacing(8.0)
-            .horizontal_alignment(HorizontalAlignment::Left)
             .keyed_children(
                 [
                     (crate::speech::Accent::British, "英", "英式发音"),
@@ -449,43 +448,45 @@ impl Translator {
                     (
                         index,
                         at(
-                            Button::new()
-                                .style(ButtonStyle::Subtle)
-                                .height(32.0)
-                                .min_width(0.0)
-                                .max_width(160.0)
-                                .padding(4.0)
-                                .horizontal_alignment(HorizontalAlignment::Left)
-                                .horizontal_content_alignment(HorizontalAlignment::Left)
-                                .vertical_content_alignment(Center)
-                                .automation_name(name)
-                                .on_click(cx.message(Message::Pronounce(accent)))
-                                .content(
-                                    Grid::new()
-                                        .columns([Auto, Auto, Auto])
-                                        .column_spacing(6.0)
-                                        .children((
-                                            text(label, 14.0)
-                                                .opacity(0.65)
-                                                .vertical_alignment(Center),
-                                            text(&phonetic, 14.0)
-                                                .max_width(96.0)
-                                                .text_wrapping(TextWrapping::NoWrap)
-                                                .text_trimming(TextTrimming::CharacterEllipsis)
-                                                .opacity(0.65)
-                                                .vertical_alignment(Center)
-                                                .grid_column(1),
+                            Grid::new()
+                                .columns([Auto, Star(1.0), Auto])
+                                .column_spacing(4.0)
+                                .children((
+                                    text(label, 14.0)
+                                        .opacity(0.65)
+                                        .is_hit_test_visible(false)
+                                        .vertical_alignment(Center),
+                                    text(&phonetic, 14.0)
+                                        .text_wrapping(TextWrapping::NoWrap)
+                                        .text_trimming(TextTrimming::CharacterEllipsis)
+                                        .opacity(0.65)
+                                        .is_hit_test_visible(false)
+                                        .vertical_alignment(Center)
+                                        .grid_column(1)
+                                        .tooltip(&phonetic),
+                                    Button::new()
+                                        .style(ButtonStyle::Subtle)
+                                        .width(28.0)
+                                        .height(28.0)
+                                        .min_width(0.0)
+                                        .min_height(28.0)
+                                        .padding(7.0)
+                                        .horizontal_content_alignment(HorizontalAlignment::Center)
+                                        .vertical_content_alignment(Center)
+                                        .automation_name(name)
+                                        .on_click(cx.message(Message::Pronounce(accent)))
+                                        .grid_column(2)
+                                        .content(
                                             Viewbox::new()
                                                 .width(14.0)
                                                 .height(14.0)
                                                 .stretch(windows_reactor::Stretch::Uniform)
                                                 .opacity(0.7)
                                                 .vertical_alignment(Center)
-                                                .grid_column(2)
                                                 .slot(ViewboxSlot::Child, icon("\u{E993}")),
-                                        )),
-                                )
-                                .tooltip(format!("{name} {phonetic}")),
+                                        )
+                                        .tooltip(format!("{name} {phonetic}")),
+                                )),
                             0,
                             index as i32,
                         ),
@@ -794,6 +795,13 @@ impl Translator {
                     .chars()
                     .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'')
         });
+        let dictionary_result = self.entry.is_some() || is_word;
+        let inline_pronunciation = dictionary_result && self.pronunciation_text().is_some();
+        let summary_target_width = if inline_pronunciation {
+            96.0
+        } else {
+            POPUP_CONTENT_WIDTH - 56.0
+        };
         let long_input = self.text.chars().count() > 80
             || visual_lines(&self.text, 23.0, POPUP_CONTENT_WIDTH - 12.0) > 2
             || self
@@ -831,9 +839,9 @@ impl Translator {
             }
         });
         let result_line_height = if result_font == 15.0 { 21.0 } else { 32.0 };
-        // Keep pronunciation on its own row, including while IPA is loading.
-        // Short words and longer words must share the same summary layout.
-        let pronunciation_height = if self.pronunciation_text().is_some() {
+        // Dictionary summaries always reserve the same row for the translation
+        // and pronunciation. Loading IPA must not switch the card's layout.
+        let pronunciation_height = if self.pronunciation_text().is_some() && !dictionary_result {
             40.0
         } else {
             0.0
@@ -856,19 +864,19 @@ impl Translator {
             .entry
             .as_ref()
             .map(dictionary_metadata)
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .or_else(|| is_word.then(|| "词性未收录".into()));
         let mut target_max_height = available_result;
         let mut details_height = 0.0;
         let mut details_viewport_height = 0.0;
         let (result_height, rendered_result_height) = if let Some(translation) = &self.output {
-            if self.entry.is_some() {
+            if dictionary_result {
                 let metadata_height = metadata.as_ref().map_or(0.0, |value| {
                     visual_lines(value, 14.0, POPUP_CONTENT_WIDTH - 56.0) as f64 * 20.0 + 6.0
                 });
                 let header_fixed = 28.0 + metadata_height + pronunciation_height;
                 let estimated_target =
-                    visual_lines(&translation.target, result_font, POPUP_CONTENT_WIDTH - 56.0)
-                        as f64
+                    visual_lines(&translation.target, result_font, summary_target_width) as f64
                         * result_line_height;
                 let closed_target =
                     estimated_target.min((available_result - header_fixed).max(result_line_height));
@@ -932,7 +940,10 @@ impl Translator {
         cx.window_title("WinTranslater");
         cx.window_visuals(
             WindowVisuals::new()
-                .client_size(POPUP_WIDTH, 172.0)
+                .client_size(
+                    POPUP_WIDTH + 2.0 * f64::from(native::POPUP_SHADOW_INSET),
+                    480.0 + 2.0 * f64::from(native::POPUP_SHADOW_INSET),
+                )
                 .backdrop(WindowBackdrop::MicaCard {
                     inset: native::POPUP_SHADOW_INSET,
                 })
@@ -1065,19 +1076,7 @@ impl Translator {
             .automation_name("输入单词或文本")
             .on_text_changed(cx.callback(Message::Text));
         let result: View = if let Some(translation) = &self.output {
-            if let Some(entry) = &self.entry {
-                let summary = StackPanel::new().spacing(6.0).children((
-                    if let Some(value) = &metadata {
-                        text(value, 14.0).opacity(0.64).tooltip(&entry.word)
-                    } else {
-                        View::empty()
-                    },
-                    ScrollViewer::new()
-                        .max_height(target_max_height)
-                        .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
-                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                        .content(text(&translation.target, result_font)),
-                ));
+            if dictionary_result {
                 let has_details = !dictionary_senses.is_empty();
                 let details_label = if details_open {
                     "收起词典释义"
@@ -1085,34 +1084,77 @@ impl Translator {
                     "展开词典释义"
                 };
                 let chevron = if details_open { "\u{E70E}" } else { "\u{E70D}" };
+                // The native details button is a sibling below the visuals.
+                // Text passes hit testing through to it; each speaker keeps
+                // its own native button without nesting interactive controls.
                 let header_content = Grid::new()
-                    .columns([Star(1.0), Auto])
-                    .column_spacing(8.0)
+                    .rows([Auto, Auto])
+                    .columns([Auto, Star(1.0), Auto])
+                    .row_spacing(6.0)
+                    .column_spacing(12.0)
+                    .margin(12.0)
                     .children((
-                        summary,
+                        if let Some(value) = &metadata {
+                            text(value, 14.0)
+                                .opacity(0.64)
+                                .is_hit_test_visible(false)
+                                .grid_column_span(3)
+                                .into()
+                        } else {
+                            View::empty()
+                        },
+                        ScrollViewer::new()
+                            .max_width(summary_target_width)
+                            .max_height(target_max_height)
+                            .horizontal_alignment(HorizontalAlignment::Left)
+                            .is_hit_test_visible(false)
+                            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                            .grid_row(1)
+                            .content(text(&translation.target, result_font)),
+                        if inline_pronunciation {
+                            Border::new()
+                                .vertical_alignment(Center)
+                                .grid_row(1)
+                                .grid_column(1)
+                                .content(self.pronunciation_controls(cx))
+                        } else {
+                            View::empty()
+                        },
                         if has_details {
                             icon(chevron)
                                 .opacity(0.6)
+                                .is_hit_test_visible(false)
                                 .vertical_alignment(Center)
-                                .grid_column(1)
+                                .grid_row(1)
+                                .grid_column(2)
                                 .into()
                         } else {
                             View::empty()
                         },
                     ));
-                let header: View = if has_details {
-                    Button::new()
-                        .style(ButtonStyle::Subtle)
-                        .horizontal_alignment(Stretch)
-                        .horizontal_content_alignment(Stretch)
-                        .padding(12.0)
-                        .automation_name(details_label)
-                        .on_click(cx.message(Message::Details(!details_open)))
-                        .content(header_content)
-                        .into()
-                } else {
-                    Border::new().padding(12.0).content(header_content)
-                };
+                let header = Grid::new().children((
+                    if has_details {
+                        Button::new()
+                            .style(ButtonStyle::Subtle)
+                            .min_width(0.0)
+                            .min_height(0.0)
+                            .resource_overrides(
+                                ResourceOverrides::new()
+                                    .set("ControlCornerRadius", CornerRadius::uniform(8.0)),
+                            )
+                            .horizontal_alignment(Stretch)
+                            .vertical_alignment(VerticalAlignment::Stretch)
+                            .horizontal_content_alignment(Stretch)
+                            .padding(0.0)
+                            .automation_name(details_label)
+                            .on_click(cx.message(Message::Details(!details_open)))
+                            .into()
+                    } else {
+                        View::empty()
+                    },
+                    header_content,
+                ));
                 let details: View = if details_mounted {
                     let senses = StackPanel::new().spacing(12.0).keyed_children(
                         dictionary_senses.iter().enumerate().map(|(index, sense)| {
@@ -1168,18 +1210,11 @@ impl Translator {
                     .corner_radius(8.0)
                     .max_height(rendered_result_height)
                     .vertical_alignment(VerticalAlignment::Top)
-                    .content(Grid::new().rows([Auto, Auto, Auto]).children((
-                        header,
-                        if pronunciation_height > 0.0 {
-                            Border::new()
-                                .padding(Thickness::new(12.0, 0.0, 12.0, 8.0))
-                                .grid_row(1)
-                                .content(self.pronunciation_controls(cx))
-                        } else {
-                            View::empty()
-                        },
-                        at(details, 2, 0),
-                    )))
+                    .content(
+                        Grid::new()
+                            .rows([Auto, Auto])
+                            .children((header, at(details, 1, 0))),
+                    )
             } else {
                 Border::new()
                     .background(ThemeBrush::CardBackground)
@@ -1331,10 +1366,11 @@ impl Translator {
         let surface = Border::new()
             .element_ref(&self.popup_surface)
             .opacity(0.0)
-            .vertical_alignment(VerticalAlignment::Stretch)
+            .height(frame_height)
+            .vertical_alignment(VerticalAlignment::Bottom)
             .padding(Thickness::new(16.0, 12.0, 16.0, 10.0))
             .on_pointer_pressed(cx.callback(|point: PointerEventInfo| {
-                if point.window_y < f64::from(native::POPUP_SHADOW_INSET) + 8.0 {
+                if point.y < 8.0 {
                     Message::Drag
                 } else {
                     Message::Warmed
@@ -1987,6 +2023,9 @@ impl Component for Translator {
                         }));
                     },
                 );
+                // The slide request reconnects WinUI's input site first. Focus
+                // in that same publication; delayed verification is a fallback.
+                self.focus_popup_input(cx, revision, 0);
             }
             Message::PopupFocusReady(revision)
                 if native::popup_show_animation_is_current(revision)
@@ -2078,7 +2117,11 @@ impl Component for Translator {
                 self.cancel_selection();
                 self.cancel_speech();
                 self.invalidate();
-                native::quit();
+                if let Err(error) = App::quit() {
+                    storage::diagnostic(serde_json::json!({
+                        "event":"quit_request_failed", "error":error.to_string(),
+                    }));
+                }
             }
             Message::Composition(active) => {
                 if active {

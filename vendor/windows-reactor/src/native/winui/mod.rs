@@ -71,6 +71,7 @@ impl<'a> PropertyTarget<'a> {
             | PropertyId::MinHeight
             | PropertyId::MaxHeight
             | PropertyId::Opacity
+            | PropertyId::IsHitTestVisible
             | PropertyId::HorizontalAlignment
             | PropertyId::VerticalAlignment
             | PropertyId::Margin => Self::Framework(runtime.ui_element(node)?),
@@ -1900,20 +1901,32 @@ impl WinUiRuntime {
             } => {
                 let sink = self.event_sink()?;
                 let result = self.ui_element(*node).and_then(|element| {
-                    let surface = self
-                        .window_hosts
-                        .values()
-                        .find(|host| host.root == Some(*node))
-                        .and_then(backdrop::WindowHost::animated_surface);
-                    let animated = if let Some(surface) = surface {
+                    let card_host = self.window_hosts.iter().find(|(_, host)| {
+                        host.root == Some(*node) && host.animated_surface().is_some()
+                    });
+                    let mut layout = None;
+                    let animated = if let Some((window_node, host)) = card_host {
+                        let window = self
+                            .windows
+                            .get(window_node)
+                            .ok_or(RuntimeError::MissingNode(*window_node))?;
+                        host.prepare_slide(
+                            window,
+                            animation.is_some_and(|animation| animation.to_y < animation.from_y),
+                        )
+                        .map_err(native_error)?;
+                        layout = host.slide_layout(window).map_err(native_error)?;
                         // The application root's startup opacity hides its own content only.
                         // Move that gate to the card so Mica and controls enter together.
                         element.SetOpacity(1.0).map_err(native_error)?;
-                        surface.cast::<UIElement>().map_err(native_error)?
+                        host.animated_surface()
+                            .unwrap()
+                            .cast::<UIElement>()
+                            .map_err(native_error)?
                     } else {
                         element
                     };
-                    slide::request(
+                    slide::request_when_ready(
                         &self.slides,
                         *node,
                         *revision,
@@ -1921,6 +1934,7 @@ impl WinUiRuntime {
                         *animation,
                         completion.clone(),
                         sink.clone(),
+                        layout,
                     )
                 });
                 if let Err(error) = result {

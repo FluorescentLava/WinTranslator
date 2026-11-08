@@ -13952,6 +13952,7 @@ pub enum PropertyId {
     MinHeight,
     MaxHeight,
     Opacity,
+    IsHitTestVisible,
     HorizontalAlignment,
     VerticalAlignment,
     Margin,

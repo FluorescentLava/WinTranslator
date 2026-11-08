@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -261,7 +261,23 @@ const MAX_CACHE_FILES: usize = 100;
 const MAX_CACHE_BYTES: u64 = 30 * 1024 * 1024;
 const MCI_ALIAS: &str = "wt_pronunciation";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-static PLAYBACK: Mutex<Option<u64>> = Mutex::new(None);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Playback {
+    Mci(u64),
+    Local(u64),
+}
+impl Playback {
+    fn generation(self) -> u64 {
+        match self {
+            Self::Mci(generation) | Self::Local(generation) => generation,
+        }
+    }
+}
+static PLAYBACK: Mutex<Option<Playback>> = Mutex::new(None);
+const CLEANUP_IDLE: u8 = 0;
+const CLEANUP_RUNNING: u8 = 1;
+const CLEANUP_REQUESTED: u8 = 2;
+static CLEANUP_STATE: AtomicU8 = AtomicU8::new(CLEANUP_IDLE);
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 
@@ -315,10 +331,52 @@ fn check_current(generation: u64, cancelled: &dyn Fn() -> bool) -> Result<(), St
 /// Stops active playback and invalidates audio that is still downloading.
 pub fn stop() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
-    if let Ok(mut current) = PLAYBACK.lock() {
-        if current.take().is_some() {
-            let _ = mci(&format!("close {MCI_ALIAS}"));
+    if let Ok(current) = PLAYBACK.try_lock()
+        && current.is_none()
+    {
+        return;
+    }
+    // Audio drivers can hold this lock during open/status/close. Never wait for
+    // those operations on the UI thread; the owning worker also observes the
+    // generation change and purges local SAPI playback within its polling loop.
+    if CLEANUP_STATE.swap(CLEANUP_REQUESTED, Ordering::AcqRel) == CLEANUP_IDLE {
+        std::thread::spawn(cleanup_playback);
+    }
+}
+
+fn cleanup_playback() {
+    loop {
+        CLEANUP_STATE.store(CLEANUP_RUNNING, Ordering::Release);
+        if let Ok(mut current) = PLAYBACK.lock() {
+            // A newer pronunciation may have started before this worker ran.
+            // Serialize MCI cleanup with playback and leave that generation alone.
+            close_cancelled_playback(&mut current, GENERATION.load(Ordering::Acquire));
         }
+        // A stop during device cleanup marks this worker for another pass.
+        // Commit idle only if no request arrived, so the last stop cannot be lost.
+        if CLEANUP_STATE
+            .compare_exchange(
+                CLEANUP_RUNNING,
+                CLEANUP_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+fn close_cancelled_playback(current: &mut Option<Playback>, generation: u64) {
+    if current.is_some_and(|active| active.generation() != generation) {
+        close_playback(current);
+    }
+}
+
+fn close_playback(current: &mut Option<Playback>) {
+    if matches!(current.take(), Some(Playback::Mci(_))) {
+        let _ = mci(&format!("close {MCI_ALIAS}"));
     }
 }
 
@@ -326,9 +384,8 @@ struct PlaybackGuard(u64);
 impl Drop for PlaybackGuard {
     fn drop(&mut self) {
         if let Ok(mut current) = PLAYBACK.lock() {
-            if *current == Some(self.0) {
-                let _ = mci(&format!("close {MCI_ALIAS}"));
-                *current = None;
+            if current.is_some_and(|active| active.generation() == self.0) {
+                close_playback(&mut current);
             }
         }
     }
@@ -353,11 +410,9 @@ fn play_mp3(path: &Path, generation: u64, cancelled: &dyn Fn() -> bool) -> Resul
             .lock()
             .map_err(|_| "音频播放状态不可用".to_owned())?;
         check_current(generation, cancelled)?;
-        if current.take().is_some() {
-            let _ = mci(&format!("close {MCI_ALIAS}"));
-        }
+        close_playback(&mut current);
         mci(&format!("open \"{path}\" type mpegvideo alias {MCI_ALIAS}"))?;
-        *current = Some(generation);
+        *current = Some(Playback::Mci(generation));
         guard = PlaybackGuard(generation);
         // The open operation can take time; check again immediately before play.
         if let Err(error) = check_current(generation, cancelled) {
@@ -377,7 +432,7 @@ fn play_mp3(path: &Path, generation: u64, cancelled: &dyn Fn() -> bool) -> Resul
             let current = PLAYBACK
                 .lock()
                 .map_err(|_| "音频播放状态不可用".to_owned())?;
-            if *current != Some(generation) {
+            if *current != Some(Playback::Mci(generation)) {
                 return Err("已取消".into());
             }
             let mode = mci(&format!("status {MCI_ALIAS} mode"))?;
@@ -802,7 +857,7 @@ fn pronounce_local(
             .lock()
             .map_err(|_| "音频播放状态不可用".to_owned())?;
         check_current(generation, cancelled)?;
-        *current = Some(generation);
+        *current = Some(Playback::Local(generation));
         guard = PlaybackGuard(generation);
         queue = SapiQueue(&voice);
         // SPF_ASYNC | SPF_PURGEBEFORESPEAK | SPF_IS_NOT_XML: text is plain text.
@@ -852,9 +907,7 @@ pub fn pronounce(text: &str, accent: Accent, cancelled: &dyn Fn() -> bool) -> Re
             return Err("已取消".into());
         }
         let generation = GENERATION.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        if current.take().is_some() {
-            let _ = mci(&format!("close {MCI_ALIAS}"));
-        }
+        close_playback(&mut current);
         generation
     };
     if text.chars().count() > MAX_DICTIONARY_CHARACTERS {
@@ -884,6 +937,15 @@ pub fn pronounce(text: &str, accent: Accent, cancelled: &dyn Fn() -> bool) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_stop_cannot_clear_a_newer_pronunciation() {
+        let mut current = Some(Playback::Local(8));
+        close_cancelled_playback(&mut current, 8);
+        assert_eq!(current, Some(Playback::Local(8)));
+        close_cancelled_playback(&mut current, 9);
+        assert_eq!(current, None);
+    }
+
     fn two_frames() -> Vec<u8> {
         let mut bytes = vec![0; 417 * 2];
         bytes[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);

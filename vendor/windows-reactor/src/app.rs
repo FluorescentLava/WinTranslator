@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -15,6 +15,7 @@ pub(crate) mod test;
 thread_local! {
     static HOST: RefCell<Option<LiveHost>> = const { RefCell::new(None) };
     static SCHEDULER_FAULT: RefCell<Option<windows_core::Error>> = const { RefCell::new(None) };
+    static QUIT_QUEUED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(feature = "test")]
@@ -726,6 +727,45 @@ impl LivePump for ComponentLoop {
 pub struct App;
 
 impl App {
+    /// Closes application-owned windows before ending the WinUI message loop.
+    ///
+    /// Call on the UI thread. Cleanup is queued so a component can request exit
+    /// from its update method without destroying its own active dispatch stack.
+    pub fn quit() -> windows_core::Result<()> {
+        if QUIT_QUEUED.with(|queued| queued.replace(true)) {
+            return Ok(());
+        }
+        let shutdown = DispatcherQueueHandler::new(|| {
+            // Closed handlers may run synchronously. Remove the host before
+            // closing windows so they cannot reenter or borrow a retiring pump.
+            if let Some(mut host) = HOST.with(|host| host.borrow_mut().take()) {
+                for pump in host.windows.values_mut() {
+                    pump.close_scheduler();
+                    pump.shutdown();
+                }
+                drop(host);
+            }
+            // Window.Close and COM releases require a live WinUI dispatcher.
+            // Posting WM_QUIT before cleanup makes later Close calls invalid.
+            exit_ui_thread();
+        });
+        let queued = DispatcherQueue::GetForCurrentThread().and_then(|dispatcher| {
+            dispatcher.TryEnqueueWithPriority(DispatcherQueuePriority::High, &shutdown)
+        });
+        match queued {
+            Ok(true) => Ok(()),
+            result => {
+                QUIT_QUEUED.with(|queued| queued.set(false));
+                result.and_then(|_| {
+                    Err(windows_core::Error::new(
+                        E_FAIL,
+                        "dispatcher rejected application exit",
+                    ))
+                })
+            }
+        }
+    }
+
     /// Runs one window whose root content is `root`.
     ///
     /// This call blocks while the WinUI message loop is running.
@@ -788,6 +828,7 @@ impl App {
         }
 
         initialize_ui_thread()?;
+        QUIT_QUEUED.with(|queued| queued.set(false));
         let create_pumps = Rc::new(RefCell::new(Some(create_pumps)));
         let result = Rc::new(RefCell::new(Ok(())));
         let callback_result = Rc::clone(&result);
@@ -838,6 +879,10 @@ impl App {
                                 return;
                             };
                             for mut pump in pumps {
+                                if QUIT_QUEUED.with(Cell::get) {
+                                    pump.shutdown();
+                                    continue;
+                                }
                                 if let Err(error) = pump.mount() {
                                     let error = pump_error(error);
                                     eprintln!("windows-reactor additional window fault: {error}");
@@ -921,6 +966,9 @@ fn publish_mounted_window(pump: Box<dyn LivePump>) {
 }
 
 pub(crate) fn open_live_windows(roots: Vec<View>) -> Result<(), RuntimeError> {
+    if QUIT_QUEUED.with(Cell::get) {
+        return Err(RuntimeError::DispatcherRejected);
+    }
     if roots.is_empty() {
         return Ok(());
     }
@@ -967,6 +1015,10 @@ pub(crate) fn open_live_windows(roots: Vec<View>) -> Result<(), RuntimeError> {
             return;
         };
         for mut pump in pumps {
+            if QUIT_QUEUED.with(Cell::get) {
+                pump.shutdown();
+                continue;
+            }
             match pump.mount() {
                 Ok(()) => publish_mounted_window(pump),
                 Err(error) => reject_pending_window(pump, error),
