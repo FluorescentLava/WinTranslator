@@ -6,6 +6,12 @@
 
 用 Rust 编写的 Windows 翻译工具，使用原生 WinUI 3 控件与 Mica 背景。
 
+## 下载
+
+在 [GitHub Releases](https://github.com/FluorescentLava/WinTranslator/releases) 下载并运行 `WinTranslater-0.1.0-Beta-windows-x64-setup.exe`。需要 Windows 11 x64；安装包包含 WinUI 运行库、本地词典及中英双向离线模型，无需安装 Rust 或 Python。API 密钥需在设置中自行填写。
+
+默认安装到 `%LOCALAPPDATA%\Programs\WinTranslater`，创建开始菜单入口和系统卸载项，无需管理员权限。安装包的 SHA-256 校验值见同一 Release 的 `SHA256SUMS.txt`。升级或卸载保留本机配置和 API 凭据。
+
 ## 使用
 
 - 按 `Ctrl+Tab` 唤出窗口，窗口移到当前虚拟桌面，并位于当前屏幕工作区右下角。在桌面 2 唤出时留在桌面 2。整块 Mica 面板与内容从任务栏下方滑入，失焦后沿原路滑下收起；使用原生 WinUI Composition 动画，唤出与隐藏时宽度保持固定。打开设置或服务选择浮层不会误隐藏。
@@ -22,7 +28,7 @@
 
 可见面板宽 480 DIP，高度随内容变化；顶部语言框为 108 × 32 DIP，转换与设置按钮为 32 × 32 DIP。设置窗口为 760 × 540 DIP。面板高度变化带短暂过渡动画，底栏保持固定位置。
 
-设置中的“用量明细”同时显示 DeepL Developer 的累计用量和 DeepL API Free 旧版的本月用量；在线路由顺序显示在卡片下方。两种计划分别读取本机记录，查看明细不会修改所选计划或用量账本。
+设置中的“用量明细”用原生进度条显示已用额度，同时显示 DeepL Developer 的累计用量和 DeepL API Free 旧版的本月用量；未配置的服务显示状态文字。在线路由的标题、服务顺序与切换说明在卡片下方分行排列。两种计划分别读取本机记录，查看明细不会修改所选计划或用量账本。
 
 ## 在线优先与免费额度
 
@@ -113,9 +119,25 @@ cargo test --locked -- --include-ignored
 
 界面使用本仓库 `vendor/windows-reactor` 中的原生 WinUI 3 封装；依赖版本由 `Cargo.lock` 固定。
 
+## 生成 EXE 安装包
+
+准备好上述资源和构建环境，再安装 [Inno Setup 6.5 或更新版本](https://jrsoftware.org/isdl.php)：
+
+```powershell
+.\scripts\package-release.ps1
+# 自定义编译器位置：
+.\scripts\package-release.ps1 -IsccPath 'C:\Tools\Inno Setup 6\ISCC.exe'
+```
+
+脚本自动构建自包含版本，校验模型文件的 SHA-256，收集 WinUI 和 Visual C++ 的应用本地运行库，在 `dist/` 生成安装程序及 `SHA256SUMS.txt`。版本读取 `Cargo.toml`，必须与 `app.rc` 的产品版本一致。Inno Setup 配置在 `installer/WinTranslater.iss`。资源从构建输出和源码目录的明确清单收集，不读取用户配置目录。
+
+已有自包含构建时，可传 `-SkipBuild -TargetDirectory '<Cargo target 目录>'`；Visual Studio 的 CRT 目录未自动找到时，可通过 `-VcRuntimeDirectory '<x64\Microsoft.VC143.CRT 目录>'` 指定。
+
 ## 安装与卸载
 
-构建并准备好运行资源后，使用 PowerShell 安装到当前用户：
+Release 安装程序默认安装到 `%LOCALAPPDATA%\Programs\WinTranslater`，创建名称为 `WinTranslater` 的开始菜单入口，并登记 Windows“已安装的应用”中的卸载项。通过系统设置卸载，或运行安装目录内的 `unins000.exe`；卸载保留 `%LOCALAPPDATA%\TranslationTool` 中的配置、历史、凭据和用量记录。
+
+从源码构建后，也可使用原有 PowerShell 脚本安装：
 
 ```powershell
 .\scripts\install.ps1
@@ -129,7 +151,7 @@ cargo test --locked -- --include-ignored
 .\scripts\register-app.ps1 -InstallDirectory "$env:USERPROFILE\Documents\WinTranslater"
 ```
 
-在 Windows“设置 → 应用 → 已安装的应用”中选择 `WinTranslater` 即可卸载，也可运行安装目录内的 `scripts\uninstall.ps1`。卸载会停止该目录的程序、移除对应的开机自启、开始菜单入口及登记文件清单内的程序资源；默认保留设置、历史和 API 凭据，不删除清单外的文件。安装、登记和卸载脚本均支持 `-WhatIf` 预览。
+此方式安装的版本可从系统设置卸载，或运行安装目录内的 `scripts\uninstall.ps1`。脚本移除对应的开机自启、开始菜单入口及登记文件清单内的程序资源，保留本机配置和清单外的文件。安装、登记和卸载脚本均支持 `-WhatIf` 预览。
 
 ## 本地数据
 

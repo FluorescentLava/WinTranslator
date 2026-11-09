@@ -1555,7 +1555,7 @@ impl Translator {
         let routes = crate::routing::status(&self.settings);
         let route_rows =
             StackPanel::new()
-                .spacing(10.0)
+                .spacing(12.0)
                 .keyed_children(routes.into_iter().enumerate().map(|(index, route)| {
                     let note = if !route.configured {
                         if self.settings_load_warning.is_some() {
@@ -1603,23 +1603,43 @@ impl Translator {
                     } else {
                         note
                     };
+                    let progress: View = match route.remaining_characters {
+                        Some(remaining) if route.allowance_characters > 0 => ProgressBar::new()
+                            .minimum(0.0)
+                            .maximum(route.allowance_characters as f64)
+                            .value(route.allowance_characters.saturating_sub(remaining) as f64)
+                            .is_indeterminate(false)
+                            .show_paused(!route.eligible || route.cooldown_seconds > 0)
+                            .height(4.0)
+                            .automation_name(format!("{}，{description}", route.label))
+                            .into(),
+                        _ => View::empty(),
+                    };
                     (
                         index,
-                        Grid::new()
-                            .columns([GridLength::Pixel(150.0), Star(1.0)])
-                            .column_spacing(8.0)
-                            .children((text(route.label, 13.0), muted(description).grid_column(1))),
+                        StackPanel::new().spacing(6.0).children((
+                            Grid::new()
+                                .columns([Star(1.0), Auto])
+                                .column_spacing(12.0)
+                                .children((
+                                    text(route.label, 13.0).vertical_alignment(Center),
+                                    muted(description)
+                                        .vertical_alignment(Center)
+                                        .grid_column(1),
+                                )),
+                            progress,
+                        )),
                     )
                 }));
         let order = crate::routing::candidates(&self.settings)
             .iter()
             .map(|provider| provider.name())
             .collect::<Vec<_>>()
-            .join("→");
+            .join(" → ");
         let order = if order.is_empty() {
             "手动离线".to_owned()
         } else if self.settings.auto_offline {
-            format!("{order}→本地离线")
+            format!("{order} → 本地离线")
         } else {
             order
         };
@@ -1638,9 +1658,12 @@ impl Translator {
             self.card(StackPanel::new().spacing(10.0).children((
                 text("用量明细", 14.0),
                 route_rows,
-                muted("仅统计本程序的用量，包含失败请求的保守预留。"),
             ))),
-            muted(format!("在线路由\n{order} · 免费额度不足时自动换服务")),
+            StackPanel::new().spacing(4.0).children((
+                text("在线路由", 12.0).opacity(0.75),
+                muted(order),
+                muted("免费额度不足时自动换服务"),
+            )),
         ))
     }
     fn general_settings(&self, cx: &ViewContext<Self>) -> View {
