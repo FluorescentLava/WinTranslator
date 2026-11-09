@@ -49,7 +49,7 @@ pub enum Message {
     PopupDismissed(u64),
     PopupHidden(u64),
     CaptureSelection,
-    SelectionCaptured(u64, Option<String>),
+    SelectionCaptured(u64, Option<String>, bool),
     Quit,
     Composition(bool),
     OpenSettings,
@@ -910,12 +910,6 @@ impl Translator {
                     .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'')
         });
         let dictionary_result = self.entry.is_some() || is_word;
-        let inline_pronunciation = dictionary_result && self.pronunciation_text().is_some();
-        let summary_target_width = if inline_pronunciation {
-            96.0
-        } else {
-            POPUP_CONTENT_WIDTH - 56.0
-        };
         let long_input = self.text.chars().count() > 80
             || visual_lines(&self.text, 23.0, POPUP_CONTENT_WIDTH - 12.0) > 2
             || self
@@ -953,9 +947,68 @@ impl Translator {
             }
         });
         let result_line_height = if result_font == 15.0 { 21.0 } else { 32.0 };
-        // Dictionary summaries always reserve the same row for the translation
-        // and pronunciation. Loading IPA must not switch the card's layout.
-        let pronunciation_height = if self.pronunciation_text().is_some() && !dictionary_result {
+        let pronunciation = self.pronunciation_text();
+        let summary_width = POPUP_CONTENT_WIDTH - 58.0;
+        // Reserve both IPA cells before they load so a network response cannot
+        // push a word to another row. The word itself uses WinUI text metrics.
+        let pronunciation_width = pronunciation.map_or(0.0, |value| {
+            if crate::speech::supports_word_phonetics(value) {
+                284.0
+            } else {
+                32.0
+            }
+        });
+        let target_metrics = self
+            .output
+            .as_ref()
+            .filter(|_| dictionary_result)
+            .map(|output| {
+                measure_text(&output.target, result_font).unwrap_or(TextMetrics {
+                    width: output
+                        .target
+                        .chars()
+                        .map(|c| {
+                            if c >= '\u{1100}' {
+                                result_font
+                            } else {
+                                result_font * 0.6
+                            }
+                        })
+                        .sum(),
+                    height: result_line_height,
+                    baseline: result_font,
+                })
+            });
+        let inline_pronunciation = dictionary_result
+            && pronunciation.is_some()
+            && self
+                .output
+                .as_ref()
+                .is_some_and(|output| !output.target.contains('\n'))
+            && target_metrics.is_some_and(|metrics| {
+                metrics.width.ceil() + 12.0 + pronunciation_width <= summary_width
+            });
+        let stacked_pronunciation =
+            dictionary_result && pronunciation.is_some() && !inline_pronunciation;
+        let summary_target_width = if inline_pronunciation {
+            summary_width - pronunciation_width - 12.0
+        } else {
+            summary_width
+        };
+        let speech_metrics = measure_text("Ag", 14.0);
+        let speech_baseline = speech_metrics.map_or(20.0, |metrics| {
+            metrics.baseline + (28.0 - metrics.height).max(0.0) / 2.0
+        });
+        let baseline_offset = if inline_pronunciation {
+            target_metrics.map_or(0.0, |metrics| metrics.baseline - speech_baseline)
+        } else {
+            0.0
+        };
+        let target_top = (-baseline_offset).max(0.0);
+        let speech_top = baseline_offset.max(0.0);
+        let pronunciation_height = if stacked_pronunciation {
+            34.0
+        } else if pronunciation.is_some() && !dictionary_result {
             40.0
         } else {
             0.0
@@ -990,8 +1043,16 @@ impl Translator {
                 });
                 let header_fixed = 28.0 + metadata_height + pronunciation_height;
                 let estimated_target =
-                    visual_lines(&translation.target, result_font, summary_target_width) as f64
-                        * result_line_height;
+                    (visual_lines(&translation.target, result_font, summary_target_width) as f64
+                        * result_line_height)
+                        .max(if inline_pronunciation {
+                            (28.0 + speech_top).max(
+                                target_metrics.map_or(result_line_height, |metrics| metrics.height)
+                                    + target_top,
+                            )
+                        } else {
+                            0.0
+                        });
                 let closed_target =
                     estimated_target.min((available_result - header_fixed).max(result_line_height));
                 let open_target = estimated_target
@@ -1198,11 +1259,14 @@ impl Translator {
                     "展开词典释义"
                 };
                 let chevron = if details_open { "\u{E70E}" } else { "\u{E70D}" };
-                // The native details button is a sibling below the visuals.
-                // Text passes hit testing through to it; each speaker keeps
-                // its own native button without nesting interactive controls.
+                // The card background and chevron open details; selectable
+                // translation text and each speaker keep their own hit targets.
                 let header_content = Grid::new()
-                    .rows([Auto, Auto])
+                    .rows(if stacked_pronunciation {
+                        vec![Auto, Auto, Auto]
+                    } else {
+                        vec![Auto, Auto]
+                    })
                     .columns([Auto, Star(1.0), Auto])
                     .row_spacing(6.0)
                     .column_spacing(12.0)
@@ -1221,17 +1285,25 @@ impl Translator {
                             .max_width(summary_target_width)
                             .max_height(target_max_height)
                             .horizontal_alignment(HorizontalAlignment::Left)
-                            .is_hit_test_visible(false)
+                            .vertical_alignment(VerticalAlignment::Top)
+                            .margin(Thickness::new(0.0, target_top, 0.0, 0.0))
                             .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                             .grid_row(1)
-                            .content(text(&translation.target, result_font)),
-                        if inline_pronunciation {
+                            .grid_column_span(if inline_pronunciation { 1 } else { 2 })
+                            .content(
+                                text(&translation.target, result_font)
+                                    .text_wrapping(TextWrapping::WrapWholeWords)
+                                    .is_text_selection_enabled(true),
+                            ),
+                        if dictionary_result && pronunciation.is_some() {
                             Border::new()
                                 .horizontal_alignment(HorizontalAlignment::Left)
-                                .vertical_alignment(Center)
-                                .grid_row(1)
-                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Top)
+                                .margin(Thickness::new(0.0, speech_top, 0.0, 0.0))
+                                .grid_row(if inline_pronunciation { 1 } else { 2 })
+                                .grid_column(if inline_pronunciation { 1 } else { 0 })
+                                .grid_column_span(if inline_pronunciation { 1 } else { 2 })
                                 .content(self.pronunciation_controls(cx))
                         } else {
                             View::empty()
@@ -2281,18 +2353,23 @@ impl Component for Translator {
             Message::CaptureSelection => {
                 self.cancel_selection();
                 let revision = self.selection_revision;
+                let in_place = native::popup_is_foreground();
                 let request = crate::selection::CaptureRequest::new();
                 self.selection_task = Some(cx.spawn_background(move |cancel| {
                     Message::SelectionCaptured(
                         revision,
                         request.and_then(|request| request.capture(&|| cancel.is_cancelled())),
+                        in_place,
                     )
                 }));
             }
-            Message::SelectionCaptured(revision, selected)
+            Message::SelectionCaptured(revision, selected, in_place)
                 if revision == self.selection_revision =>
             {
                 self.selection_task = None;
+                if in_place && !native::popup_is_foreground() {
+                    return;
+                }
                 if let Some(selected) = selected.filter(|value| !value.trim().is_empty()) {
                     if self.text != selected {
                         self.cancel_speech();
@@ -2302,8 +2379,13 @@ impl Component for Translator {
                         self.force_online_for_long_text = false;
                         self.pending_provider = None;
                     }
+                    if in_place {
+                        self.translate(cx);
+                    }
                 }
-                let _ = cx.sender().send(Message::Show);
+                if !in_place {
+                    let _ = cx.sender().send(Message::Show);
+                }
             }
             Message::Quit => {
                 self.cancel_selection();

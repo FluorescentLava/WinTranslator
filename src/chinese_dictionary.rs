@@ -342,7 +342,13 @@ fn make_entry(cached: &CachedEntry, cancelled: &dyn Fn() -> bool) -> Option<Entr
             continue;
         }
         let parts = sense.part_of_speech.clone().map_or_else(
-            || crate::dictionary::chinese_candidate_parts_of_speech(&sense.english, &cached.query),
+            || {
+                crate::dictionary::chinese_candidate_parts_of_speech(
+                    &sense.english,
+                    &cached.query,
+                    &sense.explanation,
+                )
+            },
             |part| vec![part],
         );
         crate::dictionary::append_chinese_candidate(&mut entry, &sense.english, &parts);
@@ -636,6 +642,38 @@ mod tests {
                 .senses
                 .iter()
                 .all(|sense| sense.part_of_speech == "n.")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires scripts/download-dictionary.ps1"]
+    fn cached_candidates_use_installed_matching_senses_to_fill_missing_pos() {
+        // Same source-only cache schema and gloss as the reported 墓 lookup.
+        let cached: CachedEntry = serde_json::from_value(json!({
+            "version": 1,
+            "query": "墓",
+            "senses": [
+                {"english": "tomb", "explanation": "坟墓，冢；土棺，石棺；墓碑"},
+                {"english": "mausoleum", "explanation": "陵墓；阴森森的大厦"}
+            ]
+        }))
+        .unwrap();
+        assert!(valid_cache(&cached, "墓"));
+        let entry = make_entry(&cached, &|| false).unwrap();
+        assert_eq!(entry.parts_of_speech, ["n."]);
+        assert_eq!(entry.senses.len(), 2);
+        assert_eq!(entry.senses[0].definition, "tomb");
+        assert!(
+            entry
+                .senses
+                .iter()
+                .all(|sense| sense.part_of_speech == "n.")
+        );
+        assert!(
+            cached
+                .senses
+                .iter()
+                .all(|sense| sense.part_of_speech.is_none())
         );
     }
 

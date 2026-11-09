@@ -17797,7 +17797,8 @@ pub struct ITextBlock_Vtbl {
     ContentEnd: usize,
     SelectionStart: usize,
     SelectionEnd: usize,
-    BaselineOffset: usize,
+    pub BaselineOffset:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
     SelectionHighlightColor: usize,
     SetSelectionHighlightColor: usize,
     MaxLines: usize,
@@ -19831,7 +19832,8 @@ impl IUIElement {
 #[repr(C)]
 pub struct IUIElement_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
-    DesiredSize: usize,
+    pub DesiredSize:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Size) -> windows_core::HRESULT,
     AllowDrop: usize,
     pub SetAllowDrop:
         unsafe extern "system" fn(*mut core::ffi::c_void, bool) -> windows_core::HRESULT,
@@ -20124,7 +20126,8 @@ pub struct IUIElement_Vtbl {
     RemovePreviewKeyUp: usize,
     BringIntoViewRequested: usize,
     RemoveBringIntoViewRequested: usize,
-    Measure: usize,
+    pub Measure:
+        unsafe extern "system" fn(*mut core::ffi::c_void, Size) -> windows_core::HRESULT,
     Arrange: usize,
     pub CapturePointer: unsafe extern "system" fn(
         *mut core::ffi::c_void,

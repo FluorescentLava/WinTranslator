@@ -35,6 +35,8 @@ mod caret;
 mod content_dialog;
 mod input_activation;
 mod slide;
+mod text_metrics;
+pub use text_metrics::{TextMetrics, measure_text};
 #[cfg(feature = "test")]
 pub(crate) use content_dialog::LiveContentDialogState;
 use content_dialog::{ContentDialogAction, ContentDialogScheduler};

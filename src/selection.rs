@@ -45,7 +45,7 @@ pub struct CaptureRequest {
 }
 
 impl CaptureRequest {
-    /// Snapshot the source before the popup takes focus. Ignore our own windows.
+    /// Snapshot the source before changing focus, including this application's windows.
     pub fn new() -> Option<Self> {
         let window = unsafe { GetForegroundWindow() };
         if window.is_null() {
@@ -53,7 +53,7 @@ impl CaptureRequest {
         }
         let mut process = 0;
         unsafe { GetWindowThreadProcessId(window, &mut process) };
-        if process == 0 || process == unsafe { GetCurrentProcessId() } {
+        if process == 0 {
             return None;
         }
         Some(Self {
@@ -127,7 +127,7 @@ impl CaptureRequest {
         }
         let mut process = 0;
         unsafe { GetWindowThreadProcessId(window, &mut process) };
-        process == self.process && process != unsafe { GetCurrentProcessId() }
+        process == self.process
     }
 }
 
@@ -322,7 +322,7 @@ fn element_safety(
     }
     let mut process = 0;
     if unsafe { (element.vtable().process_id)(element.raw(), &mut process) } < 0
-        || process as u32 == unsafe { GetCurrentProcessId() }
+        || process <= 0
         || !active()
     {
         return ElementSafety::Outside;
@@ -681,7 +681,6 @@ unsafe extern "system" {
 }
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn GetCurrentProcessId() -> u32;
     fn GetCurrentThreadId() -> u32;
 }
 #[link(name = "ole32")]
@@ -807,11 +806,42 @@ mod tests {
     }
 
     #[test]
+    fn source_search_reads_same_process_selection_without_reading_passwords() {
+        let foreground = unsafe { GetForegroundWindow() };
+        let fixture = LocalFixture::start();
+        let _apartment = Apartment::new().expect("MTA");
+        let automation = create_automation().expect("UI Automation");
+        let source = fixture.window as Raw;
+        let mut process = 0;
+        unsafe { GetWindowThreadProcessId(source, &mut process) };
+        assert_eq!(process, std::process::id());
+        assert_eq!(
+            read_scoped_selection(&automation, source, &|| true).as_deref(),
+            Some("Synthetic"),
+        );
+        unsafe { SendMessageW(source, 0x8001, 0, 0) };
+        assert!(read_scoped_selection(&automation, source, &|| true).is_none());
+        unsafe { SendMessageW(source, 0x8001, 2, 0) };
+        assert_eq!(
+            read_scoped_selection(&automation, source, &|| true).as_deref(),
+            Some("中文🪟"),
+        );
+        assert!(read_scoped_selection(&automation, source, &|| false).is_none());
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    }
+
+    #[test]
     #[ignore = "helper process for source_search_finds_unfocused_selection"]
     fn hidden_text_provider_fixture() {
         let Some(path) = std::env::var_os("WINTRANSLATER_SELECTION_FIXTURE") else {
             return;
         };
+        run_hidden_fixture(|window| {
+            std::fs::write(path, window.to_string()).expect("fixture ready");
+        });
+    }
+
+    fn run_hidden_fixture(ready: impl FnOnce(usize)) {
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let name: Vec<u16> = "WinTranslaterSelectionTest\0".encode_utf16().collect();
         let class = FixtureWindowClass {
@@ -902,7 +932,7 @@ mod tests {
         };
         assert!(!other_edit.is_null());
         unsafe { SendMessageW(other_edit, 0x00b1, 0, 9) };
-        std::fs::write(path, (window as usize).to_string()).expect("fixture ready");
+        ready(window as usize);
         let mut message: FixtureMessage = unsafe { std::mem::zeroed() };
         while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {
             unsafe {
@@ -912,6 +942,33 @@ mod tests {
         }
         unsafe { DestroyWindow(window) };
         unsafe { DestroyWindow(other_window) };
+    }
+
+    struct LocalFixture {
+        window: usize,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl LocalFixture {
+        fn start() -> Self {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let thread = std::thread::spawn(move || {
+                run_hidden_fixture(|window| sender.send(window).expect("fixture receiver"));
+            });
+            Self {
+                window: receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("same-process fixture ready"),
+                thread: Some(thread),
+            }
+        }
+    }
+    impl Drop for LocalFixture {
+        fn drop(&mut self) {
+            unsafe { PostMessageW(self.window as Raw, 0x0010, 0, 0) };
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     struct HiddenFixture {
@@ -1047,6 +1104,7 @@ mod tests {
         ) -> Raw;
         fn DefWindowProcW(window: Raw, message: u32, wparam: usize, lparam: isize) -> isize;
         fn SendMessageW(window: Raw, message: u32, wparam: usize, lparam: isize) -> isize;
+        fn PostMessageW(window: Raw, message: u32, wparam: usize, lparam: isize) -> i32;
         fn GetDlgItem(window: Raw, identifier: i32) -> Raw;
         fn GetMessageW(message: *mut FixtureMessage, window: Raw, min: u32, max: u32) -> i32;
         fn TranslateMessage(message: *const FixtureMessage) -> i32;

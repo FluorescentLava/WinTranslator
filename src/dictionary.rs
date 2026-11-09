@@ -93,13 +93,18 @@ pub fn lookup_chinese(word: &str) -> Option<Entry> {
     reverse_entry(dictionary, key)
 }
 
-/// Resolve a candidate's POS from the matching Chinese sense. A polysemous
-/// English word must not borrow the first POS of an unrelated meaning.
-pub(crate) fn chinese_candidate_parts_of_speech(english: &str, chinese: &str) -> Vec<String> {
+/// Resolve a candidate's POS from the matching Chinese sense. The source gloss
+/// can identify that sense when the two dictionaries use different synonyms.
+/// A polysemous English word must not borrow an unrelated meaning's POS.
+pub(crate) fn chinese_candidate_parts_of_speech(
+    english: &str,
+    chinese: &str,
+    explanation: &str,
+) -> Vec<String> {
     let Some(dictionary) = dictionary() else {
         return Vec::new();
     };
-    candidate_parts_of_speech(dictionary, english, chinese)
+    candidate_parts_of_speech(dictionary, english, chinese, explanation)
 }
 
 pub(crate) fn foreign_candidate(english: &str) -> bool {
@@ -132,7 +137,12 @@ pub(crate) fn foreign_candidate(english: &str) -> bool {
             .all(|sense| foreign_language_gloss(&sense.definition))
 }
 
-fn candidate_parts_of_speech(dictionary: &Dictionary, english: &str, chinese: &str) -> Vec<String> {
+fn candidate_parts_of_speech(
+    dictionary: &Dictionary,
+    english: &str,
+    chinese: &str,
+    explanation: &str,
+) -> Vec<String> {
     let Some(key) = chinese_key(chinese) else {
         return Vec::new();
     };
@@ -155,27 +165,48 @@ fn candidate_parts_of_speech(dictionary: &Dictionary, english: &str, chinese: &s
             .get(dictionary.translation)
             .map_or("", String::as_str),
     );
-    let mut parts = Vec::new();
-    for sense in &source.senses {
-        if sense.part_of_speech.is_empty() || foreign_language_gloss(&sense.definition) {
-            continue;
+    let matching_parts = |keys: &[&str]| {
+        let mut parts = Vec::new();
+        for sense in &source.senses {
+            if sense.part_of_speech.is_empty() || foreign_language_gloss(&sense.definition) {
+                continue;
+            }
+            let matched = sense
+                .definition
+                .split([',', '，', ';', '；', '、', '\n'])
+                .any(|part| {
+                    let Some(candidate) = chinese_key(strip_annotation(part)) else {
+                        return false;
+                    };
+                    keys.iter().any(|key| {
+                        candidate == *key
+                            || (sense.part_of_speech == "adj."
+                                && candidate.strip_suffix('的') == Some(*key))
+                    })
+                });
+            if matched {
+                push_unique(&mut parts, &sense.part_of_speech);
+            }
         }
-        let matched = sense
-            .definition
-            .split([',', '，', ';', '；', '、', '\n'])
-            .any(|part| {
-                let Some(candidate) = chinese_key(strip_annotation(part)) else {
-                    return false;
-                };
-                candidate == key
-                    || (sense.part_of_speech == "adj." && candidate.strip_suffix('的') == Some(key))
-            });
-        if matched {
-            push_unique(&mut parts, &sense.part_of_speech);
-        }
+        parts
+    };
+    let parts = matching_parts(&[key]);
+    if !parts.is_empty() {
+        return parts;
     }
-    if parts.is_empty()
-        && source.parts_of_speech.len() == 1
+    let explained = explanation
+        .split([',', '，', ';', '；', '、', '\n'])
+        .filter(|part| !foreign_language_gloss(part))
+        .filter_map(|part| chinese_key(strip_annotation(part)))
+        .collect::<Vec<_>>();
+    let parts = matching_parts(&explained);
+    // The CE explanation can cover several meanings of the English headword.
+    // Use it only when its exact gloss matches agree on a single POS; otherwise
+    // the Chinese query does not identify which of those meanings was intended.
+    if parts.len() == 1 {
+        return parts;
+    }
+    if source.parts_of_speech.len() == 1
         && source
             .senses
             .iter()
@@ -185,7 +216,7 @@ fn candidate_parts_of_speech(dictionary: &Dictionary, english: &str, chinese: &s
         // dictionary uses another Chinese synonym for this same candidate.
         source.parts_of_speech
     } else {
-        parts
+        Vec::new()
     }
 }
 
@@ -780,20 +811,57 @@ mod tests {
         assert_eq!(love.senses[1].definition, "affection");
         assert_eq!(love.senses[1].part_of_speech, "n.");
         assert_eq!(
-            candidate_parts_of_speech(&dictionary, "light", "明亮"),
+            candidate_parts_of_speech(&dictionary, "light", "明亮", ""),
             ["adj."]
         );
         assert_eq!(
-            candidate_parts_of_speech(&dictionary, "light", "光"),
+            candidate_parts_of_speech(&dictionary, "light", "光", ""),
             ["n."]
         );
-        assert!(candidate_parts_of_speech(&dictionary, "light", "轻松").is_empty());
+        assert!(candidate_parts_of_speech(&dictionary, "light", "轻松", "").is_empty());
         assert_eq!(
-            candidate_parts_of_speech(&dictionary, "hello", "你好"),
+            candidate_parts_of_speech(&dictionary, "hello", "你好", ""),
             ["interj."]
         );
         assert!(reverse_entry(&dictionary, "光线").is_none());
         assert!(reverse_entry(&dictionary, "我想向你表达爱").is_none());
+    }
+
+    #[test]
+    fn candidate_source_glosses_fill_only_unambiguous_matching_parts_of_speech() {
+        let dictionary = Dictionary::from_csv(
+            concat!(
+                "word,phonetic,definition,translation,pos\n",
+                "tomb,,,n. 坟墓；死亡\\nvt. 埋葬,\n",
+                "light,,,n. 光\\na. 轻的；明亮的\\nvt. 点燃,\n",
+            )
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate_parts_of_speech(&dictionary, "tomb", "墓", "坟墓，冢；土棺，石棺；墓碑"),
+            ["n."]
+        );
+        assert_eq!(
+            candidate_parts_of_speech(&dictionary, "tomb", "安葬", "埋葬"),
+            ["vt."]
+        );
+        // Query evidence takes priority over other meanings in a source gloss.
+        assert_eq!(
+            candidate_parts_of_speech(&dictionary, "light", "光", "轻的；点燃"),
+            ["n."]
+        );
+        assert_eq!(
+            candidate_parts_of_speech(&dictionary, "light", "明亮", "光"),
+            ["adj."]
+        );
+        for explanation in ["", "墓碑", "坟墓；埋葬", "（法）坟墓"] {
+            assert!(
+                candidate_parts_of_speech(&dictionary, "tomb", "墓", explanation).is_empty(),
+                "unsupported or ambiguous explanation: {explanation}"
+            );
+        }
+        assert!(candidate_parts_of_speech(&dictionary, "missing", "墓", "坟墓").is_empty());
     }
 
     #[test]
