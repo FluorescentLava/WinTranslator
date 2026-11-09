@@ -24,7 +24,6 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.22000
 WizardStyle=modern
-SetupIconFile=..\assets\icons\app.ico
 UninstallDisplayIcon={app}\WinTranslater.exe
 VersionInfoVersion={#NumericVersion}
 VersionInfoProductVersion={#NumericVersion}
@@ -86,6 +85,8 @@ Filename: "{app}\WinTranslater.exe"; WorkingDir: "{app}"; Description: "{cm:Laun
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\support\stop-app.ps1"" -Executable ""{app}\WinTranslater.exe"""; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopWinTranslater"
 
 [Code]
+#include "finish-page.iss"
+
 var
   RuntimeDownloadPage: TDownloadWizardPage;
   InstallerProgressPage: TOutputMarqueeProgressWizardPage;
@@ -93,6 +94,7 @@ var
 
 procedure InitializeWizard;
 begin
+  ConfigureFinishedRunList;
   RuntimeDownloadPage := CreateDownloadPage(CustomMessage('RuntimeDownloadTitle'),
     CustomMessage('RuntimeDownloadDescription'), nil);
   RuntimeDownloadPage.ShowBaseNameInsteadOfUrl := True;

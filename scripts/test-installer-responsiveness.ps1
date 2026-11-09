@@ -20,9 +20,10 @@ $extractionIdentity = 'WinTranslater extraction ' + $identity
 $installerSourceDirectory = Join-Path $project 'installer'
 $installerSourcePath = Join-Path $installerSourceDirectory 'WinTranslater.iss'
 $installerSource = [IO.File]::ReadAllText($installerSourcePath)
+$finishLayoutPath = Join-Path $installerSourceDirectory 'finish-page.iss'
 $utf8Bom = [Text.UTF8Encoding]::new($true)
 $utf8 = [Text.UTF8Encoding]::new($false)
-$report = [ordered]@{ success = $false; source_sha256 = (Get-FileHash -LiteralPath $installerSourcePath -Algorithm SHA256).Hash.ToLowerInvariant() }
+$report = [ordered]@{ success = $false; source_sha256 = (Get-FileHash -LiteralPath $installerSourcePath -Algorithm SHA256).Hash.ToLowerInvariant(); finish_layout_sha256 = (Get-FileHash -LiteralPath $finishLayoutPath -Algorithm SHA256).Hash.ToLowerInvariant() }
 $completed = $false
 $childExe = Join-Path $testRoot 'finish\payload\WinTranslater.exe'
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
@@ -108,6 +109,7 @@ try {
         $extraction = Join-Path $testRoot 'extraction'
         New-Item -ItemType Directory -Path $extraction -Force | Out-Null
         $source = $installerSource.Replace('[Setup]', "[Setup]`r`nSourceDir=$installerSourceDirectory")
+        $source = $source.Replace('#include "finish-page.iss"', ('#include "' + $finishLayoutPath + '"'))
         $source = [regex]::Replace($source, '(?m)^AppName=.*$', "AppName=$extractionIdentity")
         $source += @'
 
@@ -196,6 +198,8 @@ WizardStyle=modern
 $runAction
 
 [Code]
+#include "$installerSourceDirectory\finish-page.iss"
+
 $callbacks
 function ProbePostMessage(Window: HWND; Msg, WParam, LParam: LongWord): Boolean;
   external 'PostMessageW@user32.dll stdcall';
@@ -203,8 +207,36 @@ function ProbePostMessage(Window: HWND; Msg, WParam, LParam: LongWord): Boolean;
 function ProbeShowWindow(Window: HWND; Command: Integer): Boolean;
   external 'ShowWindow@user32.dll stdcall';
 
+function ProbeGetDpiForWindow(Window: HWND): Integer;
+  external 'GetDpiForWindow@user32.dll stdcall';
+
+procedure VerifyFinishedCheckboxBounds;
+var
+  Theme: THandle;
+  Size: TFinishedCheckSize;
+  Left: Integer;
+begin
+  Theme := OpenFinishedCheckTheme(WizardForm.RunList.Handle, 'Button');
+  if Theme = 0 then RaiseException('The checkbox theme could not be measured.');
+  try
+    if GetFinishedCheckSize(Theme, 0, 3, 5, 0, 1, Size) <> 0 then
+      RaiseException('The checkbox theme size could not be measured.');
+    // Match the Inno owner-draw column, then check the actual Windows glyph
+    // against the client clip. This also fails with the unmodified layout.
+    Left := 13 + WizardForm.RunList.Offset - Size.Width;
+    Log(Format('FINISH checkbox dpi=%d width=%d height=%d offset=%d left=%d', [
+       ProbeGetDpiForWindow(WizardForm.RunList.Handle), Size.Width, Size.Height,
+       WizardForm.RunList.Offset, Left]));
+    if (Size.Width <= 0) or (Size.Height <= 0) or (Left < 0) then
+      RaiseException('The finished-page checkbox exceeds its client clip.');
+  finally
+    CloseFinishedCheckTheme(Theme);
+  end;
+end;
+
 procedure InitializeWizard;
 begin
+  ConfigureFinishedRunList;
   WizardForm.Left := -32000;
   WizardForm.Top := -32000;
   WizardForm.Visible := False;
@@ -217,6 +249,7 @@ begin
     ProbePostMessage(WizardForm.NextButton.Handle, `$00F5, 0, 0);
   if CurPageID = wpFinished then
   begin
+    VerifyFinishedCheckboxBounds;
     Log(Format('FINISH button enabled=%d', [Ord(WizardForm.NextButton.Enabled)]));
     // Only this fixture's own hidden button receives a click; no global input.
     ProbePostMessage(WizardForm.NextButton.Handle, `$00F5, 0, 0);
@@ -234,14 +267,17 @@ end;
     if (-not (Test-Path -LiteralPath $started)) { throw 'Finish did not start the fixture application.' }
     $child = Get-Process -Id ([int][IO.File]::ReadAllText($started)) -ErrorAction SilentlyContinue
     $logText = [IO.File]::ReadAllText($log)
+    $checkbox = [regex]::Match($logText, 'FINISH checkbox dpi=(\d+) width=(\d+) height=(\d+) offset=(\d+) left=(-?\d+)')
     if ($run.exit_code -ne 0 -or -not $child -or
         -not [string]::Equals($child.Path, $childExe, [StringComparison]::OrdinalIgnoreCase) -or
         (Test-Path -LiteralPath (Join-Path $payload 'child-finished.txt')) -or
+        -not $checkbox.Success -or [int]$checkbox.Groups[5].Value -lt 0 -or
         -not $logText.Contains('FINISH button enabled=1') -or
         -not $logText.Contains('WinTranslater launch returned; closing Setup.') -or $run.elapsed_seconds -ge 5) {
         throw 'Finish blocked on application startup, or its launch action failed.'
     }
     $report.finish = [ordered]@{ setup_exit_code = $run.exit_code; setup_seconds = $run.elapsed_seconds; child_startup_seconds = 20; child_still_running = $true; finish_button_enabled = $true; private_unseen_desktop = $true }
+    $report.finish.checkbox = [ordered]@{ dpi = [int]$checkbox.Groups[1].Value; width = [int]$checkbox.Groups[2].Value; height = [int]$checkbox.Groups[3].Value; offset = [int]$checkbox.Groups[4].Value; left = [int]$checkbox.Groups[5].Value }
     $report.success = $true
     $completed = $true
     if ($KeepArtifacts) { $report.artifact_directory = $testRoot }
