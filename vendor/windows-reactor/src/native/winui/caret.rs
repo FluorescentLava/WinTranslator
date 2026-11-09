@@ -1,4 +1,4 @@
-//! Guarded workaround for the native DestInvert caret over a transparent system backdrop.
+//! Native DestInvert caret rendering over a transparent system backdrop.
 //!
 //! The identifying invariants come from Microsoft's TextBoxView.cpp, EnsureCaretElement and
 //! CreateCaretShape. VisualTreeHelper returns the ordinary child collection, including this shape.

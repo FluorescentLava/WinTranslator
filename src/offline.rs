@@ -511,9 +511,7 @@ pub fn translate_cancellable(
             Err(_) => anyhow::bail!("离线引擎不可用"),
         }
     };
-    // Loading the first model must not consume the first sentence's inference
-    // budget. Every following chunk receives its own budget, so a document's
-    // allowed work grows with its length instead of sharing a three-second cap.
+    // Each chunk has an independent inference budget that excludes model loading.
     let model = engine.model(&format!("{from}-{to}"))?;
     anyhow::ensure!(!cancelled(), "已取消");
     let long_document = text.chars().take(241).count() > 240;

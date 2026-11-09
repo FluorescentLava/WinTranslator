@@ -1,9 +1,9 @@
-# Application icon
+# 应用图标来源
 
-The WinTranslater icon is the user's selected paper-structure variant D: an original translation mark using two curved, asymmetrical pages with consistent edge thickness and connected fold geometry. The front-left golden-yellow page blends through orange into coral at the turned edge. The shorter rear-right page rises toward a rounded upper corner and transitions from coral through rose-magenta into saturated medium purple, with a continuous right edge and lower contour following the user's guide. Broad satin highlights and a warm contact shadow give the pages soft volume. Both `A` and `文` are white, medium-sized, and matched in optical prominence. The compact, nearly square silhouette is centered with safe margins for taskbar and tray use. It is not a Microsoft application logo.
+WinTranslater 图标由两张弯曲纸页和白色 `A`、`文` 组成。前页使用金黄、橙色至珊瑚色渐变，后页使用珊瑚色、玫红至紫色渐变，配合折角、柔和高光与阴影。图案居中并保留边距，用于窗口、任务栏和托盘。
 
-Design reference: Jon Friedman, Microsoft Design, [Fluid forms, vibrant colors](https://microsoft.design/articles/fluid-forms-vibrant-colors/), 1 October 2025. The relevant design principles are simpler silhouettes, soft folds and curves, richer analogous gradients, clear layering, and legibility at small sizes. The user also supplied a PowerPoint icon screenshot as a reference for material depth and the small proportion of lettering; the translation mark retains its own two-page silhouette and glyphs.
+设计参考：Jon Friedman，Microsoft Design，[Fluid forms, vibrant colors](https://microsoft.design/articles/fluid-forms-vibrant-colors/)，2025 年 10 月 1 日；以及 Microsoft PowerPoint 图标的材质层次与文字比例。应用图标采用独立的双页轮廓和翻译字符。
 
-Generated with the user-supplied image service using its `gpt-image-2` model. The final transparent PNG preserves the generated alpha channel, crops imperceptible outer residue, and centers the mark on a square canvas with safe margins. The multi-resolution ICO is derived from the same image for Explorer, the tray, and window icons. The final generation prompt is recorded in `app-generation-prompt.txt`; credentials are not included.
+`app.png` 使用 `gpt-image-2` 生成，保留透明背景并居中为方形画布；多分辨率 `app.ico` 由同一图像生成。原始生成提示保存在 `app-generation-prompt.txt`。
 
-The small language-swap path is drawn locally: two parallel thin arrows, each with one outer barb, matching the supplied interface reference. It is separate from the application icon.
+`arrow-swap.path` 是本项目绘制的语言交换箭头，由两条带单侧箭头的平行线组成，采用本仓库的 MIT 许可证。

@@ -114,15 +114,14 @@ function Copy-PayloadFile([string]$Source, [string]$Relative) {
 }
 try {
     Copy-PayloadFile $binary 'WinTranslater.exe'
-    # Explicit build/resource allowlist: never copy an installed folder or user profile.
-    # Reuse the registered Windows App Runtime. Never collect stale DLLs or
-    # locale directories left in Cargo's target by an earlier portable build.
+    # The payload allowlist includes application resources and app-local CRT;
+    # WinUI uses the registered Windows App Runtime.
     Get-ChildItem -LiteralPath $VcRuntimeDirectory -Filter '*.dll' -File |
         ForEach-Object { Copy-PayloadFile $_.FullName $_.Name }
     foreach ($name in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
         Copy-PayloadFile (Join-Path $project $name) $name
     }
-    foreach ($directory in @('assets', 'licenses')) {
+    foreach ($directory in @('assets', 'docs', 'licenses')) {
         Copy-Item -LiteralPath (Join-Path $project $directory) -Destination $stage -Recurse
     }
     foreach ($name in @('onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'LICENSE.txt')) {

@@ -41,8 +41,7 @@ fn main() {
             return;
         }
     };
-    // Resolve and decrypt the primary window's configuration before WinUI starts.
-    // Manual launch and background activation must publish the same loaded state.
+    // Load and decrypt configuration before initializing WinUI window state.
     let mut initial_configuration = storage::load();
     let mut initial_text = String::new();
     if background {

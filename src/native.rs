@@ -1048,9 +1048,8 @@ unsafe extern "system" fn popup_proc(
         } else if DEFER_EXTERNAL_GEOMETRY.with(Cell::get)
             || (!APPLYING_FRAME.with(Cell::get) && !MANUAL_MOVE.with(Cell::get))
         {
-            // Only an acknowledged popup frame owns programmatic geometry.
-            // In particular, a cached AppWindow client size or the default DPI
-            // handler must not first resize one way and then get corrected back.
+            // Only an acknowledged popup frame owns programmatic geometry;
+            // AppWindow and default DPI handling cannot override that frame.
             position.flags |= 0x0001 | 0x0002;
         }
     }

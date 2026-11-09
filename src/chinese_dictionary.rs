@@ -51,7 +51,7 @@ struct CachedSense {
 /// Supplement one Chinese dictionary word with exact Chinese-English senses.
 /// Only at most sixteen Han characters are sent; punctuation, spaces inside a
 /// query, mixed scripts and longer text are rejected before any network access.
-/// Network failure is optional: a previously cached entry works offline.
+/// Cached entries remain available offline when the network lookup fails.
 pub fn lookup(text: &str, cancelled: &dyn Fn() -> bool) -> Option<Entry> {
     let query = chinese_word(text)?;
     if cancelled() {

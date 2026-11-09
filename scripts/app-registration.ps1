@@ -68,7 +68,7 @@ function Test-WinTranslaterPayloadPath([string]$RelativePath) {
     }).Count -ne 0) { return $false }
     if ($segments.Count -eq 1) { return $segments[0] -match '^(WinTranslater\.exe|README\.md|LICENSE|THIRD_PARTY_NOTICES\.md|[^.][^\\/]*\.(dll|pri|manifest))$' }
     if ($segments[0] -ieq 'scripts') { return $segments.Count -eq 2 -and $segments[1] -in $script:WinTranslaterSupportFiles }
-    $segments[0] -in @('assets', 'dictionary', 'licenses', 'models', 'runtime') -or $segments[0] -cmatch '^[a-z]{2}(-[A-Za-z0-9]+)*$'
+    $segments[0] -in @('assets', 'dictionary', 'docs', 'licenses', 'models', 'runtime') -or $segments[0] -cmatch '^[a-z]{2}(-[A-Za-z0-9]+)*$'
 }
 
 function Get-WinTranslaterPayloadFiles([string]$Directory, [string[]]$DataDirectories = @()) {

@@ -1701,6 +1701,9 @@ impl Translator {
                         )),
                         ToggleSwitch::new()
                             .is_on(self.settings.auto_start)
+                            .min_width(0.0)
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .vertical_alignment(Center)
                             .automation_name("开机启动")
                             .on_toggled(cx.callback(Message::AutoStart))
                             .grid_column(1),
@@ -1717,6 +1720,9 @@ impl Translator {
                         )),
                         ToggleSwitch::new()
                             .is_on(self.settings.auto_pair)
+                            .min_width(0.0)
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .vertical_alignment(Center)
                             .automation_name("自动选择中英方向")
                             .on_toggled(cx.callback(Message::AutoPair))
                             .grid_column(1),
@@ -1737,6 +1743,9 @@ impl Translator {
                         )),
                         ToggleSwitch::new()
                             .is_on(self.settings.auto_offline)
+                            .min_width(0.0)
+                            .horizontal_alignment(HorizontalAlignment::Right)
+                            .vertical_alignment(Center)
                             .automation_name("自动使用离线翻译")
                             .on_toggled(cx.callback(Message::AutoOffline))
                             .grid_column(1),
