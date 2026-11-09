@@ -34,7 +34,8 @@ pub enum Message {
     PopupFrame(native::PopupFrame),
     Pronounce(crate::speech::Accent),
     Pronounced(u64, Result<(), String>),
-    PhoneticsReady(u64, Result<crate::speech::Phonetics, String>),
+    LocalPhoneticReady(u64, String, String),
+    PhoneticsReady(u64, String, Result<crate::speech::Phonetics, String>),
     ColorScheme(ColorScheme),
     RepairCaret(u8),
     RetryCaret(u8),
@@ -106,6 +107,8 @@ pub struct Translator {
     speech_task: Option<ComponentTask>,
     speech_revision: u64,
     speech_error: Option<String>,
+    phonetics_word: String,
+    local_phonetic: String,
     phonetics: Option<crate::speech::Phonetics>,
     phonetics_task: Option<ComponentTask>,
     selection_task: Option<ComponentTask>,
@@ -240,6 +243,23 @@ const POPUP_WIDTH: f64 = 480.0;
 const POPUP_CONTENT_WIDTH: f64 = POPUP_WIDTH - 32.0;
 fn icon(path: &str) -> FontIcon {
     FontIcon::new().glyph(path)
+}
+fn speaker_icon() -> View {
+    Viewbox::new()
+        .width(14.0)
+        .height(14.0)
+        .stretch(windows_reactor::Stretch::Uniform)
+        .opacity(0.7)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(Center)
+        .slot(
+            ViewboxSlot::Child,
+            icon("\u{E994}")
+                .width(20.0)
+                .height(20.0)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(Center),
+        )
 }
 fn provider_icon(provider: Provider) -> Image {
     let data: &'static [u8] = match provider {
@@ -381,19 +401,41 @@ impl Translator {
     }
 
     fn load_phonetics(&mut self, cx: &ComponentContext<Self>) {
-        if let Some(task) = self.phonetics_task.take() {
-            task.cancel();
+        let word = self
+            .pronunciation_text()
+            .filter(|text| crate::speech::supports_word_phonetics(text))
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if word != self.phonetics_word {
+            if let Some(task) = self.phonetics_task.take() {
+                task.cancel();
+            }
+            self.phonetics_word = word.clone();
+            self.phonetics = None;
+            self.local_phonetic.clear();
         }
-        self.phonetics = None;
-        if let Some(text) = self.pronunciation_text().map(str::to_owned) {
-            let revision = self.revision;
-            self.phonetics_task = Some(cx.spawn_background(move |cancel| {
-                Message::PhoneticsReady(
-                    revision,
-                    crate::speech::phonetics(&text, &|| cancel.is_cancelled()),
-                )
-            }));
+        if word.is_empty()
+            || self.phonetics_task.is_some()
+            || self
+                .phonetics
+                .as_ref()
+                .is_some_and(|value| !value.british.is_empty() && !value.american.is_empty())
+        {
+            return;
         }
+        let revision = self.revision;
+        self.phonetics_task = Some(cx.spawn_background(move |cancel| {
+            // The English result of a Chinese lookup needs its own local IPA;
+            // the translation entry contains Chinese headwords in that case.
+            let local = if cancel.is_cancelled() {
+                String::new()
+            } else {
+                crate::dictionary::lookup(&word)
+                    .map(|entry| entry.phonetic)
+                    .unwrap_or_default()
+            };
+            Message::LocalPhoneticReady(revision, word, local)
+        }));
     }
 
     fn pronunciation_controls(&self, cx: &ViewContext<Self>) -> View {
@@ -406,39 +448,49 @@ impl Translator {
                 .width(32.0)
                 .height(32.0)
                 .min_width(0.0)
-                .padding(4.0)
+                .min_height(32.0)
+                .padding(0.0)
                 .horizontal_alignment(HorizontalAlignment::Left)
+                .vertical_alignment(Center)
                 .horizontal_content_alignment(HorizontalAlignment::Center)
                 .vertical_content_alignment(Center)
                 .automation_name("朗读")
                 .on_click(cx.message(Message::Pronounce(crate::speech::Accent::American)))
-                .content(
-                    Viewbox::new()
-                        .width(14.0)
-                        .height(14.0)
-                        .stretch(windows_reactor::Stretch::Uniform)
-                        .opacity(0.7)
-                        .vertical_alignment(Center)
-                        .slot(ViewboxSlot::Child, icon("\u{E993}")),
-                )
+                .content(speaker_icon())
                 .tooltip("朗读")
                 .into();
         }
-        let common_phonetic =
-            self.entry
-                .as_ref()
-                .filter(|entry| {
-                    entry.direction == crate::dictionary::LookupDirection::EnglishToChinese
-                        && entry.word.eq_ignore_ascii_case(pronunciation)
-                        && self.phonetics.as_ref().is_none_or(|value| {
-                            value.british.is_empty() && value.american.is_empty()
+        let phonetics = self
+            .phonetics
+            .as_ref()
+            .filter(|_| self.phonetics_word.eq_ignore_ascii_case(pronunciation));
+        let common_phonetic = if phonetics
+            .is_none_or(|value| value.british.is_empty() && value.american.is_empty())
+        {
+            let local = self
+                .phonetics_word
+                .eq_ignore_ascii_case(pronunciation)
+                .then_some(self.local_phonetic.as_str())
+                .filter(|value| !value.trim().is_empty());
+            local
+                .or_else(|| {
+                    self.entry
+                        .as_ref()
+                        .filter(|entry| {
+                            entry.direction == crate::dictionary::LookupDirection::EnglishToChinese
+                                && entry.word.eq_ignore_ascii_case(pronunciation)
                         })
+                        .map(|entry| entry.phonetic.as_str())
                 })
-                .map(|entry| entry.phonetic.trim().trim_matches('/').trim())
-                .filter(|phonetic| !phonetic.is_empty());
+                .map(|value| value.trim().trim_matches('/').trim())
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
         let accents = Grid::new()
             .columns([Auto, Auto])
             .horizontal_alignment(HorizontalAlignment::Left)
+            .vertical_alignment(Center)
             .column_spacing(8.0)
             .keyed_children(
                 [
@@ -448,7 +500,7 @@ impl Translator {
                 .into_iter()
                 .enumerate()
                 .map(|(index, (accent, label, name))| {
-                    let phonetic = self.phonetics.as_ref().map_or("", |value| match accent {
+                    let phonetic = phonetics.map_or("", |value| match accent {
                         crate::speech::Accent::British => value.british.as_str(),
                         crate::speech::Accent::American => value.american.as_str(),
                     });
@@ -464,6 +516,7 @@ impl Translator {
                             Grid::new()
                                 .columns([Auto, Auto, Auto])
                                 .horizontal_alignment(HorizontalAlignment::Left)
+                                .vertical_alignment(Center)
                                 .column_spacing(4.0)
                                 .children((
                                     text(label, 14.0)
@@ -485,21 +538,14 @@ impl Translator {
                                         .height(28.0)
                                         .min_width(0.0)
                                         .min_height(28.0)
-                                        .padding(7.0)
+                                        .padding(0.0)
+                                        .vertical_alignment(Center)
                                         .horizontal_content_alignment(HorizontalAlignment::Center)
                                         .vertical_content_alignment(Center)
                                         .automation_name(name)
                                         .on_click(cx.message(Message::Pronounce(accent)))
                                         .grid_column(2)
-                                        .content(
-                                            Viewbox::new()
-                                                .width(14.0)
-                                                .height(14.0)
-                                                .stretch(windows_reactor::Stretch::Uniform)
-                                                .opacity(0.7)
-                                                .vertical_alignment(Center)
-                                                .slot(ViewboxSlot::Child, icon("\u{E993}")),
-                                        )
+                                        .content(speaker_icon())
                                         .tooltip(format!("{name} {phonetic}")),
                                 )),
                             0,
@@ -538,7 +584,8 @@ impl Translator {
         }
         self.revision += 1;
         self.busy = false;
-        self.phonetics = None;
+        // Hiding cancels work without discarding the displayed word's IPA.
+        // A different pronunciation word is reset by load_phonetics instead.
         if let Some(task) = self.phonetics_task.take() {
             task.cancel();
         }
@@ -1886,6 +1933,8 @@ impl Component for Translator {
             speech_task: None,
             speech_revision: 0,
             speech_error: None,
+            phonetics_word: String::new(),
+            local_phonetic: String::new(),
             phonetics: None,
             phonetics_task: None,
             selection_task: None,
@@ -1964,7 +2013,21 @@ impl Component for Translator {
                 self.speech_task = None;
                 self.speech_error = result.err();
             }
-            Message::PhoneticsReady(revision, result) if revision == self.revision => {
+            Message::LocalPhoneticReady(revision, word, phonetic)
+                if revision == self.revision && word == self.phonetics_word =>
+            {
+                self.phonetics_task = None;
+                if !phonetic.trim().is_empty() {
+                    self.local_phonetic = phonetic;
+                }
+                self.phonetics_task = Some(cx.spawn_background(move |cancel| {
+                    let result = crate::speech::phonetics(&word, &|| cancel.is_cancelled());
+                    Message::PhoneticsReady(revision, word, result)
+                }));
+            }
+            Message::PhoneticsReady(revision, word, result)
+                if revision == self.revision && word == self.phonetics_word =>
+            {
                 self.phonetics_task = None;
                 storage::diagnostic(serde_json::json!({
                     "event": "word_phonetics",
@@ -1972,7 +2035,15 @@ impl Component for Translator {
                     "american": result.as_ref().is_ok_and(|value| !value.american.is_empty()),
                     "error": result.as_ref().err(),
                 }));
-                self.phonetics = result.ok();
+                if let Ok(value) = result {
+                    let current = self.phonetics.get_or_insert_with(Default::default);
+                    if !value.british.is_empty() {
+                        current.british = value.british;
+                    }
+                    if !value.american.is_empty() {
+                        current.american = value.american;
+                    }
+                }
             }
             Message::ColorScheme(scheme) => self.color_scheme = scheme,
             Message::RepairCaret(attempt) => self.repair_caret(cx, attempt),
@@ -2061,6 +2132,10 @@ impl Component for Translator {
                     || (!self.text.trim().is_empty() && self.output.is_none())
                 {
                     self.schedule(cx);
+                } else {
+                    // A lookup cancelled while hiding must restart even when
+                    // the translation itself is still current.
+                    self.load_phonetics(cx);
                 }
             }
             Message::PopupActivated(revision)
