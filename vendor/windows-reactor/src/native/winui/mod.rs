@@ -2340,8 +2340,10 @@ impl WinUiRuntime {
                                 .SetFlyoutPresenterStyle(None::<&Style>)
                                 .map_err(native_error)?;
                         } else {
+                            // Keep the native corner radius, surface, and template
+                            // when overriding the presenter's spacing constraints.
                             let mut xaml = String::from(
-                                "<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' TargetType='FlyoutPresenter'>",
+                                "<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' TargetType='FlyoutPresenter' BasedOn='{StaticResource DefaultFlyoutPresenterStyle}'>",
                             );
                             if let Some(padding) = padding {
                                 write!(

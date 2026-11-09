@@ -1369,7 +1369,7 @@ impl Translator {
                 ))
                 .placement(FlyoutPlacement::TopEdgeAlignedLeft)
                 .constrain_to_root_bounds(false)
-                .padding(0.0)
+                .padding(4.0)
                 .min_width(0.0)
                 .min_height(0.0)
                 .on_closed(move || {
