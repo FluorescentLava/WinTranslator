@@ -1,8 +1,8 @@
 //! Optional layout for the native NavigationView left-menu repeater.
 //!
 //! The NavigationViewItems and NavigationView selection model remain native.
-//! Only the template's MenuItemsHost Layout is replaced, so selection indicators,
-//! keyboard focus, invocation, and accessibility stay owned by NavigationView.
+//! MenuItemsHost layout and compact item spacing are adjusted. Selection
+//! indicators, keyboard focus, invocation, and accessibility remain native.
 
 use super::bindings::{
     Control, DependencyObject, DependencyProperty, DispatcherQueue, DispatcherQueueTimer,
@@ -229,6 +229,7 @@ fn apply(control: &NavigationView, state: &mut LayoutState) -> windows_core::Res
             repeater.SetLayout(layout)?;
             state.applied = true;
         }
+        let mut compact_items_ready = true;
         if state.compact {
             for element in chrome {
                 set_compact_property(state, &element, FrameworkElement::MinHeightProperty()?, 0.0)?;
@@ -289,8 +290,40 @@ fn apply(control: &NavigationView, state: &mut LayoutState) -> windows_core::Res
                     )?;
                 }
             }
+            // A compact row is 36 DIP. Its native LayoutRoot has 2 DIP of
+            // margin above and below, so its content must fit in 32 DIP. The
+            // default 36-DIP template minimum otherwise clips the lower corners.
+            let mut pending = vec![repeater.cast::<DependencyObject>()?];
+            let mut visited = 0;
+            let mut item_roots = 0;
+            while let Some(element) = pending.pop() {
+                visited += 1;
+                if visited > MAX_VISITED {
+                    break;
+                }
+                let name = element
+                    .cast::<IFrameworkElement>()
+                    .and_then(|element| element.Name())
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_default();
+                if matches!(name.as_str(), "LayoutRoot" | "ContentGrid") {
+                    set_compact_property(
+                        state,
+                        &element,
+                        FrameworkElement::MinHeightProperty()?,
+                        32.0,
+                    )?;
+                    item_roots += usize::from(name == "LayoutRoot");
+                }
+                for index in 0..tree.count(&element)? {
+                    pending.push(tree.child(&element, index)?);
+                }
+            }
+            // Item templates can be realized after the repeater's own layout.
+            // Keep the existing bounded retry active until they are available.
+            compact_items_ready = item_roots > 0;
         }
-        Ok(state.applied)
+        Ok(state.applied && compact_items_ready)
     })
 }
 
