@@ -10,9 +10,9 @@
 
 在 [GitHub Releases](https://github.com/FluorescentLava/WinTranslator/releases) 下载并运行 `WinTranslater-0.1.0-Beta-windows-x64-setup.exe`。需要 Windows 11 x64；安装包包含本地词典及中英双向离线模型，无需安装 Rust 或 Python。API 密钥需在设置中自行填写。
 
-默认安装到 `%LOCALAPPDATA%\Programs\WinTranslater`，创建开始菜单入口和系统卸载项，无需管理员权限。安装包的 SHA-256 校验值见同一 Release 的 `SHA256SUMS.txt`。升级或卸载保留本机配置和 API 凭据。
+默认安装到 `%LOCALAPPDATA%\Programs\WinTranslater`，创建开始菜单入口和系统卸载项，无需管理员权限。升级或卸载保留本机配置和 API 凭据。
 
-程序使用系统已为当前用户注册的 Windows App Runtime 2.4 或更新的兼容 2.x x64 版本。安装程序先检查现有运行库；缺少兼容版本时才从微软官网下载官方安装程序，校验 SHA-256 和 Microsoft 数字签名，再安装并复查。已有兼容运行库时不下载、不重复安装，离线也可完成应用安装。运行库下载信息在 `installer/runtime.json` 中固定。
+程序使用系统已为当前用户注册的 Windows App Runtime 2.4 或更新的兼容 2.x x64 版本。安装程序先检查现有运行库；缺少兼容版本时才从微软官网下载官方安装程序，校验文件完整性和 Microsoft 数字签名，再安装并复查。已有兼容运行库时不下载、不重复安装，离线也可完成应用安装。运行库下载信息在 `installer/runtime.json` 中固定。
 
 此前已安装附带 WinUI 运行库的安装包时，重新运行新版安装程序会按旧安装清单清理随包附带的 WinUI DLL 和各国语言目录；系统共享运行库由 Windows 维护，卸载应用时保留。
 
@@ -86,7 +86,7 @@
 .\scripts\download-dictionary.ps1
 ```
 
-运行库位于 `runtime/`，模型位于 `models/en-zh/`、`models/zh-en/`，词典位于 `dictionary/`。模型下载记录上游修订、文件大小和 SHA-256 校验信息。
+运行库位于 `runtime/`，模型位于 `models/en-zh/`、`models/zh-en/`，词典位于 `dictionary/`。模型下载记录上游修订、文件大小和完整性校验信息。
 
 超过 5,000 字符时自动使用本地模型翻译全文。离线长文按句界、词界和模型 token 数顺序分段，保留段落；修改输入会取消尚未完成的任务。模型译文与词典释义是不同来源，多义词和部分句子的译文仍可能不准确。
 
@@ -133,7 +133,7 @@ cargo test --locked -- --include-ignored
 .\scripts\package-release.ps1 -IsccPath 'C:\Tools\Inno Setup 6\ISCC.exe'
 ```
 
-脚本自动构建使用系统 Windows App Runtime 的版本，校验模型文件的 SHA-256，收集应用需要的 Visual C++ DLL，在 `dist/` 生成安装程序及 `SHA256SUMS.txt`。版本读取 `Cargo.toml`，必须与 `app.rc` 的产品版本一致。Inno Setup 配置在 `installer/WinTranslater.iss`；运行库检查、下载和安装由安装程序处理。资源从构建输出和源码目录的明确清单收集，不读取用户配置目录，也不收集旧自包含构建残留的 WinUI 文件。
+脚本自动构建使用系统 Windows App Runtime 的版本，校验模型文件完整性，收集应用需要的 Visual C++ DLL，在 `dist/` 生成安装程序。版本读取 `Cargo.toml`，必须与 `app.rc` 的产品版本一致。Inno Setup 配置在 `installer/WinTranslater.iss`；运行库检查、下载和安装由安装程序处理。资源从构建输出和源码目录的明确清单收集，不读取用户配置目录，也不收集旧自包含构建残留的 WinUI 文件。
 
 已有普通 Release 构建时，可传 `-SkipBuild -TargetDirectory '<Cargo target 目录>'`；脚本读取 EXE 内嵌 manifest，拒绝将自包含版本打进此安装包。Visual Studio 的 CRT 目录未自动找到时，可通过 `-VcRuntimeDirectory '<x64\Microsoft.VC143.CRT 目录>'` 指定。安装逻辑测试可运行 `.\scripts\test-installer.ps1`。
 

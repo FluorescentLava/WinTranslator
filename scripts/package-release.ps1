@@ -160,9 +160,9 @@ try {
     & $IsccPath "/DAppVersion=$version" "/DNumericVersion=$numericVersion" "/DPayloadDir=$stage" "/DReleaseDir=$OutputDirectory" "/DRuntimeUrl=$($runtimeSpec.url)" "/DRuntimeSHA256=$($runtimeSpec.sha256)" (Join-Path $project 'installer\WinTranslater.iss')
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
     $installer = Get-Item -LiteralPath (Join-Path $OutputDirectory "WinTranslater-$version-windows-x64-setup.exe")
-    $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    [IO.File]::WriteAllText((Join-Path $OutputDirectory 'SHA256SUMS.txt'), "$hash  $($installer.Name)`n", $utf8)
-    [pscustomobject]@{ Installer = $installer.FullName; Bytes = $installer.Length; SHA256 = $hash; Stage = $(if ($KeepStage) { $stage } else { $null }) }
+    $legacyChecksum = Join-Path $OutputDirectory 'SHA256SUMS.txt'
+    if (Test-Path -LiteralPath $legacyChecksum -PathType Leaf) { Remove-Item -LiteralPath $legacyChecksum -Force }
+    [pscustomobject]@{ Installer = $installer.FullName; Bytes = $installer.Length; Stage = $(if ($KeepStage) { $stage } else { $null }) }
 } finally {
     if (-not $KeepStage) {
         $resolvedStage = [IO.Path]::GetFullPath($stage)
