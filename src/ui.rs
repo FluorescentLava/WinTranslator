@@ -118,6 +118,7 @@ pub struct Translator {
     input: ElementRef<TextBox>,
     provider_button: ElementRef<Button>,
     popup_surface: ElementRef<Border>,
+    popup_animation_revision: Option<u64>,
 }
 fn text(value: impl Into<String>, size: f64) -> TextBlock {
     TextBlock::new()
@@ -851,6 +852,28 @@ impl Translator {
                 .sender()
                 .send(Message::InputFocusResult(revision, attempt, false));
         }
+    }
+    fn reveal_popup(&mut self, revision: u64) {
+        if !native::popup_show_animation_is_current(revision)
+            || self.popup_animation_revision == Some(revision)
+        {
+            return;
+        }
+        self.popup_animation_revision = Some(revision);
+        let _ = self.popup_surface.request_slide_y(
+            native::popup_slide_distance(),
+            0.0,
+            1.0,
+            1.0,
+            280,
+            |result| {
+                storage::diagnostic(serde_json::json!({
+                    "event":"popup_show_animation",
+                    "completed":matches!(result, Ok(true)),
+                    "cancelled":matches!(result, Ok(false)),
+                }));
+            },
+        );
     }
     fn popup(&self, cx: &mut ViewContext<Self>) -> View {
         cx.on_color_scheme(cx.callback(Message::ColorScheme));
@@ -1623,9 +1646,7 @@ impl Translator {
                                 .column_spacing(12.0)
                                 .children((
                                     text(route.label, 13.0).vertical_alignment(Center),
-                                    muted(description)
-                                        .vertical_alignment(Center)
-                                        .grid_column(1),
+                                    muted(description).vertical_alignment(Center).grid_column(1),
                                 )),
                             progress,
                         )),
@@ -1655,10 +1676,11 @@ impl Translator {
                         .content("保存凭据"),
                 )),
             ),
-            self.card(StackPanel::new().spacing(10.0).children((
-                text("用量明细", 14.0),
-                route_rows,
-            ))),
+            self.card(
+                StackPanel::new()
+                    .spacing(10.0)
+                    .children((text("用量明细", 14.0), route_rows)),
+            ),
             StackPanel::new().spacing(4.0).children((
                 text("在线路由", 12.0).opacity(0.75),
                 muted(order),
@@ -1975,6 +1997,7 @@ impl Component for Translator {
             input: ElementRef::new(),
             provider_button: ElementRef::new(),
             popup_surface: ElementRef::new(),
+            popup_animation_revision: None,
         }
     }
     fn update(&mut self, message: Message, cx: &ComponentContext<Self>) {
@@ -2172,23 +2195,13 @@ impl Component for Translator {
             Message::PopupActivated(revision)
                 if native::popup_show_animation_is_current(revision) =>
             {
-                let _ = self.popup_surface.request_slide_y(
-                    native::popup_slide_distance(),
-                    0.0,
-                    1.0,
-                    1.0,
-                    280,
-                    |result| {
-                        storage::diagnostic(serde_json::json!({
-                            "event":"popup_show_animation",
-                            "completed":matches!(result, Ok(true)),
-                            "cancelled":matches!(result, Ok(false)),
-                        }));
-                    },
-                );
-                // The slide request reconnects WinUI's input site first. Focus
-                // in that same publication; delayed verification is a fallback.
-                self.focus_popup_input(cx, revision, 0);
+                // Keep the first card invisible until ContentIsland is active;
+                // foreground HWND and logical TextBox focus alone are not enough.
+                if native::popup_is_foreground() {
+                    self.focus_popup_input(cx, revision, 0);
+                } else {
+                    self.reveal_popup(revision);
+                }
             }
             Message::PopupFocusReady(revision)
                 if native::popup_show_animation_is_current(revision)
@@ -2210,11 +2223,18 @@ impl Component for Translator {
                 }));
                 if focused && keyboard_focus {
                     self.repair_caret(cx, 0);
-                } else if attempt < 6 {
+                    self.reveal_popup(revision);
+                } else if self.popup_animation_revision != Some(revision) && attempt < 6 {
+                    if attempt >= 1 {
+                        native::recover_popup_input_activation(revision);
+                    }
                     cx.spawn_background(move |_| {
                         std::thread::sleep(std::time::Duration::from_millis(40));
                         Message::FocusPopupInput(revision, attempt + 1)
                     });
+                } else {
+                    // Still show a usable surface if an input provider fails.
+                    self.reveal_popup(revision);
                 }
             }
             Message::PopupDismissed(revision)

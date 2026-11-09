@@ -28,6 +28,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(8);
 const MAX_SELECTION_UNITS: usize = 1_048_576;
 const MAX_SELECTION_RANGES: i32 = 16;
 const MAX_ANCESTORS: usize = 6;
+const MAX_TEXT_ELEMENTS: i32 = 32;
 // A provider which ignores RPC cancellation may outlive our deadline. Keep only
 // one such worker instead of leaking another thread on every hotkey press.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -183,74 +184,180 @@ fn read_selection(context: &Context) -> Option<String> {
     if !context.active() {
         return None;
     }
-    let mut element: Com<ElementVtable> =
-        owned(|out| unsafe { (automation.vtable().focused)(automation.raw(), out) })?;
+    match read_focused_selection(&automation, context) {
+        Selection::Text(value) => return context.active().then_some(value),
+        Selection::Protected => return None,
+        Selection::Unsupported | Selection::Empty | Selection::Failed => {}
+    }
+    // A text selection need not own keyboard focus. For example, a document
+    // can keep its selection while an embedded control owns focus. Ancestors
+    // of GetFocusedElement can never reach a sibling document in that case.
+    // Query only TextPattern providers inside the snapshotted source HWND, and
+    // read only their explicit selections, under the same capture deadline.
+    read_scoped_selection(&automation, context.request.window as Raw, &|| {
+        context.active()
+    })
+}
+
+fn read_focused_selection(automation: &Com<AutomationVtable>, context: &Context) -> Selection {
+    let Some(mut element): Option<Com<ElementVtable>> =
+        owned(|out| unsafe { (automation.vtable().focused)(automation.raw(), out) })
+    else {
+        return Selection::Failed;
+    };
     let mut walker: Option<Com<TreeWalkerVtable>> = None;
     for _ in 0..MAX_ANCESTORS {
-        if !context.active() || !safe_element(&element, context) {
-            return None;
+        match element_safety(&element, context.request.window as Raw, &|| {
+            context.active()
+        }) {
+            ElementSafety::Allowed => {}
+            ElementSafety::Protected => return Selection::Protected,
+            ElementSafety::Outside => return Selection::Failed,
         }
-        match selected_ranges(&element, context) {
-            Selection::Text(value) => return context.active().then_some(value),
-            Selection::Empty | Selection::Failed => return None,
-            Selection::Unsupported => {}
+        match selected_ranges(&element, &|| context.active()) {
+            Selection::Text(value) => return Selection::Text(value),
+            Selection::Failed | Selection::Protected => return Selection::Failed,
+            Selection::Unsupported | Selection::Empty => {}
         }
-        // Walk only ancestors of the focused element, never document children,
-        // siblings or a desktop-wide search. Stop at the source native window.
+        // Try focused ancestors before searching the source HWND's providers.
+        // Stop this walk at the source native window.
         let mut native_window = std::ptr::null_mut();
         let status = unsafe { (element.vtable().native_window)(element.raw(), &mut native_window) };
         if status >= 0 && native_window == context.request.window as Raw {
-            return None;
+            return Selection::Empty;
         }
         if !context.active() {
-            return None;
+            return Selection::Failed;
         }
         if walker.is_none() {
             walker = owned(|out| unsafe { (automation.vtable().walker)(automation.raw(), out) });
         }
-        let parent = walker.as_ref()?;
-        element =
-            owned(|out| unsafe { (parent.vtable().parent)(parent.raw(), element.raw(), out) })?;
+        let Some(parent) = walker.as_ref() else {
+            return Selection::Failed;
+        };
+        let Some(ancestor) =
+            owned(|out| unsafe { (parent.vtable().parent)(parent.raw(), element.raw(), out) })
+        else {
+            return Selection::Empty;
+        };
+        element = ancestor;
+    }
+    Selection::Empty
+}
+
+fn read_scoped_selection(
+    automation: &Com<AutomationVtable>,
+    source: Raw,
+    active: &dyn Fn() -> bool,
+) -> Option<String> {
+    if !active() {
+        return None;
+    }
+    let root: Com<ElementVtable> =
+        owned(|out| unsafe { (automation.vtable().from_handle)(automation.raw(), source, out) })?;
+    if !matches!(
+        element_safety(&root, source, active),
+        ElementSafety::Allowed
+    ) {
+        return None;
+    }
+    if let Selection::Text(value) = selected_ranges(&root, active) {
+        return active().then_some(value);
+    }
+    if !active() {
+        return None;
+    }
+    let condition: Com<UnknownVtable> = owned(|out| unsafe {
+        (automation.vtable().property_condition)(
+            automation.raw(),
+            30040, // UIA_IsTextPatternAvailablePropertyId
+            Variant::boolean(true),
+            out,
+        )
+    })?;
+    let elements: Com<ElementArrayVtable> = owned(|out| unsafe {
+        (root.vtable().find_all)(root.raw(), 4, condition.raw(), out) // TreeScope_Descendants
+    })?;
+    if !active() {
+        return None;
+    }
+    let mut count = 0;
+    if unsafe { (elements.vtable().length)(elements.raw(), &mut count) } < 0 || count < 0 {
+        return None;
+    }
+    for index in 0..count.min(MAX_TEXT_ELEMENTS) {
+        if !active() {
+            return None;
+        }
+        let Some(element): Option<Com<ElementVtable>> =
+            owned(|out| unsafe { (elements.vtable().element)(elements.raw(), index, out) })
+        else {
+            continue;
+        };
+        if !matches!(
+            element_safety(&element, source, active),
+            ElementSafety::Allowed
+        ) {
+            continue;
+        }
+        if let Selection::Text(value) = selected_ranges(&element, active) {
+            return active().then_some(value);
+        }
     }
     None
 }
 
-fn safe_element(element: &Com<ElementVtable>, context: &Context) -> bool {
+enum ElementSafety {
+    Allowed,
+    Protected,
+    Outside,
+}
+fn element_safety(
+    element: &Com<ElementVtable>,
+    source: Raw,
+    active: &dyn Fn() -> bool,
+) -> ElementSafety {
+    if !active() {
+        return ElementSafety::Outside;
+    }
     let mut process = 0;
     if unsafe { (element.vtable().process_id)(element.raw(), &mut process) } < 0
         || process as u32 == unsafe { GetCurrentProcessId() }
-        || !context.active()
+        || !active()
     {
-        return false;
+        return ElementSafety::Outside;
     }
     let mut password = 1;
     if unsafe { (element.vtable().password)(element.raw(), &mut password) } < 0
         || password != 0
-        || !context.active()
+        || !active()
     {
-        return false;
+        return ElementSafety::Protected;
     }
     let mut window = std::ptr::null_mut();
     if unsafe { (element.vtable().native_window)(element.raw(), &mut window) } < 0 {
-        return false;
+        return ElementSafety::Outside;
     }
-    // Browser descendants can live in a renderer process and have no HWND. The
-    // focused element plus unchanged foreground scope is authoritative there.
-    window.is_null()
-        || window == context.request.window as Raw
-        || unsafe { GetAncestor(window, 2) } == context.request.window as Raw
+    // Browser descendants can live in a renderer process and have no HWND. They
+    // come from either the focused ancestry or the source HWND's scoped search.
+    if window.is_null() || window == source || unsafe { GetAncestor(window, 2) } == source {
+        ElementSafety::Allowed
+    } else {
+        ElementSafety::Outside
+    }
 }
 
 enum Selection {
     Unsupported,
     Empty,
     Failed,
+    Protected,
     Text(String),
 }
-fn selected_ranges(element: &Com<ElementVtable>, context: &Context) -> Selection {
+fn selected_ranges(element: &Com<ElementVtable>, active: &dyn Fn() -> bool) -> Selection {
     let mut pattern: Option<Com<TextPatternVtable>> = None;
     for pattern_id in [10014, 10024] {
-        if !context.active() {
+        if !active() {
             return Selection::Failed;
         }
         pattern = owned(|out| unsafe {
@@ -277,7 +384,7 @@ fn selected_ranges(element: &Com<ElementVtable>, context: &Context) -> Selection
     let mut text = String::new();
     let mut units = 0;
     for index in 0..count {
-        if !context.active() {
+        if !active() {
             return Selection::Failed;
         }
         let Some(range): Option<Com<TextRangeVtable>> =
@@ -297,7 +404,7 @@ fn selected_ranges(element: &Com<ElementVtable>, context: &Context) -> Selection
         if comparison == 0 {
             continue;
         }
-        if !context.active() {
+        if !active() {
             return Selection::Failed;
         }
         let remaining = MAX_SELECTION_UNITS.saturating_sub(units);
@@ -398,6 +505,23 @@ struct Guid {
     c: u16,
     d: [u8; 8],
 }
+// VARIANT's value union includes a pair of pointers (VT_RECORD). Preserve that
+// size/alignment even though this request uses only VARIANT_BOOL.
+#[repr(C)]
+struct Variant {
+    kind: u16,
+    reserved: [u16; 3],
+    value: [usize; 2],
+}
+impl Variant {
+    fn boolean(value: bool) -> Self {
+        Self {
+            kind: 11, // VT_BOOL
+            reserved: [0; 3],
+            value: [if value { u16::MAX as usize } else { 0 }, 0],
+        }
+    }
+}
 const IID_AUTOMATION: Guid = Guid {
     a: 0x30cbe57d,
     b: 0xd9d0,
@@ -437,10 +561,14 @@ struct UnknownVtable {
 #[repr(C)]
 struct AutomationVtable {
     _unknown: UnknownVtable,
-    _slots_3_7: [usize; 5],
+    _slots_3_5: [usize; 3],
+    from_handle: unsafe extern "system" fn(Raw, Raw, *mut Raw) -> HResult,
+    _slot_7: usize,
     focused: ObjectGetter,
     _slots_9_13: [usize; 5],
     walker: ObjectGetter,
+    _slots_15_22: [usize; 8],
+    property_condition: unsafe extern "system" fn(Raw, i32, Variant, *mut Raw) -> HResult,
 }
 #[repr(C)]
 struct Automation2Vtable {
@@ -454,7 +582,9 @@ struct Automation2Vtable {
 #[repr(C)]
 struct ElementVtable {
     _unknown: UnknownVtable,
-    _slots_3_13: [usize; 11],
+    _slots_3_5: [usize; 3],
+    find_all: unsafe extern "system" fn(Raw, i32, Raw, *mut Raw) -> HResult,
+    _slots_7_13: [usize; 7],
     pattern: unsafe extern "system" fn(Raw, i32, *const Guid, *mut Raw) -> HResult,
     _slots_15_19: [usize; 5],
     process_id: unsafe extern "system" fn(Raw, *mut i32) -> HResult,
@@ -474,6 +604,7 @@ struct TextRangeArrayVtable {
     length: unsafe extern "system" fn(Raw, *mut i32) -> HResult,
     element: unsafe extern "system" fn(Raw, i32, *mut Raw) -> HResult,
 }
+type ElementArrayVtable = TextRangeArrayVtable;
 #[repr(C)]
 struct TextRangeVtable {
     _unknown: UnknownVtable,
@@ -587,9 +718,13 @@ mod tests {
         assert_eq!(size_of::<UnknownVtable>(), 3 * slot);
         assert_eq!(offset_of!(UnknownVtable, query), 0);
         assert_eq!(offset_of!(UnknownVtable, release), 2 * slot);
-        assert_eq!(size_of::<AutomationVtable>(), 15 * slot);
+        assert_eq!(size_of::<Variant>(), if slot == 8 { 24 } else { 16 });
+        assert_eq!(offset_of!(Variant, value), 8);
+        assert_eq!(size_of::<AutomationVtable>(), 24 * slot);
+        assert_eq!(offset_of!(AutomationVtable, from_handle), 6 * slot);
         assert_eq!(offset_of!(AutomationVtable, focused), 8 * slot);
         assert_eq!(offset_of!(AutomationVtable, walker), 14 * slot);
+        assert_eq!(offset_of!(AutomationVtable, property_condition), 23 * slot);
         assert_eq!(offset_of!(Automation2Vtable, auto_focus), 59 * slot);
         assert_eq!(offset_of!(Automation2Vtable, connection_timeout), 61 * slot);
         assert_eq!(
@@ -598,6 +733,7 @@ mod tests {
         );
         assert_eq!(size_of::<Automation2Vtable>(), 64 * slot);
         assert_eq!(offset_of!(ElementVtable, pattern), 14 * slot);
+        assert_eq!(offset_of!(ElementVtable, find_all), 6 * slot);
         assert_eq!(offset_of!(ElementVtable, process_id), 20 * slot);
         assert_eq!(offset_of!(ElementVtable, password), 35 * slot);
         assert_eq!(offset_of!(ElementVtable, native_window), 36 * slot);
@@ -627,5 +763,299 @@ mod tests {
             created_at: Instant::now() - CAPTURE_TIMEOUT,
         };
         assert!(request.capture(&|| false).is_none());
+    }
+
+    // Use the operating system's real EDIT accessibility provider, in a second
+    // process. The fixture stays off screen with WS_EX_NOACTIVATE and never
+    // changes focus, the clipboard, or keyboard/mouse state. This catches COM
+    // ABI and provider behavior which a mocked TextPattern cannot verify.
+    #[test]
+    fn source_search_finds_unfocused_selection_and_skips_empty_and_password_controls() {
+        let foreground = unsafe { GetForegroundWindow() };
+        let fixture = HiddenFixture::start();
+        let _apartment = Apartment::new().expect("MTA");
+        let automation = create_automation().expect("UI Automation");
+        let source = fixture.window as Raw;
+        assert_ne!(source, unsafe { GetForegroundWindow() });
+
+        // The first Edit has only a caret; the second has a selection. An empty
+        // candidate must not end the search before the selected sibling.
+        assert_eq!(
+            read_scoped_selection(&automation, source, &|| true).as_deref(),
+            Some("Synthetic"),
+        );
+        fixture.select(0);
+        assert!(read_scoped_selection(&automation, source, &|| true).is_none());
+
+        // Keep the password selection while changing the ordinary Edit. Only
+        // the ordinary explicit selection is read.
+        fixture.select(1);
+        assert_eq!(
+            read_scoped_selection(&automation, source, &|| true).as_deref(),
+            Some("Synthetic"),
+        );
+        fixture.select(2);
+        assert_eq!(
+            read_scoped_selection(&automation, source, &|| true).as_deref(),
+            Some("中文🪟"),
+        );
+        // The same helper process also owns a second window with a selection.
+        // It must not be returned when the requested source has only a caret.
+        fixture.select(0);
+        assert!(read_scoped_selection(&automation, source, &|| true).is_none());
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    }
+
+    #[test]
+    #[ignore = "helper process for source_search_finds_unfocused_selection"]
+    fn hidden_text_provider_fixture() {
+        let Some(path) = std::env::var_os("WINTRANSLATER_SELECTION_FIXTURE") else {
+            return;
+        };
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let name: Vec<u16> = "WinTranslaterSelectionTest\0".encode_utf16().collect();
+        let class = FixtureWindowClass {
+            style: 0,
+            procedure: fixture_window_proc,
+            class_extra: 0,
+            window_extra: 0,
+            instance,
+            icon: std::ptr::null_mut(),
+            cursor: std::ptr::null_mut(),
+            background: std::ptr::null_mut(),
+            menu: std::ptr::null(),
+            name: name.as_ptr(),
+        };
+        assert_ne!(unsafe { RegisterClassW(&class) }, 0);
+        let window = unsafe {
+            CreateWindowExW(
+                0x0800_0080,
+                name.as_ptr(),
+                name.as_ptr(),
+                0x9000_0000,
+                -32000,
+                -32000,
+                320,
+                240,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!window.is_null());
+        let edit_class: Vec<u16> = "EDIT\0".encode_utf16().collect();
+        let text: Vec<u16> = "Synthetic 中文🪟 selected text\0".encode_utf16().collect();
+        // A password control and an empty Edit precede the selected Edit.
+        for (index, style) in [(1, 0x20), (2, 0), (3, 0)] {
+            let edit = unsafe {
+                CreateWindowExW(
+                    0,
+                    edit_class.as_ptr(),
+                    text.as_ptr(),
+                    0x5000_0104 | style,
+                    0,
+                    (index - 1) * 60,
+                    300,
+                    50,
+                    window,
+                    index as usize as Raw,
+                    instance,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(!edit.is_null());
+            unsafe { SendMessageW(edit, 0x00b1, 0, if index == 2 { 0 } else { 9 }) };
+        }
+        let other_window = unsafe {
+            CreateWindowExW(
+                0x0800_0080,
+                name.as_ptr(),
+                name.as_ptr(),
+                0x9000_0000,
+                -32000,
+                -32000,
+                320,
+                240,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!other_window.is_null());
+        let other_edit = unsafe {
+            CreateWindowExW(
+                0,
+                edit_class.as_ptr(),
+                text.as_ptr(),
+                0x5000_0104,
+                0,
+                0,
+                300,
+                50,
+                other_window,
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!other_edit.is_null());
+        unsafe { SendMessageW(other_edit, 0x00b1, 0, 9) };
+        std::fs::write(path, (window as usize).to_string()).expect("fixture ready");
+        let mut message: FixtureMessage = unsafe { std::mem::zeroed() };
+        while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {
+            unsafe {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        unsafe { DestroyWindow(window) };
+        unsafe { DestroyWindow(other_window) };
+    }
+
+    struct HiddenFixture {
+        child: std::process::Child,
+        window: usize,
+        ready_file: std::path::PathBuf,
+    }
+    impl HiddenFixture {
+        fn start() -> Self {
+            let ready_file = std::env::temp_dir().join(format!(
+                "wintranslater-selection-test-{}.state",
+                std::process::id(),
+            ));
+            let _ = std::fs::remove_file(&ready_file);
+            let module = module_path!().split_once("::").unwrap().1;
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("{module}::hidden_text_provider_fixture"),
+                    "--ignored",
+                ])
+                .env("WINTRANSLATER_SELECTION_FIXTURE", &ready_file)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("hidden source process");
+            let mut fixture = Self {
+                child,
+                window: 0,
+                ready_file,
+            };
+            let start = Instant::now();
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&fixture.ready_file)
+                    && let Ok(window) = value.parse::<usize>()
+                {
+                    fixture.window = window;
+                    return fixture;
+                }
+                assert!(
+                    fixture.child.try_wait().unwrap().is_none(),
+                    "fixture exited"
+                );
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "fixture startup timeout"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fn select(&self, selected: usize) {
+            // Synchronous message to our own test process, never a foreign app.
+            unsafe { SendMessageW(self.window as Raw, 0x8001, selected, 0) };
+        }
+    }
+    impl Drop for HiddenFixture {
+        fn drop(&mut self) {
+            if self.window != 0 {
+                unsafe { SendMessageW(self.window as Raw, 0x0010, 0, 0) };
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.ready_file);
+        }
+    }
+    unsafe extern "system" fn fixture_window_proc(
+        window: Raw,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        match message {
+            0x0010 => {
+                unsafe { PostQuitMessage(0) };
+                0
+            }
+            0x8001 => {
+                let (start, end) = match wparam {
+                    0 => (0, 0),
+                    2 => (10, 14),
+                    _ => (0, 9),
+                };
+                unsafe {
+                    SendMessageW(GetDlgItem(window, 3), 0x00b1, start, end);
+                }
+                0
+            }
+            _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+        }
+    }
+    #[repr(C)]
+    struct FixtureWindowClass {
+        style: u32,
+        procedure: unsafe extern "system" fn(Raw, u32, usize, isize) -> isize,
+        class_extra: i32,
+        window_extra: i32,
+        instance: Raw,
+        icon: Raw,
+        cursor: Raw,
+        background: Raw,
+        menu: *const u16,
+        name: *const u16,
+    }
+    #[repr(C)]
+    struct FixtureMessage {
+        window: Raw,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        point: [i32; 2],
+        private: u32,
+    }
+    // These test-only SDK-compatible structures intentionally mirror the
+    // independent narrow Win32 declarations used by native.rs/desktop.rs.
+    #[allow(clashing_extern_declarations)]
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn RegisterClassW(class: *const FixtureWindowClass) -> u16;
+        fn CreateWindowExW(
+            extended: u32,
+            class: *const u16,
+            title: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            parent: Raw,
+            menu: Raw,
+            instance: Raw,
+            data: Raw,
+        ) -> Raw;
+        fn DefWindowProcW(window: Raw, message: u32, wparam: usize, lparam: isize) -> isize;
+        fn SendMessageW(window: Raw, message: u32, wparam: usize, lparam: isize) -> isize;
+        fn GetDlgItem(window: Raw, identifier: i32) -> Raw;
+        fn GetMessageW(message: *mut FixtureMessage, window: Raw, min: u32, max: u32) -> i32;
+        fn TranslateMessage(message: *const FixtureMessage) -> i32;
+        fn DispatchMessageW(message: *const FixtureMessage) -> isize;
+        fn PostQuitMessage(code: i32);
+        fn DestroyWindow(window: Raw) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> Raw;
     }
 }

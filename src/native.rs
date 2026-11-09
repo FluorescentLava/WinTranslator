@@ -283,6 +283,7 @@ thread_local! {
     static REFRESH_PENDING: Cell<bool> = const { Cell::new(false) };
     static FOCUS_RECHECKS: Cell<u8> = const { Cell::new(0) };
     static ACTIVATION_CHECK: Cell<Option<ActivationVerification>> = const { Cell::new(None) };
+    static INPUT_ACTIVATION_RECOVERY: Cell<Option<u64>> = const { Cell::new(None) };
     static ACTIVATION_SOURCE: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
 }
 #[link(name = "user32")]
@@ -330,7 +331,6 @@ unsafe extern "system" {
     fn PostMessageW(window: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
     fn SetForegroundWindow(window: Hwnd) -> i32;
     fn SetActiveWindow(window: Hwnd) -> Hwnd;
-    fn SetFocus(window: Hwnd) -> Hwnd;
     fn GetForegroundWindow() -> Hwnd;
     fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
     fn GetWindowThreadProcessId(window: Hwnd, process: *mut u32) -> u32;
@@ -1562,9 +1562,8 @@ fn activate_window_with_intent(window: Hwnd, intent: Option<ActivationVerificati
         return false;
     }
     set_window_icon(window);
-    let attachment = InputQueueAttachment::new();
-    // Desktop preparation and queue attachment can dispatch work. Recheck the
-    // explicit open before changing visibility or foreground after either one.
+    // Desktop preparation can dispatch work. Recheck the explicit open before
+    // changing visibility or foreground.
     if !permitted() {
         return false;
     }
@@ -1585,18 +1584,17 @@ fn activate_window_with_intent(window: Hwnd, intent: Option<ActivationVerificati
             0,
             0x0001 | 0x0002 | 0x0010 | 0x0040,
         );
-        // WinUI's initial Activate can report foreground before the first
-        // presentation is stable. Always request activation after raising it.
+        // The hotkey or a launching instance normally grants foreground rights.
+        // Let USER deliver the activation to WinUI on its own input queue first.
         SetForegroundWindow(window);
-        if GetForegroundWindow() == window {
-            // Activate WinUI's input site while the foreground and UI queues
-            // are still attached. Delaying these until the later focus check
-            // leaves the first TextBox focus request without an active HWND.
-            SetActiveWindow(window);
-            SetFocus(window);
-        }
     }
-    drop(attachment);
+    if unsafe { GetForegroundWindow() } != window && permitted() {
+        let attachment = InputQueueAttachment::new();
+        if permitted() {
+            unsafe { SetForegroundWindow(window) };
+        }
+        drop(attachment);
+    }
     (unsafe { IsWindowVisible(window) }) != 0 && unsafe { GetForegroundWindow() } == window
 }
 
@@ -1760,21 +1758,77 @@ pub fn popup_is_foreground() -> bool {
         && unsafe { GetForegroundWindow() } == popup
 }
 
-/// Reconnect Win32 keyboard focus before asking the XAML TextBox to focus.
-/// A successful SetForegroundWindow (especially after input-queue detachment)
-/// does not imply that this UI thread has an active input site yet.
+/// Confirm native activation before letting ContentIsland focus the TextBox.
 pub fn prepare_popup_input_focus() -> bool {
     if !popup_is_foreground() {
         return false;
     }
     let popup = POPUP.with(Cell::get);
-    unsafe {
-        SetActiveWindow(popup);
-        if !popup_has_keyboard_focus() {
-            SetFocus(popup);
-        }
-    }
+    // ContentIsland owns the keyboard target. Focusing the top-level HWND here
+    // would take focus back from the input site initialized by WinUI.
+    unsafe { SetActiveWindow(popup) };
     popup_is_foreground()
+}
+
+/// Reconcile a foreground handoff that happened while USER input queues were
+/// attached. Such a handoff can leave ContentIsland's activation listener in
+/// Deactivated even though both GetForegroundWindow and GetFocus look correct.
+/// A real, synchronous activation through an owned zero-sized tool window delivers
+/// the missing native transition. No other application's window is activated.
+/// This runs after the first loaded focus attempt and before revealing the card.
+pub fn recover_popup_input_activation(revision: u64) -> bool {
+    if !popup_show_animation_is_current(revision)
+        || !popup_is_foreground()
+        || INPUT_ACTIVATION_RECOVERY.with(Cell::get) == Some(revision)
+    {
+        return false;
+    }
+    let popup = POPUP.with(Cell::get);
+    // Create this relay on the current desktop, owned by the already-positioned
+    // popup. Reusing the background tray HWND could activate its older desktop.
+    let relay = unsafe {
+        CreateWindowExW(
+            0x80, // WS_EX_TOOLWINDOW: no taskbar or Alt+Tab entry.
+            wide("STATIC").as_ptr(),
+            std::ptr::null(),
+            0x80000000, // WS_POPUP, with no caption, border or visible pixels.
+            -32000,
+            -32000,
+            0,
+            0,
+            popup,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null_mut(),
+        )
+    };
+    if relay.is_null() {
+        return false;
+    }
+    INPUT_ACTIVATION_RECOVERY.with(|value| value.set(Some(revision)));
+    unsafe {
+        SetWindowPos(
+            relay,
+            std::ptr::null_mut(),
+            -32000,
+            -32000,
+            0,
+            0,
+            0x0010 | 0x0004 | 0x0040,
+        );
+        if popup_is_foreground() && popup_show_animation_is_current(revision) {
+            SetForegroundWindow(relay);
+            if GetForegroundWindow() == relay && popup_show_animation_is_current(revision) {
+                SetForegroundWindow(popup);
+            }
+        }
+        DestroyWindow(relay);
+    }
+    let restored = popup_is_foreground();
+    crate::storage::diagnostic(serde_json::json!({
+        "event":"popup_input_activation_recovered", "foreground":restored,
+    }));
+    restored
 }
 
 pub fn popup_has_keyboard_focus() -> bool {

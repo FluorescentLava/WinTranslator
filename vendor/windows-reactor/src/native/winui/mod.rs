@@ -1535,9 +1535,8 @@ impl WinUiRuntime {
                             .flatten()
                     });
                     match window {
-                        Some((window, host)) => {
-                            input_activation::focus(&element, window, &host.initial_activation)
-                                .map_err(native_error)
+                        Some((window, _)) => {
+                            input_activation::focus(&element, window).map_err(native_error)
                         }
                         None => Ok(false),
                     }

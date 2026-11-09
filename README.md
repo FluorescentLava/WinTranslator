@@ -137,6 +137,8 @@ cargo test --locked -- --include-ignored
 
 已有普通 Release 构建时，可传 `-SkipBuild -TargetDirectory '<Cargo target 目录>'`；脚本读取 EXE 内嵌 manifest，拒绝将自包含版本打进此安装包。Visual Studio 的 CRT 目录未自动找到时，可通过 `-VcRuntimeDirectory '<x64\Microsoft.VC143.CRT 目录>'` 指定。安装逻辑测试可运行 `.\scripts\test-installer.ps1`。
 
+安装响应测试：`.\scripts\test-installer-responsiveness.ps1 -IsccPath '<ISCC.exe 路径>'`。它在独立桌面验证点击“完成”后不等待程序初始化；追加 `-PayloadPath '<KeepStage 输出目录>'` 可验证大型离线模型不会拖慢辅助脚本提取。测试不安装应用，也不切换用户桌面。
+
 ## 安装与卸载
 
 Release 安装程序默认安装到 `%LOCALAPPDATA%\Programs\WinTranslater`，创建名称为 `WinTranslater` 的开始菜单入口，并登记 Windows“已安装的应用”中的卸载项。通过系统设置卸载，或运行安装目录内的 `unins000.exe`；卸载保留 `%LOCALAPPDATA%\TranslationTool` 中的配置、历史、凭据和用量记录。
