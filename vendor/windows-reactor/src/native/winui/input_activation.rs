@@ -4,6 +4,7 @@
 //! logical focus target in an inactive island that cannot receive keyboard input.
 use super::{FocusState, IWindowNative, UIElement, Window, XamlRoot};
 use core::ffi::c_void;
+use std::cell::Cell;
 use windows_core::{HRESULT, IInspectable_Vtbl, IUnknown, Interface, Result, RuntimeName};
 
 type Raw = *mut c_void;
@@ -93,6 +94,43 @@ impl RuntimeName for FocusManagerClass {
 
 windows_core::link!("user32.dll" "system" fn GetForegroundWindow() -> Raw);
 windows_core::link!("user32.dll" "system" fn IsWindowVisible(hwnd: Raw) -> i32);
+windows_core::link!("user32.dll" "system" fn GetActiveWindow() -> Raw);
+windows_core::link!("user32.dll" "system" fn SetActiveWindow(hwnd: Raw) -> Raw);
+
+#[derive(Default)]
+pub(super) struct InitialActivation {
+    restarted: Cell<bool>,
+}
+
+impl InitialActivation {
+    fn repair(&self, window: &Window, hwnd: Raw, snapshot: FocusSnapshot) -> Result<()> {
+        if snapshot.input_active()
+            || self.restarted.get()
+            || !owns_foreground(hwnd)
+            || unsafe { GetActiveWindow() } != hwnd
+        {
+            return Ok(());
+        }
+        self.restarted.set(true);
+        // The first HWND activation can precede ContentIsland readiness. Once
+        // its listener exists, another Activate on the already-active HWND is
+        // a no-op. Re-enter native activation once so WinUI receives a genuine
+        // WM_ACTIVATE with the ready island, before revealing the Mica card.
+        // Deactivate only our own window; never activate another application.
+        unsafe { SetActiveWindow(std::ptr::null_mut()) };
+        let foreground = unsafe { GetForegroundWindow() };
+        if unsafe { IsWindowVisible(hwnd) } != 0 && (foreground == hwnd || foreground.is_null()) {
+            window.Activate()?;
+        }
+        Ok(())
+    }
+}
+
+fn owns_foreground(hwnd: Raw) -> bool {
+    !hwnd.is_null()
+        && unsafe { IsWindowVisible(hwnd) } != 0
+        && unsafe { GetForegroundWindow() } == hwnd
+}
 
 struct InputSite {
     root: XamlRoot,
@@ -197,7 +235,11 @@ pub(super) fn inspect(element: &UIElement) -> Result<FocusSnapshot> {
 
 /// Never activate an unrelated or hidden window as a side effect of focusing a
 /// control. Every operation that can dispatch input rechecks this native gate.
-pub(super) fn focus(element: &UIElement, window: &Window) -> Result<bool> {
+pub(super) fn focus(
+    element: &UIElement,
+    window: &Window,
+    initial_activation: &InitialActivation,
+) -> Result<bool> {
     let mut hwnd = std::ptr::null_mut();
     unsafe {
         window
@@ -205,11 +247,7 @@ pub(super) fn focus(element: &UIElement, window: &Window) -> Result<bool> {
             .WindowHandle(&mut hwnd)
             .ok()?;
     }
-    let foreground = || {
-        !hwnd.is_null()
-            && unsafe { IsWindowVisible(hwnd) } != 0
-            && unsafe { GetForegroundWindow() } == hwnd
-    };
+    let foreground = || owns_foreground(hwnd);
     if !foreground() {
         return Ok(false);
     }
@@ -226,7 +264,14 @@ pub(super) fn focus(element: &UIElement, window: &Window) -> Result<bool> {
     if !foreground() {
         return Ok(false);
     }
-    let activated = site.snapshot(element)?;
+    let mut activated = site.snapshot(element)?;
+    if !activated.input_active() {
+        initial_activation.repair(window, hwnd, activated)?;
+        if !foreground() {
+            return Ok(false);
+        }
+        activated = site.snapshot(element)?;
+    }
     if !activated.island_has_focus || !activated.input_active() {
         let mut accepted = false;
         unsafe {

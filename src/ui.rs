@@ -252,6 +252,8 @@ fn speaker_icon() -> View {
         .opacity(0.7)
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(Center)
+        // Optical alignment: shift the glyph left 1 DIP and down 2 DIPs.
+        .margin(Thickness::new(-1.0, 2.0, 1.0, -2.0))
         .slot(
             ViewboxSlot::Child,
             icon("\u{E994}")
@@ -832,6 +834,12 @@ impl Translator {
         }
         let sender = cx.sender();
         let accepted = self.input.request_focus_result(move |result| {
+            if let Err(error) = &result {
+                storage::diagnostic(serde_json::json!({
+                    "event":"popup_input_focus_error", "attempt":attempt,
+                    "error":format!("{error:?}"),
+                }));
+            }
             let _ = sender.send(Message::InputFocusResult(
                 revision,
                 attempt,

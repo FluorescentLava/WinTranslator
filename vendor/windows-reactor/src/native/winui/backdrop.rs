@@ -489,6 +489,7 @@ fn round_content(drawing: &bindings::Grid, radius: f64) -> Result<windows_core::
 pub(super) struct WindowHost {
     pub root: Option<NodeId>,
     pub host: bindings::Grid,
+    pub initial_activation: input_activation::InitialActivation,
     card: Option<MicaCard>,
 }
 struct MicaCard {
@@ -506,6 +507,7 @@ impl WindowHost {
         Ok(Self {
             root: None,
             host: bindings::Grid::new()?,
+            initial_activation: input_activation::InitialActivation::default(),
             card: None,
         })
     }

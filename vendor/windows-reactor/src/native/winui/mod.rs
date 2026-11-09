@@ -1531,12 +1531,13 @@ impl WinUiRuntime {
                             .cast::<UIElement>()
                             .and_then(|host| host.XamlRoot());
                         (host_root.as_ref().ok() == Some(&root))
-                            .then(|| self.windows.get(window_node))
+                            .then(|| self.windows.get(window_node).map(|window| (window, host)))
                             .flatten()
                     });
                     match window {
-                        Some(window) => {
-                            input_activation::focus(&element, window).map_err(native_error)
+                        Some((window, host)) => {
+                            input_activation::focus(&element, window, &host.initial_activation)
+                                .map_err(native_error)
                         }
                         None => Ok(false),
                     }
