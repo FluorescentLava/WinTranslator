@@ -697,7 +697,7 @@ impl Translator {
                         let content = if compact {
                             StackPanel::new()
                                 .orientation(Orientation::Horizontal)
-                                .spacing(10.0)
+                                .spacing(8.0)
                                 .children((
                                     provider_icon(provider).vertical_alignment(Center),
                                     text(label.clone(), 14.0)
@@ -1369,7 +1369,7 @@ impl Translator {
                 ))
                 .placement(FlyoutPlacement::TopEdgeAlignedLeft)
                 .constrain_to_root_bounds(false)
-                .padding(4.0)
+                .padding(0.0)
                 .min_width(0.0)
                 .min_height(0.0)
                 .on_closed(move || {
