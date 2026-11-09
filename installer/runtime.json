@@ -1,0 +1,8 @@
+{
+  "package_name": "Microsoft.WindowsAppRuntime.2",
+  "package_family": "Microsoft.WindowsAppRuntime.2_8wekyb3d8bbwe",
+  "minimum_version": "2.4.0.0",
+  "download_version": "2.6.5",
+  "url": "https://aka.ms/windowsappsdk/2.6/2.6.5/windowsappruntimeinstall-x64.exe",
+  "sha256": "908e9a8ed8ad2ac765d6679543b0758812437e3ad6e3223f08d1730635cec8ec"
+}

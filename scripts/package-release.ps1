@@ -39,8 +39,8 @@ if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) {
 if (-not $SkipBuild) {
     Push-Location $project
     try {
-        & cargo build --release --locked --features portable --target-dir $TargetDirectory
-        if ($LASTEXITCODE -ne 0) { throw 'Self-contained Cargo build failed.' }
+        & cargo build --release --locked --target-dir $TargetDirectory
+        if ($LASTEXITCODE -ne 0) { throw 'Framework-dependent Cargo build failed.' }
     } finally { Pop-Location }
 }
 $binary = Join-Path $release 'translator.exe'
@@ -49,9 +49,37 @@ $identity = [Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
 if ($identity.ProductName -ne 'WinTranslater' -or $identity.ProductVersion -ne $version) {
     throw 'Executable version does not match Cargo.toml. Rebuild before packaging.'
 }
-if (-not [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($binary)).Contains('windows-reactor-self-contained')) {
-    throw 'The executable was not built with --features portable.'
+if (-not ('WinTranslaterManifestResource' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class WinTranslaterManifestResource {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")] static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32.dll")] static extern uint SizeofResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")] static extern bool FreeLibrary(IntPtr module);
+    public static string Read(string path) {
+        IntPtr module = LoadLibraryEx(path, IntPtr.Zero, 0x22);
+        if (module == IntPtr.Zero) throw new Win32Exception();
+        try {
+            IntPtr resource = FindResource(module, new IntPtr(1), new IntPtr(24));
+            if (resource == IntPtr.Zero) throw new Win32Exception();
+            byte[] bytes = new byte[SizeofResource(module, resource)];
+            Marshal.Copy(LockResource(LoadResource(module, resource)), bytes, 0, bytes.Length);
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        } finally { FreeLibrary(module); }
+    }
 }
+'@
+}
+if ([WinTranslaterManifestResource]::Read($binary).Contains('windows-reactor-self-contained')) {
+    throw 'The installer requires a framework-dependent build; rebuild without --features portable.'
+}
+$runtimeSpec = [IO.File]::ReadAllText((Join-Path $project 'installer\runtime.json')) | ConvertFrom-Json
+if ($runtimeSpec.url -notmatch '^https://aka\.ms/windowsappsdk/[0-9.]+/[0-9.]+/windowsappruntimeinstall-x64\.exe$' -or $runtimeSpec.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Invalid official Windows App Runtime download specification.' }
 
 # App-local Microsoft CRT avoids requiring an administrator or a separate VC++ installer.
 if (-not $VcRuntimeDirectory) {
@@ -87,10 +115,8 @@ function Copy-PayloadFile([string]$Source, [string]$Relative) {
 try {
     Copy-PayloadFile $binary 'WinTranslater.exe'
     # Explicit build/resource allowlist: never copy an installed folder or user profile.
-    Get-ChildItem -LiteralPath $release -File | Where-Object { $_.Extension -in @('.dll', '.pri', '.manifest') } |
-        ForEach-Object { Copy-PayloadFile $_.FullName $_.Name }
-    Get-ChildItem -LiteralPath $release -Directory | Where-Object { $_.Name -eq 'Microsoft.UI.Xaml' -or $_.Name -match '^[a-z]{2,3}(-[A-Za-z0-9]+)+$' } |
-        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $stage -Recurse }
+    # Reuse the registered Windows App Runtime. Never collect stale DLLs or
+    # locale directories left in Cargo's target by an earlier portable build.
     Get-ChildItem -LiteralPath $VcRuntimeDirectory -Filter '*.dll' -File |
         ForEach-Object { Copy-PayloadFile $_.FullName $_.Name }
     foreach ($name in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
@@ -118,8 +144,8 @@ try {
             }
         }
     }
-    foreach ($required in @('Microsoft.ui.xaml.dll', 'Microsoft.UI.Xaml.Controls.dll', 'Microsoft.UI.Input.dll', 'Microsoft.UI.Windowing.dll', 'Microsoft.WindowsAppRuntime.dll', 'Microsoft.Windows.ApplicationModel.Resources.dll', 'Microsoft.Web.WebView2.Core.dll', 'resources.pri', 'Microsoft.UI.Xaml\Assets', 'zh-CN', 'en-us', 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
-        if (-not (Test-Path -LiteralPath (Join-Path $stage $required))) { throw "Self-contained runtime incomplete: $required" }
+    foreach ($required in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $stage $required))) { throw "Visual C++ runtime missing: $required" }
     }
     $files = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Force)
     foreach ($file in $files) {
@@ -131,7 +157,7 @@ try {
         [ordered]@{ path = $_.FullName.Substring($stage.Length + 1); bytes = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
     })
     [IO.File]::WriteAllText((Join-Path $stage 'payload-sha256.json'), (ConvertTo-Json -InputObject $manifest -Depth 4), $utf8)
-    & $IsccPath "/DAppVersion=$version" "/DNumericVersion=$numericVersion" "/DPayloadDir=$stage" "/DReleaseDir=$OutputDirectory" (Join-Path $project 'installer\WinTranslater.iss')
+    & $IsccPath "/DAppVersion=$version" "/DNumericVersion=$numericVersion" "/DPayloadDir=$stage" "/DReleaseDir=$OutputDirectory" "/DRuntimeUrl=$($runtimeSpec.url)" "/DRuntimeSHA256=$($runtimeSpec.sha256)" (Join-Path $project 'installer\WinTranslater.iss')
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compilation failed.' }
     $installer = Get-Item -LiteralPath (Join-Path $OutputDirectory "WinTranslater-$version-windows-x64-setup.exe")
     $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
