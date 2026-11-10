@@ -292,6 +292,36 @@ fn set_color_inner(
     Ok(true)
 }
 
+/// First descendant of `root` that implements `T`, within the same bounded walk as the caret
+/// search. `None` when the template has not been applied yet or has no such part.
+pub(super) fn find_descendant<T: Interface>(
+    root: &DependencyObject,
+) -> windows_core::Result<Option<T>> {
+    VISUAL_TREE.call(|tree| {
+        let mut pending = vec![root.clone()];
+        let mut visited = 0;
+        while let Some(element) = pending.pop() {
+            visited += 1;
+            if visited > MAX_VISITED {
+                return Ok(None);
+            }
+            if visited > 1
+                && let Ok(found) = element.cast::<T>()
+            {
+                return Ok(Some(found));
+            }
+            let count = tree.count(&element)?;
+            if count < 0 || count as usize + pending.len() + visited > MAX_VISITED {
+                return Ok(None);
+            }
+            for index in 0..count {
+                pending.push(tree.child(&element, index)?);
+            }
+        }
+        Ok(None)
+    })
+}
+
 // This IID is a type identity, not a callable private editing interface. We only QI and release it.
 // The identity has been stable since the original TextBoxView peer and is checked defensively.
 windows_core::imp::define_interface!(

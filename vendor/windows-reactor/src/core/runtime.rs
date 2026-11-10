@@ -328,6 +328,10 @@ pub enum Command {
         color: Color,
         completion: Callback<Result<bool, RuntimeError>>,
     },
+    MeasureTextBox {
+        node: NodeId,
+        completion: Callback<Result<f64, RuntimeError>>,
+    },
     InitializeWebView2 {
         node: NodeId,
         completion: Callback<Result<windows_core::IUnknown, RuntimeError>>,
@@ -462,6 +466,9 @@ impl Command {
             | Self::SetTextBoxCaretColor {
                 node, completion, ..
             } => {
+                _ = completion.call(Err(RuntimeError::MissingNode(*node)));
+            }
+            Self::MeasureTextBox { node, completion } => {
                 _ = completion.call(Err(RuntimeError::MissingNode(*node)));
             }
             Self::InitializeWebView2 { node, completion } => {

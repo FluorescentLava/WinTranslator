@@ -4,6 +4,7 @@ mod api;
 mod chinese_dictionary;
 mod desktop;
 mod dictionary;
+mod input_layout;
 mod model;
 mod model_download;
 mod native;

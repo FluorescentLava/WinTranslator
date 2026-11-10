@@ -102,6 +102,9 @@ const ACTIVATION_DELAY_MS: u32 = 30;
 const ACTIVATION_RETRY_WINDOW: Duration = Duration::from_millis(250);
 const RESIZE_TIMER: usize = 0x5452_535a;
 const FOCUS_TIMER: usize = 0x5446_4353;
+const CLIPBOARD_TIMER: usize = 0x5443_4c50;
+const CLIPBOARD_RETRY_MS: u32 = 10;
+const CLIPBOARD_RETRIES: u32 = 50;
 const FOCUS_DELAY_MS: u32 = 60;
 const RESIZE_DURATION_MS: f64 = 200.0;
 // A 16 ms USER timer can be rounded up to two default clock ticks. Request
@@ -110,6 +113,10 @@ const RESIZE_INTERVAL_MS: u32 = 10;
 // The visible card stays 16 DIPs from the work-area edges. The transparent
 // host reserves the same gutter on all sides for the card's moving shadow.
 pub const POPUP_SHADOW_INSET: u16 = 16;
+/// The card grows with its text box in WinUI's layout pass, one line at a time,
+/// a moment before this module learns its new height. The window region keeps
+/// this much room above the card so that growth is never cut off.
+const POPUP_GROWTH_HEADROOM: f64 = 20.0;
 const POPUP_MAX_HEIGHT: f64 = 480.0;
 const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
 const APP_NAME: &str = "WinTranslater";
@@ -313,6 +320,8 @@ thread_local! {
     static ESCAPE: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
     static INITIALIZED: Cell<bool> = const { Cell::new(false) };
     static COMPOSING: Cell<bool> = const { Cell::new(false) };
+    static FLUSHED_CLIPBOARD: Cell<u32> = const { Cell::new(0) };
+    static CLIPBOARD_RETRIES_LEFT: Cell<u32> = const { Cell::new(0) };
     static ORIGINAL_PROC: Cell<isize> = const { Cell::new(0) };
     static POPUP: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
     static SINK: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
@@ -405,6 +414,9 @@ unsafe extern "system" {
     fn GetForegroundWindow() -> Hwnd;
     fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
     fn GetWindowThreadProcessId(window: Hwnd, process: *mut u32) -> u32;
+    fn AddClipboardFormatListener(window: Hwnd) -> i32;
+    fn GetClipboardOwner() -> Hwnd;
+    fn GetClipboardSequenceNumber() -> u32;
     fn AllowSetForegroundWindow(process: u32) -> i32;
     fn SetWindowsHookExW(
         id: i32,
@@ -870,8 +882,11 @@ fn update_popup_region(window: Hwnd, card_height: f64) {
         return;
     }
     let scale = f64::from(unsafe { GetDpiForWindow(window) }.max(96)) / 96.0;
-    let visible_height =
-        ((card_height + 2.0 * f64::from(POPUP_SHADOW_INSET)) * scale).ceil() as i32;
+    let visible_height = ((card_height
+        + POPUP_GROWTH_HEADROOM
+        + 2.0 * f64::from(POPUP_SHADOW_INSET))
+        * scale)
+        .ceil() as i32;
     let region = unsafe {
         CreateRectRgn(
             0,
@@ -1145,7 +1160,7 @@ fn resize_tick(window: Hwnd) {
     if monitor != animation.monitor || unsafe { GetDpiForWindow(window) }.max(96) != animation.dpi {
         stop_resize(window);
         ANCHOR.with(|value| value.set(monitor));
-        resize_popup(window, true);
+        resize_popup(window, true, true);
         return;
     }
     animation.elapsed_ms += (animation.last_sample.elapsed().as_secs_f64() * 1000.0).min(32.0);
@@ -1164,7 +1179,10 @@ fn resize_tick(window: Hwnd) {
         None,
     );
 }
-fn resize_popup(window: Hwnd, first: bool) {
+/// `animated == false` applies the target size in one step. Text edits use it:
+/// the view has already laid the card out at its new height in the same turn,
+/// and an eased resize would trail every keystroke that adds a line.
+fn resize_popup(window: Hwnd, first: bool, animated: bool) {
     // Keep the committed viewport steady while its WinUI visual slides out.
     // SIZE still records newer results, and reopening consumes that target.
     if PRESENTATION.with(Cell::get).hide_revision.is_some() {
@@ -1217,7 +1235,8 @@ fn resize_popup(window: Hwnd, first: bool) {
     {
         return;
     }
-    let animate = !first
+    let animate = animated
+        && !first
         && FRAME_HANDLER.with(|value| value.borrow().is_some())
         && visible
         && has_rectangle
@@ -1227,6 +1246,11 @@ fn resize_popup(window: Hwnd, first: bool) {
     stop_resize(window);
     let revision = RESIZE_REVISION.with(Cell::get);
     if !animate {
+        if !animated && !first && visible && has_rectangle && current == host {
+            // The card is already this tall in XAML. Expose it now instead of
+            // after the frame acknowledgement, so its top edge is never cut.
+            update_popup_region(window, target.height);
+        }
         queue_popup_frame(
             window,
             target,
@@ -1284,6 +1308,14 @@ unsafe extern "system" fn popup_proc(
             // The rounded Mica card is inside the transparent WinUI host.
             return 0;
         }
+    }
+    if message == 0x031d {
+        CLIPBOARD_RETRIES_LEFT.with(|value| value.set(CLIPBOARD_RETRIES));
+        flush_own_clipboard(window);
+    }
+    if message == 0x0113 && wparam == CLIPBOARD_TIMER {
+        flush_own_clipboard(window);
+        return 0;
     }
     if message == REFRESH_MESSAGE {
         REFRESH_PENDING.with(|value| value.set(false));
@@ -1371,7 +1403,7 @@ unsafe extern "system" fn popup_proc(
         };
         DEFER_EXTERNAL_GEOMETRY.with(|value| value.set(previous));
         ANCHOR.with(|v| v.set(unsafe { MonitorFromWindow(window, 2) }));
-        resize_popup(window, true);
+        resize_popup(window, true, true);
         return result;
     }
     if INITIALIZED.with(Cell::get) && (message == 0x007e || (message == 0x001a && wparam == 0x002f))
@@ -1389,7 +1421,7 @@ unsafe extern "system" fn popup_proc(
         };
         DEFER_EXTERNAL_GEOMETRY.with(|value| value.set(previous));
         ANCHOR.with(|value| value.set(unsafe { MonitorFromWindow(window, 2) }));
-        resize_popup(window, true);
+        resize_popup(window, true, true);
         return result;
     }
     let original = ORIGINAL_PROC.with(Cell::get);
@@ -1401,7 +1433,42 @@ fn attach_popup(window: Hwnd) {
         ORIGINAL_PROC.with(|v| {
             v.set(unsafe { SetWindowLongPtrW(window, -4, popup_proc as *const () as isize) })
         });
+        // Delivers WM_CLIPBOARDUPDATE to popup_proc; see flush_own_clipboard.
+        unsafe { AddClipboardFormatListener(window) };
     }
+}
+/// Keeps what this app copies as plain text.
+///
+/// A copy or cut in a WinUI text box leaves the box's own live data object
+/// on the clipboard. Pasting that object back into the same process brings
+/// the text's formatting with it, so text copied from the input at one
+/// font size kept that size after the input had switched to the other,
+/// leaving two sizes on one line. Flushing replaces the live object with
+/// the plain text it offers, so a paste always takes the box's own size.
+/// (Rich text from other applications already pastes as plain text.)
+///
+/// Other clipboard listeners, such as clipboard history, open the clipboard
+/// at the same moment and make the flush fail, so it is retried on a timer
+/// until it succeeds or the clipboard is no longer this app's.
+fn flush_own_clipboard(window: Hwnd) {
+    let owner = unsafe { GetClipboardOwner() };
+    let ours = !owner.is_null()
+        && unsafe { GetWindowThreadProcessId(owner, std::ptr::null_mut()) }
+            == unsafe { GetCurrentThreadId() };
+    let pending =
+        ours && FLUSHED_CLIPBOARD.with(Cell::get) != unsafe { GetClipboardSequenceNumber() };
+    if pending && unsafe { OleFlushClipboard() } < 0 {
+        let retries = CLIPBOARD_RETRIES_LEFT.with(Cell::get);
+        if retries > 0 {
+            CLIPBOARD_RETRIES_LEFT.with(|value| value.set(retries - 1));
+            unsafe { SetTimer(window, CLIPBOARD_TIMER, CLIPBOARD_RETRY_MS, None) };
+            return;
+        }
+    } else if pending {
+        // Flushing changes the clipboard once more; do not answer that change.
+        FLUSHED_CLIPBOARD.with(|value| value.set(unsafe { GetClipboardSequenceNumber() }));
+    }
+    unsafe { KillTimer(window, CLIPBOARD_TIMER) };
 }
 fn observe_taskbar_button_created(window: Hwnd, message: u32) {
     let taskbar_button_message = TASKBAR_BUTTON_MESSAGE.with(Cell::get);
@@ -1840,9 +1907,12 @@ pub fn take_startup_selection_request() -> bool {
         }
     })
 }
-pub fn configure_popup_with_key(width: f64, height: f64, transition_key: u64) {
+/// Sets the popup card's target size. With `animate`, a visible popup eases to
+/// it over published frames; otherwise the size is applied in one step.
+/// Returns whether an eased resize toward the target is now in flight.
+pub fn configure_popup(width: f64, height: f64, transition_key: u64, animate: bool) -> bool {
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
-        return;
+        return false;
     }
     SIZE.with(|v| v.set((width, height)));
     TRANSITION_KEY.with(|value| value.set(transition_key));
@@ -1869,9 +1939,11 @@ pub fn configure_popup_with_key(width: f64, height: f64, transition_key: u64) {
             INITIALIZED.with(|v| v.set(true));
             // If the presenter ever restores a frame style, clear its cached
             // non-client metrics too; SetWindowLongPtr alone does not do this.
-            resize_popup(window, first || frame_changed);
+            resize_popup(window, first || frame_changed, animate);
         }
+        return RESIZE_ANIMATION.with(Cell::get).is_some();
     }
+    false
 }
 fn prepare_activation(window: Hwnd) -> bool {
     let ready = crate::desktop::move_to_remembered_desktop(window as usize);
@@ -2229,7 +2301,7 @@ pub fn show_popup() {
             && unsafe { MonitorFromWindow(window, 2) } == ANCHOR.with(Cell::get)
         {
             if reversing_hide {
-                resize_popup(window, false);
+                resize_popup(window, false, true);
             }
             // Re-activating an already visible popup must not snap an active
             // expansion to its destination. Its pending UI frame remains valid.
@@ -2240,7 +2312,7 @@ pub fn show_popup() {
         // ShowWindow still waits for the matching UI viewport to be committed.
         SHOW_AFTER_FRAME.with(|value| value.set(true));
         stop_resize(window);
-        resize_popup(window, true);
+        resize_popup(window, true, true);
     }
 }
 pub fn hide_popup() {
@@ -2356,6 +2428,7 @@ struct TaskbarList3Table {
 }
 #[link(name = "ole32")]
 unsafe extern "system" {
+    fn OleFlushClipboard() -> i32;
     fn CoInitializeEx(reserved: Hwnd, flags: u32) -> i32;
     fn CoUninitialize();
     fn CoCreateInstance(
@@ -2857,7 +2930,9 @@ mod presentation_tests {
                 actual,
                 Rect {
                     left: 0,
-                    top: (512 - ((height + 32.0) * scale).ceil() as i32).max(0),
+                    // The card, its shadow gutter, and room for one more line.
+                    top: (512 - ((height + 32.0 + POPUP_GROWTH_HEADROOM) * scale).ceil() as i32)
+                        .max(0),
                     right: 512,
                     bottom: 512
                 }

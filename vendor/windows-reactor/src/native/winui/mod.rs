@@ -35,8 +35,9 @@ mod caret;
 mod content_dialog;
 mod input_activation;
 mod slide;
+mod text_box_layout;
 mod text_metrics;
-pub use text_metrics::{TextMetrics, measure_text};
+pub use text_metrics::{TextMetrics, measure_text, measure_wrapped_text_height};
 #[cfg(feature = "test")]
 pub(crate) use content_dialog::LiveContentDialogState;
 use content_dialog::{ContentDialogAction, ContentDialogScheduler};
@@ -1573,6 +1574,16 @@ impl WinUiRuntime {
                         self.caret_overrides.entry(*node).or_default(),
                     )
                     .map_err(native_error),
+                    Some(_) => Err(RuntimeError::UnsupportedKind),
+                    None => Err(RuntimeError::MissingNode(*node)),
+                };
+                _ = completion.call(result);
+            }
+            Command::MeasureTextBox { node, completion } => {
+                let result = match self.handles.get(node) {
+                    Some(Handle::TextBox(control)) => {
+                        text_box_layout::laid_out_height(control).map_err(native_error)
+                    }
                     Some(_) => Err(RuntimeError::UnsupportedKind),
                     None => Err(RuntimeError::MissingNode(*node)),
                 };

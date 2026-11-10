@@ -432,6 +432,32 @@ impl ElementRef<crate::TextBox> {
             },
         })
     }
+
+    /// Enqueues a layout pass and reports this text box's laid-out height, in DIPs.
+    ///
+    /// A text box without an explicit height sizes itself to its wrapped text, within its
+    /// minimum and maximum. This is that native result for the text the control holds when
+    /// the request runs, for callers that size surrounding content from a prediction and
+    /// need to confirm it. The request also lets the box show its vertical scroll bar when
+    /// its text overflows the maximum height; WinUI hides it by default.
+    #[must_use = "false means the reference is currently unbound or its queue is full"]
+    pub fn request_layout_height(
+        &self,
+        completion: impl Fn(Result<f64, IntegrationError>) + 'static,
+    ) -> bool {
+        let Some(binding) = self.target.borrow().binding.clone() else {
+            return false;
+        };
+        binding.endpoint.enqueue(NativeWork {
+            identity: binding.identity,
+            work: ImperativeRequest::MeasureTextBox {
+                node: binding.node,
+                completion: Callback::new(move |result: Result<f64, RuntimeError>| {
+                    completion(result.map_err(IntegrationError::from_runtime));
+                }),
+            },
+        })
+    }
 }
 
 impl ElementRef<crate::WebView2> {
@@ -985,6 +1011,10 @@ pub(crate) enum ImperativeRequest {
         color: crate::Color,
         completion: Callback<Result<bool, RuntimeError>>,
     },
+    MeasureTextBox {
+        node: NodeId,
+        completion: Callback<Result<f64, RuntimeError>>,
+    },
     InitializeWebView2 {
         node: NodeId,
         completion: Callback<Result<windows_core::IUnknown, RuntimeError>>,
@@ -1036,6 +1066,9 @@ impl ImperativeRequest {
             | Self::SetTextBoxCaretColor {
                 node, completion, ..
             } => {
+                _ = completion.call(Err(RuntimeError::MissingNode(node)));
+            }
+            Self::MeasureTextBox { node, completion } => {
                 _ = completion.call(Err(RuntimeError::MissingNode(node)));
             }
             Self::InitializeWebView2 { node, completion } => {

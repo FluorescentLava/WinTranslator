@@ -731,6 +731,17 @@ impl RecordingRuntime {
                     Err(RuntimeError::UnsupportedKind)
                 });
             }
+            Command::MeasureTextBox { node, completion } => {
+                let recorded = self
+                    .nodes
+                    .get(node)
+                    .ok_or(RuntimeError::MissingNode(*node))?;
+                _ = completion.call(if recorded.kind == Some(MountedKind::TextBox) {
+                    Ok(0.0)
+                } else {
+                    Err(RuntimeError::UnsupportedKind)
+                });
+            }
             Command::SetTextBoxCaretColor {
                 node, completion, ..
             } => {
