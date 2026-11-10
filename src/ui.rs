@@ -68,6 +68,9 @@ pub enum Message {
     SetKey(Provider, String),
     Region(String),
     AutoOffline(bool),
+    DownloadModels,
+    CancelModelDownload,
+    ModelsStatus(crate::model_download::Status),
     DeepLPlan(Option<usize>),
     Save,
     Theme(Option<usize>),
@@ -113,6 +116,9 @@ pub struct Translator {
     phonetics_task: Option<ComponentTask>,
     selection_task: Option<ComponentTask>,
     selection_revision: u64,
+    model_download_status: crate::model_download::Status,
+    model_download_watch: Option<ComponentTask>,
+    model_cancel_pending: bool,
     status: String,
     error: bool,
     input: ElementRef<TextBox>,
@@ -701,6 +707,117 @@ impl Translator {
             .padding(14.0)
             .content(content)
     }
+    fn watch_model_download(&mut self, cx: &ComponentContext<Self>) {
+        if let Some(watch) = self.model_download_watch.take() {
+            watch.cancel();
+        }
+        let previous = self.model_download_status.clone();
+        self.model_download_watch = Some(cx.spawn_background(move |cancel| {
+            while !cancel.is_cancelled() {
+                let next = crate::model_download::status();
+                if next != previous || next.phase != crate::model_download::Phase::Downloading {
+                    return Message::ModelsStatus(next);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Message::Warmed
+        }));
+    }
+    fn offline_models_card(&self, cx: &ViewContext<Self>) -> View {
+        use crate::model_download::Phase;
+        let status = &self.model_download_status;
+        let downloading = status.phase == Phase::Downloading;
+        let ready = !downloading && crate::model_download::ready_at(&offline::models_dir());
+        let description = if ready {
+            "中文 ⇄ 英语 · 已就绪".to_owned()
+        } else if downloading && self.model_cancel_pending {
+            "正在取消下载…".to_owned()
+        } else if downloading {
+            format!(
+                "正在下载 · {:.1} / {:.1} MiB",
+                status.downloaded as f64 / 1048576.0,
+                status.total as f64 / 1048576.0
+            )
+        } else if status.phase == Phase::Cancelled {
+            "中文 ⇄ 英语 · 下载已取消，可继续下载".to_owned()
+        } else {
+            format!(
+                "中文 ⇄ 英语 · 下载约 {:.0} MiB",
+                crate::model_download::total_bytes() as f64 / 1048576.0
+            )
+        };
+        self.card(
+            StackPanel::new().spacing(10.0).children((
+                Grid::new()
+                    .columns([Star(1.0), Auto])
+                    .column_spacing(12.0)
+                    .children((
+                        StackPanel::new()
+                            .spacing(4.0)
+                            .children((text("离线模型", 14.0), muted(description))),
+                        if ready {
+                            View::empty()
+                        } else {
+                            Button::new()
+                                .style(if downloading {
+                                    ButtonStyle::Default
+                                } else {
+                                    ButtonStyle::Accent
+                                })
+                                .min_width(0.0)
+                                .is_enabled(!self.model_cancel_pending)
+                                .vertical_alignment(Center)
+                                .automation_name(if downloading {
+                                    "取消下载离线模型"
+                                } else {
+                                    "下载离线模型"
+                                })
+                                .on_click(cx.message(if downloading {
+                                    Message::CancelModelDownload
+                                } else {
+                                    Message::DownloadModels
+                                }))
+                                .grid_column(1)
+                                .content(if self.model_cancel_pending {
+                                    "正在取消"
+                                } else if downloading {
+                                    "取消下载"
+                                } else if status.phase == Phase::Failed {
+                                    "重试下载"
+                                } else if status.phase == Phase::Cancelled {
+                                    "继续下载"
+                                } else {
+                                    "下载离线模型"
+                                })
+                                .into()
+                        },
+                    )),
+                if downloading {
+                    ProgressBar::new()
+                        .minimum(0.0)
+                        .maximum(status.total.max(1) as f64)
+                        .value(status.downloaded.min(status.total) as f64)
+                        .is_indeterminate(false)
+                        .height(4.0)
+                        .automation_name("离线模型下载进度")
+                        .into()
+                } else {
+                    View::empty()
+                },
+                if !ready && status.phase == Phase::Failed {
+                    muted(
+                        status
+                            .error
+                            .as_deref()
+                            .unwrap_or("下载失败，请检查网络后重试"),
+                    )
+                    .into()
+                } else {
+                    View::empty()
+                },
+            )),
+        )
+    }
     fn provider_choices(&self, selected: Provider, compact: bool, cx: &ViewContext<Self>) -> View {
         NavigationView::new()
             .width(if compact { 224.0 } else { 420.0 })
@@ -739,7 +856,13 @@ impl Translator {
                         };
                         let status = match provider {
                             Provider::Offline if offline::ready() => "已就绪",
-                            Provider::Offline => "未就绪",
+                            Provider::Offline
+                                if crate::model_download::status().phase
+                                    == crate::model_download::Phase::Downloading =>
+                            {
+                                "下载中"
+                            }
+                            Provider::Offline => "未下载",
                             Provider::MyMemory => "免密钥试用",
                             _ if configured => "已配置",
                             _ => missing_status,
@@ -1737,17 +1860,21 @@ impl Translator {
             order
         };
         StackPanel::new().spacing(10.0).children((
-            self.card(
-                StackPanel::new().spacing(12.0).children((
-                    field("默认引擎", self.provider_choices(provider, false, cx)),
-                    StackPanel::new().keyed_children([(provider.index(), credentials)]),
-                    extra,
+            self.offline_models_card(cx),
+            self.card(StackPanel::new().spacing(12.0).children((
+                field("默认引擎", self.provider_choices(provider, false, cx)),
+                StackPanel::new().keyed_children([(provider.index(), credentials)]),
+                extra,
+                if provider.needs_key() {
                     Button::new()
                         .style(ButtonStyle::Accent)
                         .on_click(cx.message(Message::Save))
-                        .content("保存凭据"),
-                )),
-            ),
+                        .content("保存凭据")
+                        .into()
+                } else {
+                    View::empty()
+                },
+            ))),
             self.card(
                 StackPanel::new()
                     .spacing(10.0)
@@ -1810,7 +1937,7 @@ impl Translator {
                             muted(if offline::ready() {
                                 "断网或未配置密钥时使用 · 中英模型已就绪"
                             } else {
-                                "模型文件缺失，请检查 models 文件夹"
+                                "在“翻译服务”页下载中英离线模型"
                             }),
                         )),
                         ToggleSwitch::new()
@@ -2032,7 +2159,7 @@ impl Component for Translator {
                 Message::Warmed
             });
         }
-        Self {
+        let mut translator = Self {
             settings_window: input.settings_window,
             parent: input.parent.clone(),
             settings_open: false,
@@ -2073,13 +2200,22 @@ impl Component for Translator {
             phonetics_task: None,
             selection_task: None,
             selection_revision: 0,
+            model_download_status: crate::model_download::status(),
+            model_download_watch: None,
+            model_cancel_pending: false,
             status: warning.clone().unwrap_or_default(),
             error: warning.is_some(),
             input: ElementRef::new(),
             provider_button: ElementRef::new(),
             popup_surface: ElementRef::new(),
             popup_animation_revision: None,
+        };
+        if input.settings_window
+            && translator.model_download_status.phase == crate::model_download::Phase::Downloading
+        {
+            translator.watch_model_download(cx);
         }
+        translator
     }
     fn update(&mut self, message: Message, cx: &ComponentContext<Self>) {
         match message {
@@ -2572,6 +2708,25 @@ impl Component for Translator {
                     self.save();
                 }
             }
+            Message::DownloadModels if self.settings_window => {
+                self.model_cancel_pending = false;
+                crate::model_download::start();
+                self.model_download_status = crate::model_download::status();
+                self.watch_model_download(cx);
+            }
+            Message::CancelModelDownload if self.settings_window => {
+                self.model_cancel_pending = true;
+                crate::model_download::cancel();
+            }
+            Message::ModelsStatus(status) => {
+                self.model_download_status = status;
+                if self.model_download_status.phase != crate::model_download::Phase::Downloading {
+                    self.model_cancel_pending = false;
+                }
+                if self.model_download_status.phase == crate::model_download::Phase::Downloading {
+                    self.watch_model_download(cx);
+                }
+            }
             Message::DeepLPlan(Some(index)) if index < 3 => {
                 let plan = [DeepLPlan::Developer, DeepLPlan::LegacyFree, DeepLPlan::Paid][index];
                 if self.settings.effective_deepl_plan() != plan {
@@ -2615,6 +2770,9 @@ impl Component for Translator {
 impl Drop for Translator {
     fn drop(&mut self) {
         self.cancel_selection();
+        if let Some(watch) = self.model_download_watch.take() {
+            watch.cancel();
+        }
         if let Some(task) = self.phonetics_task.take() {
             task.cancel();
         }

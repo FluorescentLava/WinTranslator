@@ -7,7 +7,7 @@ param(
 )
 # Windows PowerShell 5.1+. Run the real Inno extraction and Finish actions in
 # isolated fixtures. Pass a staging folder from package-release.ps1 -KeepStage
-# as PayloadPath to include the large-payload extraction regression check.
+# as PayloadPath to include the application-payload extraction regression check.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $project = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))

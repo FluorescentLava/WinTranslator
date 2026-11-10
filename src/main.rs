@@ -5,6 +5,7 @@ mod chinese_dictionary;
 mod desktop;
 mod dictionary;
 mod model;
+mod model_download;
 mod native;
 mod offline;
 mod routing;

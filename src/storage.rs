@@ -142,6 +142,12 @@ pub fn check_configuration() -> Result<PathBuf> {
     report["time"] = chrono::Local::now().to_rfc3339().into();
     report["executable"] = serde_json::to_value(std::env::current_exe().ok())?;
     report["working_directory"] = serde_json::to_value(std::env::current_dir().ok())?;
+    report["offline_models"] = serde_json::json!({
+        "ready": crate::offline::ready(),
+        "directory": crate::offline::models_dir(),
+        "download_directory": crate::offline::download_dir(),
+        "download_bytes": crate::model_download::total_bytes(),
+    });
     for name in ["LINGUA_DATA_DIR", "LOCALAPPDATA", "APPDATA", "USERPROFILE"] {
         report[name] = serde_json::to_value(std::env::var_os(name).map(PathBuf::from))?;
     }

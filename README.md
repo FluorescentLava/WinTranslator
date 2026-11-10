@@ -8,11 +8,11 @@ Windows 11 x64 翻译工具，使用 Rust、原生 WinUI 3 控件与 Mica 背景
 
 ## 下载与安装
 
-在 [GitHub Releases](https://github.com/FluorescentLava/WinTranslator/releases) 下载并运行 `WinTranslater-0.1.0-Beta-windows-x64-setup.exe`。安装包包含本地词典、中英双向离线模型和应用所需的 Visual C++ DLL，无需安装 Rust 或 Python。API 凭据在设置中填写。
+在 [GitHub Releases](https://github.com/FluorescentLava/WinTranslator/releases) 下载并运行 `WinTranslater-0.1.0-Beta-windows-x64-setup.exe`。安装包包含本地 ECDICT 词典、ONNX Runtime 和应用所需的 Visual C++ DLL，无需安装 Rust 或 Python。中英双向离线模型在应用内按需下载，安装应用无需先下载模型。API 凭据在设置中填写。
 
 默认安装到 `%LOCALAPPDATA%\Programs\WinTranslater`，无需管理员权限，提供开始菜单入口和系统卸载项。程序需要为当前用户注册的 Windows App Runtime 2.4 或更新的兼容 2.x x64 版本；缺少时，安装程序从微软下载官方安装程序并安装。已有兼容运行库时可离线安装应用。
 
-从 Windows“已安装的应用”卸载，或运行安装目录内的 `unins000.exe`。升级和卸载保留本机配置、凭据、历史及用量记录；系统共享运行库由 Windows 维护。
+从 Windows“已安装的应用”卸载，或运行安装目录内的 `unins000.exe`。升级和卸载保留本机配置、凭据、历史、用量记录及用户目录中的离线模型；系统共享运行库由 Windows 维护。
 
 ## 使用
 
@@ -41,19 +41,20 @@ Windows 11 x64 翻译工具，使用 Rust、原生 WinUI 3 控件与 Mica 背景
 
 ## 本地词典与离线翻译
 
-本地释义来自 [ECDICT](dictionary/SOURCES.md)，离线翻译使用 ONNX Runtime 和 OPUS-MT 量化模型，支持简体中文与英语互译。资源准备后，词典查询和模型推理不需要联网或 Python。词典释义与机器译文来自不同来源，覆盖范围和翻译准确度各有限制。
+本地释义来自 [ECDICT](dictionary/SOURCES.md)，安装完成即可查询。离线翻译使用 ONNX Runtime 和 OPUS-MT 量化模型，支持简体中文与英语互译。在“设置 → 翻译服务”的“离线模型”卡中点击“下载离线模型”，从 Hugging Face 的 [Xenova/opus-mt-en-zh](https://huggingface.co/Xenova/opus-mt-en-zh) 和 [Xenova/opus-mt-zh-en](https://huggingface.co/Xenova/opus-mt-zh-en) 原仓库下载两个方向的模型，合计约 220 MiB。
 
-超过 5,000 个字符的文本自动使用本地模型翻译全文，按句界、词界与模型 token 数分段并保留段落。此时手动选择在线服务只翻译前 5,000 个 Unicode 字符，界面会提示未翻译的后续内容；在线失败且启用自动离线时，本地模型翻译全文。
+下载的模型保存在 `%LOCALAPPDATA%\TranslationTool\models`，界面显示“中文 ⇄ 英语 · 已就绪”后即可使用。升级可复用用户目录或旧安装目录中已有的完整模型，无需重复下载。模型清单记录上游修订、文件大小和完整性信息。词典查询和已准备模型的推理不需要联网或 Python；词典释义与机器译文来自不同来源，覆盖范围和翻译准确度各有限制。
 
-源码运行所需资源由以下 PowerShell 脚本准备：
+模型就绪后，超过 5,000 个字符的文本自动使用本地模型翻译全文，按句界、词界与模型 token 数分段并保留段落。此时手动选择在线服务只翻译前 5,000 个 Unicode 字符，界面会提示未翻译的后续内容；在线失败且启用自动离线时，本地模型翻译全文。
+
+源码运行时，使用以下 PowerShell 脚本准备运行库与词典，模型也可通过应用内按钮下载：
 
 ```powershell
 .\scripts\download-runtime.ps1
-.\scripts\download-models.ps1
 .\scripts\download-dictionary.ps1
 ```
 
-ONNX Runtime 位于 `runtime/`，模型位于 `models/en-zh/`、`models/zh-en/`，词典位于 `dictionary/`。模型清单记录上游修订、文件大小和完整性信息。
+ONNX Runtime 位于 `runtime/`，词典位于 `dictionary/`。开发时可选用 `.\scripts\download-models.ps1` 将模型准备到项目内的 `models/en-zh/`、`models/zh-en/`，供本地离线推理测试使用。
 
 ## 构建与打包
 
@@ -63,18 +64,19 @@ ONNX Runtime 位于 `runtime/`，模型位于 `models/en-zh/`、`models/zh-en/`�
 git clone https://github.com/FluorescentLava/WinTranslator.git
 cd WinTranslator
 .\scripts\download-runtime.ps1
-.\scripts\download-models.ps1
 .\scripts\download-dictionary.ps1
 .\scripts\build.ps1
 ```
 
-构建脚本在项目根目录生成 `WinTranslater.exe`，运行时保留 `dictionary/`、`runtime/` 和 `models/`。`build.ps1 -SelfContained` 可附带 Windows App SDK 运行库，部署时需同时保留生成的运行库资源。原生 WinUI 3 封装位于 `vendor/windows-reactor`，依赖版本由 `Cargo.lock` 固定。
+构建脚本在项目根目录生成 `WinTranslater.exe`，运行时保留 `dictionary/` 和 `runtime/`；离线模型可在应用内下载或复用已有的 `models/`。`build.ps1 -SelfContained` 可附带 Windows App SDK 运行库，部署时需同时保留生成的运行库资源。原生 WinUI 3 封装位于 `vendor/windows-reactor`，依赖版本由 `Cargo.lock` 固定。
 
 ```powershell
 cargo build --release --locked
 cargo test --locked
-# 已准备模型和运行库时，包含实际离线推理：
-cargo test --locked -- --include-ignored
+# 使用项目内已下载的模型验证中英双向推理：
+$env:LINGUA_MODELS_DIR = (Resolve-Path .\models).Path
+cargo test --locked offline::tests::real_offline_translation_both_directions -- --ignored --exact
+Remove-Item Env:LINGUA_MODELS_DIR
 ```
 
 生成安装包需另行安装 [Inno Setup 6.5 或更新版本](https://jrsoftware.org/isdl.php)：
@@ -85,9 +87,9 @@ cargo test --locked -- --include-ignored
 .\scripts\package-release.ps1 -IsccPath 'C:\Tools\Inno Setup 6\ISCC.exe'
 ```
 
-打包脚本构建使用系统 Windows App Runtime 的版本，验证模型完整性并收集 Visual C++ DLL，在 `dist/` 生成安装程序。版本读取 `Cargo.toml` 并与 EXE 产品版本核对；安装配置在 `installer/WinTranslater.iss`，运行库来源在 `installer/runtime.json`。
+打包脚本构建使用系统 Windows App Runtime 的版本，收集 ONNX Runtime、本地 ECDICT 词典和 Visual C++ DLL，在 `dist/` 生成安装程序。模型由应用内下载，打包无需准备模型文件。版本读取 `Cargo.toml` 并与 EXE 产品版本核对；安装配置在 `installer/WinTranslater.iss`，运行库来源在 `installer/runtime.json`。
 
-可用 `-SkipBuild -TargetDirectory '<Cargo target 目录>'` 复用普通 Release 构建，自包含构建不用于此安装包。找不到 CRT 时，用 `-VcRuntimeDirectory '<x64\Microsoft.VC143.CRT 目录>'` 指定。安装检查脚本为 `scripts/test-installer.ps1` 和 `scripts/test-installer-responsiveness.ps1`。
+可用 `-SkipBuild -TargetDirectory '<Cargo target 目录>'` 复用普通 Release 构建，自包含构建不用于此安装包。找不到 CRT 时，用 `-VcRuntimeDirectory '<x64\Microsoft.VC143.CRT 目录>'` 指定。用 `-KeepStage` 保留打包载荷后，可运行 `.\scripts\test-installer.ps1 -PayloadPath '<staging 目录>'` 检查运行库、词典、模型排除规则和文件完整性；安装器响应检查脚本为 `scripts/test-installer-responsiveness.ps1`。
 
 源码构建也可通过脚本安装，或登记已有程序目录：
 
@@ -100,11 +102,11 @@ cargo test --locked -- --include-ignored
 
 ## 本机数据与网络访问
 
-设置、历史、免费用量估算、缓存和诊断记录保存在 `%LOCALAPPDATA%\TranslationTool`。API 凭据由 Windows DPAPI 为当前用户加密保存。读取或解密凭据失败时，程序保留原文件并阻止空配置覆盖；`WinTranslater.exe --check-configuration` 可生成包含路径、读取状态与凭据存在标记的本机报告，不输出密钥。
+设置、历史、免费用量估算、缓存、诊断记录及下载的离线模型保存在 `%LOCALAPPDATA%\TranslationTool`。API 凭据由 Windows DPAPI 为当前用户加密保存。读取或解密凭据失败时，程序保留原文件并阻止空配置覆盖；`WinTranslater.exe --check-configuration` 可生成包含路径、读取状态与凭据存在标记的本机报告，不输出密钥。
 
-在线翻译会把文本发送给实际尝试的服务。中文词语的补充释义、未缓存的英语音标及短文本发音音频使用有道词典；本地词典、离线模型、已有缓存和本机语音在设备上执行。
+在线翻译会把文本发送给实际尝试的服务。中文词语的补充释义、未缓存的英语音标及短文本发音音频使用有道词典；离线模型下载访问 Hugging Face 上游仓库。本地词典、已下载的离线模型、已有缓存和本机语音在设备上执行。
 
-仓库不包含个人凭据、设置、历史、编译产物、模型权重或运行库二进制文件；离线资源通过下载脚本准备。
+仓库不包含个人凭据、设置、历史、编译产物、模型权重或运行库二进制文件；运行库与词典通过下载脚本准备，离线模型可在应用内或通过脚本下载。
 
 ## 许可证
 

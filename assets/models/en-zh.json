@@ -1,0 +1,31 @@
+{
+  "files": [
+    {
+      "file": "config.json",
+      "sha256": "4727d1229a04f95bf6f39abf949d8080615433d99d6ebd85f81c09edd247d5fa",
+      "bytes": 1503
+    },
+    {
+      "file": "source.spm",
+      "sha256": "5775ddc9e3ff2fae91554da56468ad35ff56edaba870fea74447bc7234bfdaa8",
+      "bytes": 806435
+    },
+    {
+      "file": "vocab.json",
+      "sha256": "22c957348eed495ee925afc40a36da3e387c8a34a734c8486967c2dca271613e",
+      "bytes": 1747795
+    },
+    {
+      "file": "encoder_model_quantized.onnx",
+      "sha256": "d3b7912bf6a9bd27e4c074c2df91d4ff3d5b4bc5f7f6c8d7cc9c805c98fbafee",
+      "bytes": 52899742
+    },
+    {
+      "file": "decoder_model_quantized.onnx",
+      "sha256": "2c66a3981099b40edbb3a0d65e015d05964d42fecb9780f8422776eff5939112",
+      "bytes": 59842102
+    }
+  ],
+  "revision": "046f55aec303cdee3e0318604406d4df20f1e8ea",
+  "repository": "Xenova/opus-mt-en-zh"
+}

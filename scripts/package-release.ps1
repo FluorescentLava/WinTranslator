@@ -130,24 +130,16 @@ try {
     foreach ($name in @('ecdict.csv', 'ECDICT-LICENSE.txt', 'manifest.json', 'SOURCES.md')) {
         Copy-PayloadFile (Join-Path $project "dictionary\$name") "dictionary\$name"
     }
-    foreach ($direction in @('en-zh', 'zh-en')) {
-        foreach ($name in @('config.json', 'decoder_model_quantized.onnx', 'encoder_model_quantized.onnx', 'manifest.json', 'source.spm', 'tokenizer.json', 'vocab.json')) {
-            Copy-PayloadFile (Join-Path $project "models\$direction\$name") "models\$direction\$name"
-        }
-        $modelRoot = Join-Path $stage "models\$direction"
-        $modelManifest = Get-Content -LiteralPath (Join-Path $modelRoot 'manifest.json') -Raw | ConvertFrom-Json
-        foreach ($entry in $modelManifest.files) {
-            $file = Get-Item -LiteralPath (Join-Path $modelRoot $entry.file)
-            if ($file.Length -ne $entry.bytes -or (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash -ine $entry.sha256) {
-                throw "Model hash mismatch: $direction/$($entry.file)"
-            }
-        }
-    }
+    # The application downloads offline models into its per-user data directory.
+    if (Test-Path -LiteralPath (Join-Path $stage 'models')) { throw 'Offline models must be downloaded by the application.' }
     foreach ($required in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $stage $required))) { throw "Visual C++ runtime missing: $required" }
     }
     $files = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Force)
     foreach ($file in $files) {
+        if ($file.Extension -in @('.onnx', '.spm') -or $file.Name -in @('tokenizer.json', 'vocab.json')) {
+            throw "Offline model file must not be packaged: $($file.Name)"
+        }
         if ($file.Name -match '^(settings|history|free-api-usage)\.(json|tmp)$|^credentials|^secrets?|^configuration-check\.|\.log$|\.dpapi$|^\.env') {
             throw "Private data must not be packaged: $($file.Name)"
         }

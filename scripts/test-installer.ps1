@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param([string]$SignedRuntimeInstaller)
+param(
+    [string]$SignedRuntimeInstaller,
+    [string]$PayloadPath
+)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $project = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -14,6 +17,36 @@ function Assert-Throws([scriptblock]$Action) {
     $failed = $false
     try { & $Action } catch { $failed = $true }
     Assert-InstallerTest $failed 'Expected installer operation to fail.'
+}
+# Pass the staging directory from package-release.ps1 -KeepStage to verify the
+# installer payload without installing the application or downloading models.
+if ($PayloadPath) {
+    $payload = (Get-Item -LiteralPath $PayloadPath -ErrorAction Stop).FullName.TrimEnd('\')
+    Assert-InstallerTest (-not (Test-Path -LiteralPath (Join-Path $payload 'models'))) 'Offline model directories must not be bundled in the installer.'
+    foreach ($relative in @(
+        'WinTranslater.exe', 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll',
+        'runtime\onnxruntime.dll', 'runtime\onnxruntime_providers_shared.dll', 'runtime\LICENSE.txt',
+        'dictionary\ecdict.csv', 'dictionary\ECDICT-LICENSE.txt', 'dictionary\manifest.json', 'dictionary\SOURCES.md',
+        'payload-sha256.json'
+    )) {
+        Assert-InstallerTest (Test-Path -LiteralPath (Join-Path $payload $relative) -PathType Leaf) "Required installer payload file missing: $relative"
+    }
+    $payloadFiles = @(Get-ChildItem -LiteralPath $payload -Recurse -File -Force)
+    foreach ($file in $payloadFiles) {
+        Assert-InstallerTest ($file.Extension -notin @('.onnx', '.spm') -and $file.Name -notin @('tokenizer.json', 'vocab.json')) "Offline model file was bundled: $($file.Name)"
+    }
+    $payloadManifest = [IO.File]::ReadAllText((Join-Path $payload 'payload-sha256.json')) | ConvertFrom-Json
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $payloadManifest) {
+        $relative = [string]$entry.path
+        $target = [IO.Path]::GetFullPath((Join-Path $payload $relative))
+        Assert-InstallerTest ($target.StartsWith($payload+'\', [StringComparison]::OrdinalIgnoreCase)) 'Payload manifest path escaped the staging directory.'
+        Assert-InstallerTest ($seen.Add($relative)) "Duplicate payload manifest entry: $relative"
+        Assert-InstallerTest (Test-Path -LiteralPath $target -PathType Leaf) "Manifest file missing: $relative"
+        $file = Get-Item -LiteralPath $target
+        Assert-InstallerTest ($file.Length -eq $entry.bytes -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ieq $entry.sha256) "Payload hash mismatch: $relative"
+    }
+    Assert-InstallerTest ($payloadFiles.Count -eq $payloadManifest.Count + 1) 'Payload files and integrity manifest do not match.'
 }
 if ($SignedRuntimeInstaller) {
     Assert-OfficialRuntimeInstaller $SignedRuntimeInstaller $specification

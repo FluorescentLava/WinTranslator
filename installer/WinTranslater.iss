@@ -43,8 +43,8 @@ Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-; ExtractTemporaryFile must not decompress the models before reaching a helper.
-; Keep every helper first, in a separate solid block from the large payload.
+; ExtractTemporaryFile must reach each helper before the application payload.
+; Keep every helper first, in a separate solid block from the payload.
 Source: "runtime-prerequisite.ps1"; Flags: dontcopy
 Source: "runtime.json"; Flags: dontcopy
 Source: "stop-app.ps1"; DestDir: "{app}\support"; Flags: ignoreversion

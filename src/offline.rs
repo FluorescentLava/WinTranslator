@@ -20,24 +20,32 @@ pub fn resource(relative: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
     }
 }
-pub fn models_dir() -> PathBuf {
+pub fn download_dir() -> PathBuf {
     std::env::var_os("LINGUA_MODELS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| resource("models"))
+        .unwrap_or_else(|| crate::storage::data_dir().join("models"))
+}
+
+fn select_models_dir(downloaded: PathBuf, packaged: Option<PathBuf>) -> PathBuf {
+    if crate::model_download::ready_at(&downloaded) {
+        return downloaded;
+    }
+    packaged
+        .filter(|path| crate::model_download::ready_at(path))
+        .unwrap_or(downloaded)
+}
+
+pub fn models_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("LINGUA_MODELS_DIR") {
+        return PathBuf::from(path);
+    }
+    let packaged = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("models")));
+    select_models_dir(download_dir(), packaged)
 }
 pub fn ready() -> bool {
-    ["en-zh", "zh-en"].iter().all(|pair| {
-        let root = models_dir().join(pair);
-        [
-            "encoder_model_quantized.onnx",
-            "decoder_model_quantized.onnx",
-            "source.spm",
-            "vocab.json",
-            "config.json",
-        ]
-        .iter()
-        .all(|file| root.join(file).is_file())
-    }) && resource("runtime/onnxruntime.dll").is_file()
+    crate::model_download::ready_at(&models_dir()) && resource("runtime/onnxruntime.dll").is_file()
 }
 
 struct Model {
@@ -206,8 +214,12 @@ impl OfflineEngine {
         if !self.models.contains_key(pair) {
             let root = models_dir().join(pair);
             anyhow::ensure!(
-                root.join("encoder_model_quantized.onnx").is_file(),
-                "未找到 {pair} 离线模型，请运行 scripts/download-models.ps1"
+                crate::model_download::ready_at(&models_dir()),
+                "离线模型尚未下载完成，请在设置 → 翻译服务中下载离线模型"
+            );
+            anyhow::ensure!(
+                resource("runtime/onnxruntime.dll").is_file(),
+                "离线推理库缺失，请重新运行安装程序"
             );
             if self.environment.is_none() {
                 self.environment = Some(

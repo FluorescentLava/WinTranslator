@@ -10,7 +10,7 @@
 | Microsoft Visual C++ Runtime | Microsoft | 随应用分发的 DLL 来自 Visual Studio Build Tools 的 `VC/Redist/MSVC/x64/Microsoft.VC143.CRT`，遵循 Visual Studio 可再分发组件条款。 |
 | Inno Setup 安装器与简体中文翻译 | JRSoftware；翻译由 Zhenghan Yang 维护；Inno Setup 许可证 | 安装器使用 Inno Setup 自带的下载箭头图标；`installer/Languages/ChineseSimplified.isl` 来自官方 `is-6_7_3` 发行源码。许可证见 `licenses/innosetup-LICENSE.txt`。 |
 | ONNX Runtime 1.24.4 | Microsoft；MIT | 见 `runtime/LICENSE.txt`、`licenses/onnxruntime-ThirdPartyNotices.txt`。 |
-| OPUS-MT Marian 翻译模型 | Helsinki-NLP / OPUS，Xenova 转换为 ONNX；Apache-2.0 | 许可依据上游模型卡，见 `licenses/Apache-2.0.txt`；模型清单记录仓库修订与文件完整性信息。 |
+| OPUS-MT Marian 翻译模型 | Helsinki-NLP / OPUS，Xenova 转换为 ONNX；Apache-2.0 | 应用内从 Hugging Face 的 [Xenova/opus-mt-en-zh](https://huggingface.co/Xenova/opus-mt-en-zh) 和 [Xenova/opus-mt-zh-en](https://huggingface.co/Xenova/opus-mt-zh-en) 原仓库按需下载至 `%LOCALAPPDATA%\TranslationTool\models`。许可依据上游模型卡，见 `licenses/Apache-2.0.txt`；模型清单记录仓库修订与文件完整性信息。 |
 | Marian SentencePiece tokenizer 构建逻辑 | 改编自 Hugging Face Candle 的 `candle-examples/examples/marian-mt/spm.rs`；MIT | 见 `licenses/candle-MIT.txt`。 |
 | ECDICT | skywind3000 及贡献者；MIT | 见 `dictionary/ECDICT-LICENSE.txt`、`dictionary/SOURCES.md`；词典 CSV 不纳入源码管理。 |
 | ort | MIT OR Apache-2.0 | 依赖版本记录于 `Cargo.lock`。 |
