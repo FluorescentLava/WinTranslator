@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
-use ort::{environment::Environment, session::Session, value::Tensor};
+use ort::{
+    environment::Environment,
+    session::{RunOptions, Session},
+    value::Tensor,
+};
 use std::{
     collections::HashMap,
-    path::PathBuf,
-    sync::{Mutex, OnceLock},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 use tokenizers::Tokenizer;
@@ -44,8 +48,43 @@ pub fn models_dir() -> PathBuf {
         .and_then(|path| path.parent().map(|parent| parent.join("models")));
     select_models_dir(download_dir(), packaged)
 }
+
+pub fn uninstall_models() -> Result<()> {
+    let _engine = unload_models_for_removal()?;
+    crate::model_download::remove_at(&download_dir())?;
+    if std::env::var_os("LINGUA_MODELS_DIR").is_none()
+        && let Some(packaged) = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("models")))
+    {
+        crate::model_download::remove_at(&packaged)?;
+    }
+    Ok(())
+}
+
+/// A cancelled download owns only the configured download directory; it must
+/// never remove an already packaged model or another model's resources.
+pub(crate) fn cancel_model_download(root: &Path) -> Result<()> {
+    let _engine = unload_models_for_removal()?;
+    crate::model_download::remove_download_at(root)
+}
+
+fn unload_models_for_removal() -> Result<MutexGuard<'static, OfflineEngine>> {
+    // The caller sets the maintenance flag before spawning this worker. Stop a
+    // currently executing ONNX graph before waiting for its engine lock, then
+    // drop every mapped session before attempting any Windows file deletion.
+    interrupt_active_inference()?;
+    let mut engine = engine()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("离线引擎不可用，请重启程序后移除模型"))?;
+    engine.models.clear();
+    Ok(engine)
+}
+
 pub fn ready() -> bool {
-    crate::model_download::ready_at(&models_dir()) && resource("runtime/onnxruntime.dll").is_file()
+    !crate::model_download::is_removing()
+        && crate::model_download::ready_at(&models_dir())
+        && resource("runtime/onnxruntime.dll").is_file()
 }
 
 struct Model {
@@ -72,6 +111,55 @@ fn engine() -> &'static Mutex<OfflineEngine> {
             models: HashMap::new(),
         })
     })
+}
+
+fn active_inference() -> &'static Mutex<Option<Arc<RunOptions>>> {
+    static ACTIVE: OnceLock<Mutex<Option<Arc<RunOptions>>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(None))
+}
+
+struct ActiveInference(Arc<RunOptions>);
+
+impl ActiveInference {
+    fn new() -> Result<Self> {
+        let options = Arc::new(RunOptions::new()?);
+        let mut active = active_inference()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Registration and the removal worker's snapshot share this mutex. If
+        // maintenance starts between checkpoints, it either sees this options
+        // object or registration refuses to launch a new graph.
+        anyhow::ensure!(!crate::model_download::is_removing(), "已取消");
+        *active = Some(Arc::clone(&options));
+        Ok(Self(options))
+    }
+}
+
+impl Drop for ActiveInference {
+    fn drop(&mut self) {
+        let mut active = active_inference()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|options| Arc::ptr_eq(options, &self.0))
+        {
+            *active = None;
+        }
+    }
+}
+
+fn interrupt_active_inference() -> Result<()> {
+    let options = active_inference()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(options) = options {
+        options
+            .terminate()
+            .map_err(|_| anyhow::anyhow!("无法停止离线推理，请稍后重试移除模型"))?;
+    }
+    Ok(())
 }
 
 fn english_word(text: &str) -> bool {
@@ -211,6 +299,7 @@ fn repetitive_output(text: &str, single_word: bool) -> bool {
 
 impl OfflineEngine {
     fn model(&mut self, pair: &str) -> Result<&mut Model> {
+        anyhow::ensure!(!crate::model_download::is_removing(), "正在卸载离线模型");
         if !self.models.contains_key(pair) {
             let root = models_dir().join(pair);
             anyhow::ensure!(
@@ -236,10 +325,12 @@ impl OfflineEngine {
                 .with_intra_threads(threads)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?
                 .commit_from_file(root.join("encoder_model_quantized.onnx"))?;
+            anyhow::ensure!(!crate::model_download::is_removing(), "正在移除离线模型");
             let decoder = Session::builder(env)?
                 .with_intra_threads(threads)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?
                 .commit_from_file(root.join("decoder_model_quantized.onnx"))?;
+            anyhow::ensure!(!crate::model_download::is_removing(), "正在移除离线模型");
             let tokenizer =
                 crate::spm::tokenizer(root.join("source.spm"), root.join("vocab.json"))?;
             let words: HashMap<String, usize> =
@@ -302,6 +393,7 @@ impl Model {
         beam_limit: Option<usize>,
     ) -> Result<String> {
         check_budget(cancelled, deadline)?;
+        let inference = ActiveInference::new()?;
         let single_word =
             beam_limit.is_none() && self.target_prefix.is_some() && english_word(text);
         let encoding = source_encoding(&self.tokenizer, text)?;
@@ -333,11 +425,15 @@ impl Model {
             "这一段过长，请拆成短句后翻译（每段最多 256 个 token）"
         );
         let length = input.len();
-        let encoded = self.encoder.run(ort::inputs![
-            "input_ids" => Tensor::from_array(([1, length], input))?,
-            "attention_mask" => Tensor::from_array(([1, length], vec![1_i64; length]))?,
-        ])?;
+        let encoded = self.encoder.run_with_options(
+            ort::inputs![
+                "input_ids" => Tensor::from_array(([1, length], input))?,
+                "attention_mask" => Tensor::from_array(([1, length], vec![1_i64; length]))?,
+            ],
+            &*inference.0,
+        );
         check_budget(cancelled, deadline)?;
+        let encoded = encoded?;
         let (hidden_shape, hidden) = encoded["last_hidden_state"].try_extract_tensor::<f32>()?;
         let hidden_shape = hidden_shape.to_vec();
         let hidden = hidden.to_vec();
@@ -350,14 +446,18 @@ impl Model {
             let tokens = beams[0].0.len();
             let mut shape = hidden_shape.clone();
             shape[0] = batch as i64;
-            let result = self.decoder.run(ort::inputs![
-                "input_ids" => Tensor::from_array(([batch, tokens], beams.iter().flat_map(|b| b.0.iter().copied()).collect::<Vec<_>>()))?,
-                "encoder_hidden_states" => Tensor::from_array((shape, hidden.repeat(batch)))?,
-                "encoder_attention_mask" => Tensor::from_array(([batch, length], vec![1_i64; batch * length]))?,
-            ])?;
+            let result = self.decoder.run_with_options(
+                ort::inputs![
+                    "input_ids" => Tensor::from_array(([batch, tokens], beams.iter().flat_map(|b| b.0.iter().copied()).collect::<Vec<_>>()))?,
+                    "encoder_hidden_states" => Tensor::from_array((shape, hidden.repeat(batch)))?,
+                    "encoder_attention_mask" => Tensor::from_array(([batch, length], vec![1_i64; batch * length]))?,
+                ],
+                &*inference.0,
+            );
             // A run is synchronous; reject it immediately if this decoder step
             // crossed the request deadline, before considering any output.
             check_budget(cancelled, deadline)?;
+            let result = result?;
             let (shape, logits) = result["logits"].try_extract_tensor::<f32>()?;
             let vocab_size = *shape.last().context("无效模型输出")? as usize;
             let mut candidates = Vec::with_capacity(batch * beam_count * 2);
@@ -511,6 +611,8 @@ pub fn translate_cancellable(
             }
         }
     }
+    let external_cancelled = cancelled;
+    let cancelled = &|| external_cancelled() || crate::model_download::is_removing();
     let lock_deadline = Instant::now() + Duration::from_secs(30);
     let mut engine = loop {
         anyhow::ensure!(!cancelled(), "已取消");

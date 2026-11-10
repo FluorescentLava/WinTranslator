@@ -12,10 +12,10 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -28,9 +28,30 @@ const BUFFER_BYTES: usize = 64 * 1024;
 pub enum Phase {
     Idle,
     Downloading,
+    Pausing,
+    Paused,
+    Cancelling,
+    CancellationFailed,
+    Removing,
+    RemovalFailed,
     Ready,
     Cancelled,
     Failed,
+}
+
+impl Phase {
+    pub fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Downloading | Self::Pausing | Self::Cancelling | Self::Removing
+        )
+    }
+}
+
+static REMOVING: AtomicBool = AtomicBool::new(false);
+
+pub fn is_removing() -> bool {
+    REMOVING.load(Ordering::Acquire)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,13 +66,23 @@ struct WorkerState {
     status: Status,
     running: bool,
     generation: u64,
-    cancelled: Arc<AtomicBool>,
+    request: Arc<AtomicU8>,
+    root: Option<PathBuf>,
 }
 
-fn worker_state() -> &'static Mutex<WorkerState> {
-    static STATE: OnceLock<Mutex<WorkerState>> = OnceLock::new();
-    STATE.get_or_init(|| {
-        Mutex::new(WorkerState {
+const RUN: u8 = 0;
+const PAUSE: u8 = 1;
+const CANCEL: u8 = 2;
+
+struct DownloadRun {
+    generation: u64,
+    request: Arc<AtomicU8>,
+    root: PathBuf,
+}
+
+impl WorkerState {
+    fn new() -> Self {
+        Self {
             status: Status {
                 phase: Phase::Idle,
                 downloaded: 0,
@@ -60,9 +91,92 @@ fn worker_state() -> &'static Mutex<WorkerState> {
             },
             running: false,
             generation: 0,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            request: Arc::new(AtomicU8::new(RUN)),
+            root: None,
+        }
+    }
+
+    fn begin_download(&mut self, root: PathBuf) -> Option<DownloadRun> {
+        if self.running {
+            return None;
+        }
+        let resuming = matches!(self.status.phase, Phase::Paused | Phase::Failed);
+        let root = if resuming {
+            self.root.clone().unwrap_or(root)
+        } else {
+            root
+        };
+        self.generation = self.generation.wrapping_add(1);
+        self.request = Arc::new(AtomicU8::new(RUN));
+        self.root = Some(root.clone());
+        self.running = true;
+        self.status.phase = Phase::Downloading;
+        if !resuming {
+            self.status.downloaded = 0;
+        }
+        self.status.error = None;
+        Some(DownloadRun {
+            generation: self.generation,
+            request: Arc::clone(&self.request),
+            root,
         })
-    })
+    }
+
+    fn publish_progress(&mut self, generation: u64, downloaded: u64, total: u64) {
+        if self.running
+            && self.generation == generation
+            && matches!(self.status.phase, Phase::Downloading | Phase::Pausing)
+        {
+            // A resumed worker verifies earlier files before reaching its
+            // partial, so its real progress starts at zero again. Keep the
+            // displayed high-water mark across pause/resume; only a new task,
+            // acknowledged cancellation, or uninstall resets the display.
+            // The downloader still hashes and resumes at the actual disk size.
+            self.status.downloaded = self.status.downloaded.max(downloaded).min(total);
+            self.status.total = total;
+        }
+    }
+
+    fn request_pause(&mut self) {
+        if self.running && self.status.phase == Phase::Downloading {
+            self.request.store(PAUSE, Ordering::Release);
+            self.status.phase = Phase::Pausing;
+        }
+    }
+
+    /// An active download owns its cleanup. An acknowledged pause/error needs
+    /// a new cleanup worker, but retains the same exclusive writer gate.
+    fn request_cancel(&mut self) -> Option<DownloadRun> {
+        if self.running {
+            if matches!(self.status.phase, Phase::Downloading | Phase::Pausing) {
+                self.request.store(CANCEL, Ordering::Release);
+                self.status.phase = Phase::Cancelling;
+            }
+            return None;
+        }
+        if !matches!(
+            self.status.phase,
+            Phase::Paused | Phase::Failed | Phase::CancellationFailed
+        ) {
+            return None;
+        }
+        let root = self.root.clone()?;
+        self.generation = self.generation.wrapping_add(1);
+        self.request = Arc::new(AtomicU8::new(CANCEL));
+        self.running = true;
+        self.status.phase = Phase::Cancelling;
+        self.status.error = None;
+        Some(DownloadRun {
+            generation: self.generation,
+            request: Arc::clone(&self.request),
+            root,
+        })
+    }
+}
+
+fn worker_state() -> &'static Mutex<WorkerState> {
+    static STATE: OnceLock<Mutex<WorkerState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(WorkerState::new()))
 }
 
 /// This is a memory-only snapshot. No filesystem, hashing, network work, or
@@ -80,59 +194,110 @@ pub fn total_bytes() -> u64 {
 }
 
 /// Start at most one worker in this process. Closing a settings window does not
-/// own or cancel this worker. A cancelled worker acknowledges cancellation
-/// before another start is accepted, so two workers cannot write the same part.
+/// own or cancel this worker. Pausing/cancelling must acknowledge the stopped
+/// writer before another start is accepted. `start` also resumes a paused run.
 pub fn start() {
-    let (generation, cancelled) = {
+    let run = {
         let mut state = worker_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.running {
-            return;
-        }
-        state.generation = state.generation.wrapping_add(1);
-        state.cancelled = Arc::new(AtomicBool::new(false));
-        state.running = true;
-        state.status = Status {
-            phase: Phase::Downloading,
-            downloaded: 0,
-            total: TOTAL_BYTES,
-            error: None,
-        };
-        (state.generation, Arc::clone(&state.cancelled))
+        state.begin_download(crate::offline::download_dir())
     };
-    let worker_cancelled = Arc::clone(&cancelled);
+    let Some(run) = run else { return };
+    let generation = run.generation;
     let spawned = std::thread::Builder::new()
         .name("offline-model-download".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 download(
-                    &crate::offline::download_dir(),
-                    &|| worker_cancelled.load(Ordering::Acquire),
+                    &run.root,
+                    &|| run.request.load(Ordering::Acquire) != RUN,
                     &|downloaded, total| {
                         let mut state = worker_state()
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if state.running && state.generation == generation {
-                            state.status.downloaded = downloaded;
-                            state.status.total = total;
-                        }
+                        state.publish_progress(generation, downloaded, total);
                     },
                 )
             }))
             .unwrap_or_else(|_| Err(anyhow!("模型下载任务意外结束，请重试")));
-            finish_worker(generation, &worker_cancelled, result);
+            finish_worker(worker_state(), run, result, &|root| {
+                crate::offline::cancel_model_download(root)
+            });
         });
     if spawned.is_err() {
-        finish_worker(
-            generation,
-            &cancelled,
-            Err(anyhow!("无法启动模型下载，请重试")),
-        );
+        finish_spawn_failure(generation, "无法启动模型下载，请重试");
     }
 }
 
-fn finish_worker(generation: u64, cancelled: &AtomicBool, result: Result<()>) {
+fn finish_worker(
+    shared: &Mutex<WorkerState>,
+    run: DownloadRun,
+    result: Result<()>,
+    cleanup: &dyn Fn(&Path) -> Result<()>,
+) {
+    {
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.running || state.generation != run.generation {
+            return;
+        }
+        match run.request.load(Ordering::Acquire) {
+            CANCEL => {
+                // The download's file/response handles have all been dropped.
+                // Keep running=true until cleanup has also acknowledged, so a
+                // rapid cancel/start cannot race a delete against a new writer.
+                state.status.phase = Phase::Cancelling;
+            }
+            PAUSE => {
+                state.running = false;
+                state.status.phase = Phase::Paused;
+                state.status.error = None;
+                return;
+            }
+            _ => {
+                state.running = false;
+                match result {
+                    Ok(()) => {
+                        state.status.phase = Phase::Ready;
+                        state.status.downloaded = state.status.total;
+                        state.status.error = None;
+                    }
+                    Err(error) => {
+                        state.status.phase = Phase::Failed;
+                        state.status.error = Some(error.to_string());
+                    }
+                }
+                return;
+            }
+        }
+    }
+    // Cleanup, engine locks, and model destruction always happen off the UI
+    // thread and outside the status mutex. Cancellation wins a simultaneous
+    // successful download, including completed files from the first direction.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cleanup(&run.root)))
+        .unwrap_or_else(|_| Err(anyhow!("取消模型下载时清理失败，请重试取消")));
+    let mut state = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !state.running || state.generation != run.generation {
+        return;
+    }
+    state.running = false;
+    state.status.phase = if result.is_ok() {
+        Phase::Cancelled
+    } else {
+        Phase::CancellationFailed
+    };
+    if result.is_ok() {
+        state.status.downloaded = 0;
+    }
+    state.status.error = result.err().map(|error| error.to_string());
+    REMOVING.store(false, Ordering::Release);
+}
+
+fn finish_spawn_failure(generation: u64, message: &str) {
     let mut state = worker_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -140,36 +305,178 @@ fn finish_worker(generation: u64, cancelled: &AtomicBool, result: Result<()>) {
         return;
     }
     state.running = false;
-    // Cancellation wins a simultaneous finish. A later start gets its own
-    // token, and an earlier completion cannot overwrite that newer run.
-    if cancelled.load(Ordering::Acquire)
-        || result.as_ref().is_err_and(|error| error.is::<Cancelled>())
-    {
-        state.status.phase = Phase::Cancelled;
-        state.status.error = None;
+    state.status.phase = if state.status.phase == Phase::Cancelling {
+        Phase::CancellationFailed
     } else {
-        match result {
-            Ok(()) => {
-                state.status.phase = Phase::Ready;
-                state.status.downloaded = state.status.total;
-                state.status.error = None;
-            }
-            Err(error) => {
-                state.status.phase = Phase::Failed;
-                state.status.error = Some(error.to_string());
-            }
+        Phase::Failed
+    };
+    state.status.error = Some(message.into());
+    REMOVING.store(false, Ordering::Release);
+}
+
+/// Pause preserves verified files and the partial for an HTTP Range resume.
+/// Pausing can take the bounded connect/read timeout; only Paused has stopped
+/// writing. Closing the settings window does not call this function.
+pub fn pause() {
+    worker_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .request_pause();
+}
+
+/// Cancel stops the writer and removes this download's catalog files. Pausing
+/// may be upgraded to cancellation; repeated clicks are harmless. A paused or
+/// failed run spawns only a cleanup worker and never reconnects to the network.
+pub fn cancel() {
+    let run = {
+        let mut state = worker_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = state.request_cancel();
+        if state.status.phase == Phase::Cancelling {
+            REMOVING.store(true, Ordering::Release);
         }
+        run
+    };
+    let Some(run) = run else { return };
+    let generation = run.generation;
+    let spawned = std::thread::Builder::new()
+        .name("offline-model-cancel".into())
+        .spawn(move || {
+            finish_worker(worker_state(), run, Err(Cancelled.into()), &|root| {
+                crate::offline::cancel_model_download(root)
+            });
+        });
+    if spawned.is_err() {
+        finish_spawn_failure(generation, "无法启动模型下载清理，请重试取消");
     }
 }
 
-/// Acknowledgement can take up to the bounded connect/read timeout while a
-/// network operation is pending. Keep the run active until it has stopped.
-pub fn cancel() {
-    let state = worker_state()
+/// Removal shares the download worker gate, and stops inference before waiting
+/// for the engine lock. No filesystem work or model destruction runs on the UI.
+pub fn uninstall() {
+    let generation = {
+        let mut state = worker_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.running {
+            return;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        state.running = true;
+        state.status.phase = Phase::Removing;
+        state.status.error = None;
+        REMOVING.store(true, Ordering::Release);
+        state.generation
+    };
+    let spawned = std::thread::Builder::new()
+        .name("offline-model-uninstall".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(crate::offline::uninstall_models)
+                .unwrap_or_else(|_| Err(anyhow!("模型卸载任务意外结束，请重试")));
+            finish_uninstall(generation, result);
+        });
+    if spawned.is_err() {
+        finish_uninstall(generation, Err(anyhow!("无法启动模型卸载，请重试")));
+    }
+}
+
+fn finish_uninstall(generation: u64, result: Result<()>) {
+    let mut state = worker_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if state.running {
-        state.cancelled.store(true, Ordering::Release);
+    if !state.running || state.generation != generation {
+        return;
+    }
+    REMOVING.store(false, Ordering::Release);
+    state.running = false;
+    state.status = Status {
+        phase: if result.is_ok() {
+            Phase::Idle
+        } else {
+            Phase::RemovalFailed
+        },
+        downloaded: 0,
+        total: TOTAL_BYTES,
+        error: result.err().map(|error| error.to_string()),
+    };
+}
+
+/// Remove only the two catalogued models and their download/legacy resources.
+/// Other files in a custom model directory are retained; directory links are
+/// rejected so an uninstall cannot traverse a junction into another location.
+pub(crate) fn remove_at(root: &Path) -> Result<()> {
+    remove_catalog(root, catalog())
+}
+
+fn remove_catalog(root: &Path, models: &[ModelSpec]) -> Result<()> {
+    remove_catalog_files(root, models, true)
+}
+
+/// Cancellation touches only resources owned by the current catalog in the
+/// download directory. Packaged models and unrelated/legacy resources stay put.
+pub(crate) fn remove_download_at(root: &Path) -> Result<()> {
+    remove_catalog_files(root, catalog(), false)
+}
+
+fn remove_catalog_files(root: &Path, models: &[ModelSpec], include_legacy: bool) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let ordinary_directory = |path: &Path| -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir() && metadata.file_attributes() & 0x400 == 0,
+                    "模型目录不是普通文件夹，无法卸载，请检查目录设置"
+                );
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => bail!("无法读取模型目录，请检查权限后重试卸载"),
+        }
+    };
+    if !ordinary_directory(root)? {
+        return Ok(());
+    }
+    // Validate both directions before deleting files from either one.
+    for model in models {
+        ordinary_directory(&root.join(model.pair))?;
+    }
+    for model in models {
+        let directory = root.join(model.pair);
+        let names = model
+            .manifest
+            .files
+            .iter()
+            .map(|file| file.file.as_str())
+            .chain(["manifest.json"])
+            .chain(include_legacy.then_some("tokenizer.json"));
+        for name in names {
+            let file = directory.join(name);
+            for path in [file.clone(), part_path(&file)] {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => bail!("无法删除模型文件，请检查文件占用和目录权限后重试卸载"),
+                }
+            }
+        }
+        remove_empty_directory(&directory)?;
+    }
+    remove_empty_directory(root)
+}
+
+fn remove_empty_directory(path: &Path) -> Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(_) => bail!("无法清理模型空目录，请检查权限后重试卸载"),
     }
 }
 
@@ -868,6 +1175,299 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pause_acknowledges_the_writer_before_allowing_a_resume() {
+        let directory = TestDirectory::new();
+        let shared = Mutex::new(WorkerState::new());
+        let run = shared
+            .lock()
+            .unwrap()
+            .begin_download(directory.0.clone())
+            .unwrap();
+        let previous_request = Arc::clone(&run.request);
+        {
+            let mut state = shared.lock().unwrap();
+            state.status.downloaded = 123;
+            state.request_pause();
+            state.request_pause();
+            assert_eq!(state.status.phase, Phase::Pausing);
+            assert_eq!(run.request.load(Ordering::Acquire), PAUSE);
+            assert!(state.begin_download(directory.0.clone()).is_none());
+        }
+        finish_worker(&shared, run, Err(Cancelled.into()), &|_| {
+            panic!("pause must preserve all files")
+        });
+        let resumed = {
+            let mut state = shared.lock().unwrap();
+            assert_eq!(state.status.phase, Phase::Paused);
+            assert!(!state.running);
+            assert_eq!(state.status.downloaded, 123);
+            // Resuming retains the paused run's path even if configuration
+            // changes before the next click, and gets an independent token.
+            state
+                .begin_download(directory.0.join("another-root"))
+                .unwrap()
+        };
+        assert_eq!(resumed.root, directory.0);
+        assert_eq!(resumed.request.load(Ordering::Acquire), RUN);
+        assert_eq!(previous_request.load(Ordering::Acquire), PAUSE);
+        finish_worker(&shared, resumed, Ok(()), &|_| panic!("unexpected cleanup"));
+        assert_eq!(shared.lock().unwrap().status.phase, Phase::Ready);
+    }
+
+    #[test]
+    fn cancel_upgrades_pause_and_cleans_both_directions_outside_the_status_lock() {
+        let directory = TestDirectory::new();
+        let models = [
+            model("en-zh", &[("weights.onnx", b"en")]),
+            model("zh-en", &[("weights.onnx", b"zh")]),
+        ];
+        for pair in ["en-zh", "zh-en", "other-model"] {
+            fs::create_dir_all(directory.0.join(pair)).unwrap();
+        }
+        for name in [
+            "en-zh/weights.onnx",
+            "en-zh/manifest.json",
+            "zh-en/weights.onnx.partial",
+            "zh-en/manifest.json.partial",
+            "settings.json",
+            "en-zh/notes.txt",
+            "en-zh/tokenizer.json",
+            "other-model/weights.onnx",
+        ] {
+            fs::write(directory.0.join(name), b"fixture").unwrap();
+        }
+        let shared = Mutex::new(WorkerState::new());
+        let run = {
+            let mut state = shared.lock().unwrap();
+            let run = state.begin_download(directory.0.clone()).unwrap();
+            state.publish_progress(run.generation, 123, TOTAL_BYTES);
+            state.request_pause();
+            assert!(state.request_cancel().is_none());
+            assert_eq!(state.status.phase, Phase::Cancelling);
+            assert_eq!(run.request.load(Ordering::Acquire), CANCEL);
+            state.request_pause();
+            assert_eq!(run.request.load(Ordering::Acquire), CANCEL);
+            run
+        };
+        let cancelled_generation = run.generation;
+        // Cancellation also wins if the last network operation just succeeded.
+        finish_worker(&shared, run, Ok(()), &|root| {
+            {
+                let mut state = shared.try_lock().expect("cleanup held the UI status lock");
+                assert!(state.running);
+                assert!(state.begin_download(directory.0.clone()).is_none());
+                assert!(state.request_cancel().is_none());
+            }
+            remove_catalog_files(root, &models, false)
+        });
+        for name in [
+            "en-zh/weights.onnx",
+            "en-zh/manifest.json",
+            "zh-en/weights.onnx.partial",
+            "zh-en/manifest.json.partial",
+        ] {
+            assert!(!directory.0.join(name).exists(), "{name}");
+        }
+        for name in [
+            "settings.json",
+            "en-zh/notes.txt",
+            "en-zh/tokenizer.json",
+            "other-model/weights.onnx",
+        ] {
+            assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"fixture");
+        }
+        let mut state = shared.lock().unwrap();
+        assert_eq!(state.status.phase, Phase::Cancelled);
+        assert_eq!(state.status.downloaded, 0);
+        assert!(state.status.error.is_none());
+        state.publish_progress(cancelled_generation, TOTAL_BYTES, TOTAL_BYTES);
+        assert_eq!(state.status.downloaded, 0);
+        assert_eq!(
+            state
+                .begin_download(directory.0.clone())
+                .unwrap()
+                .request
+                .load(Ordering::Acquire),
+            RUN
+        );
+        state.publish_progress(cancelled_generation, TOTAL_BYTES, TOTAL_BYTES);
+        assert_eq!(
+            state.status.downloaded, 0,
+            "new task retained cancelled progress"
+        );
+    }
+
+    #[test]
+    fn acknowledged_pause_can_be_cancelled_without_starting_another_download() {
+        let directory = TestDirectory::new();
+        let shared = Mutex::new(WorkerState::new());
+        let run = {
+            let mut state = shared.lock().unwrap();
+            let run = state.begin_download(directory.0.clone()).unwrap();
+            state.request_pause();
+            run
+        };
+        let old_generation = run.generation;
+        let old_request = Arc::clone(&run.request);
+        finish_worker(&shared, run, Err(Cancelled.into()), &|_| {
+            panic!("pause started cleanup")
+        });
+        let cleanup = shared.lock().unwrap().request_cancel().unwrap();
+        assert_ne!(cleanup.generation, old_generation);
+        assert_eq!(cleanup.request.load(Ordering::Acquire), CANCEL);
+        // A stale completion cannot acknowledge a new cleanup or overwrite it.
+        finish_worker(
+            &shared,
+            DownloadRun {
+                generation: old_generation,
+                request: old_request,
+                root: directory.0.clone(),
+            },
+            Ok(()),
+            &|_| panic!("stale worker started cleanup"),
+        );
+        assert_eq!(shared.lock().unwrap().status.phase, Phase::Cancelling);
+        finish_worker(&shared, cleanup, Err(Cancelled.into()), &|root| {
+            assert_eq!(root, directory.0);
+            Ok(())
+        });
+        assert_eq!(shared.lock().unwrap().status.phase, Phase::Cancelled);
+    }
+
+    #[test]
+    fn cancellation_failure_is_visible_and_cleanup_can_be_retried_after_unlocking() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = TestDirectory::new();
+        let models = [model("en-zh", &[("weights.onnx", b"en")])];
+        let file = directory.0.join("en-zh/weights.onnx");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"en").unwrap();
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        let shared = Mutex::new(WorkerState::new());
+        let run = {
+            let mut state = shared.lock().unwrap();
+            let run = state.begin_download(directory.0.clone()).unwrap();
+            state.request_cancel();
+            run
+        };
+        finish_worker(&shared, run, Err(Cancelled.into()), &|root| {
+            remove_catalog_files(root, &models, false)
+        });
+        {
+            let state = shared.lock().unwrap();
+            assert_eq!(state.status.phase, Phase::CancellationFailed);
+            assert!(!state.running);
+            assert!(state.status.error.as_ref().unwrap().contains("文件占用"));
+        }
+        drop(locked);
+        let cleanup = shared.lock().unwrap().request_cancel().unwrap();
+        finish_worker(&shared, cleanup, Err(Cancelled.into()), &|root| {
+            remove_catalog_files(root, &models, false)
+        });
+        assert!(!file.exists());
+        assert_eq!(shared.lock().unwrap().status.phase, Phase::Cancelled);
+    }
+
+    #[test]
+    fn uninstall_removes_both_directions_parts_and_legacy_tokenizers() {
+        let directory = TestDirectory::new();
+        let models = [
+            model("en-zh", &[("weights.onnx", b"en")]),
+            model("zh-en", &[("weights.onnx", b"zh")]),
+        ];
+        for model in &models {
+            let pair = directory.0.join(model.pair);
+            fs::create_dir_all(&pair).unwrap();
+            for name in [
+                "weights.onnx",
+                "weights.onnx.partial",
+                "manifest.json",
+                "manifest.json.partial",
+                "tokenizer.json",
+                "tokenizer.json.partial",
+            ] {
+                fs::write(pair.join(name), b"fixture").unwrap();
+            }
+        }
+        remove_catalog(&directory.0, &models).unwrap();
+        assert!(!directory.0.exists());
+        // A retry or a second configured directory pointing at the same path
+        // must also succeed when the files have already been removed.
+        remove_catalog(&directory.0, &models).unwrap();
+    }
+
+    #[test]
+    fn uninstall_preserves_unrelated_files_and_other_models() {
+        let directory = TestDirectory::new();
+        let models = [model("en-zh", &[("weights.onnx", b"en")])];
+        fs::create_dir_all(directory.0.join("en-zh")).unwrap();
+        fs::create_dir_all(directory.0.join("other-model")).unwrap();
+        fs::write(directory.0.join("en-zh/weights.onnx"), b"en").unwrap();
+        for name in [
+            "settings.json",
+            "en-zh/notes.txt",
+            "other-model/weights.onnx",
+        ] {
+            fs::write(directory.0.join(name), b"keep").unwrap();
+        }
+        remove_catalog(&directory.0, &models).unwrap();
+        assert!(!directory.0.join("en-zh/weights.onnx").exists());
+        for name in [
+            "settings.json",
+            "en-zh/notes.txt",
+            "other-model/weights.onnx",
+        ] {
+            assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"keep");
+        }
+    }
+
+    #[test]
+    fn uninstall_reports_a_locked_file_and_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = TestDirectory::new();
+        let models = [model("en-zh", &[("weights.onnx", b"en")])];
+        let file = directory.0.join("en-zh/weights.onnx");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"en").unwrap();
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        assert!(
+            remove_catalog(&directory.0, &models)
+                .unwrap_err()
+                .to_string()
+                .contains("文件占用")
+        );
+        drop(locked);
+        assert_eq!(fs::read(&file).unwrap(), b"en");
+        remove_catalog(&directory.0, &models).unwrap();
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn uninstall_validates_all_model_directories_before_deleting() {
+        let directory = TestDirectory::new();
+        let models = [
+            model("en-zh", &[("weights.onnx", b"en")]),
+            model("zh-en", &[("weights.onnx", b"zh")]),
+        ];
+        fs::create_dir_all(directory.0.join("en-zh")).unwrap();
+        fs::write(directory.0.join("en-zh/weights.onnx"), b"en").unwrap();
+        fs::write(directory.0.join("zh-en"), b"not a directory").unwrap();
+        assert!(remove_catalog(&directory.0, &models).is_err());
+        assert_eq!(
+            fs::read(directory.0.join("en-zh/weights.onnx")).unwrap(),
+            b"en"
+        );
+    }
+
     fn fixture_download(
         directory: &Path,
         models: &[ModelSpec],
@@ -1025,39 +1625,113 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_preserves_a_part_and_retry_resumes_before_publishing() {
+    fn paused_transfer_preserves_a_part_and_retry_resumes_before_publishing() {
         let directory = TestDirectory::new();
+        let config = b"verified configuration";
         let contents = body(BUFFER_BYTES * 4);
-        let models = [model("en-zh", &[("config.json", &contents)])];
-        let server = FixtureServer::new(vec![Reply::Full(contents.clone())]);
-        let cancelled = AtomicBool::new(false);
+        let models = [model(
+            "en-zh",
+            &[("config.json", config), ("weights.onnx", &contents)],
+        )];
+        let total = config.len() as u64 + contents.len() as u64;
+        let server = FixtureServer::new(vec![
+            Reply::Full(config.to_vec()),
+            Reply::Full(contents.clone()),
+        ]);
+        let shared = Mutex::new(WorkerState::new());
+        let run = shared
+            .lock()
+            .unwrap()
+            .begin_download(directory.0.clone())
+            .unwrap();
+        let initial_generation = run.generation;
+        let displayed = RefCell::new(Vec::new());
         let error = fixture_download(
             &directory.0,
             &models,
             &server,
-            &|| cancelled.load(Ordering::Acquire),
-            &|done, _| {
-                if done >= BUFFER_BYTES as u64 {
-                    cancelled.store(true, Ordering::Release);
+            &|| run.request.load(Ordering::Acquire) != RUN,
+            &|done, total| {
+                let mut state = shared.lock().unwrap();
+                state.publish_progress(run.generation, done, total);
+                displayed.borrow_mut().push(state.status.downloaded);
+                if done >= config.len() as u64 + BUFFER_BYTES as u64 {
+                    state.request_pause();
                 }
             },
         )
         .unwrap_err();
         assert!(error.is::<Cancelled>());
-        let destination = directory.0.join("en-zh/config.json");
+        let destination = directory.0.join("en-zh/weights.onnx");
         let partial = part_path(&destination);
         let offset = fs::metadata(&partial).unwrap().len();
         assert!(offset >= BUFFER_BYTES as u64 && offset < contents.len() as u64);
+        assert_eq!(fs::read(&partial).unwrap(), contents[..offset as usize]);
+        assert_eq!(
+            fs::read(directory.0.join("en-zh/config.json")).unwrap(),
+            config
+        );
         assert!(!destination.exists());
         assert!(!directory.0.join("en-zh/manifest.json").exists());
         assert!(!ready_at_catalog(&directory.0, &models));
+        finish_worker(&shared, run, Err(error), &|_| panic!("pause ran cleanup"));
+        let paused = shared.lock().unwrap().status.clone();
+        assert_eq!(paused.phase, Phase::Paused);
+        assert_eq!(paused.downloaded, config.len() as u64 + offset);
+
+        let resumed = {
+            let mut state = shared.lock().unwrap();
+            let resumed = state.begin_download(directory.0.clone()).unwrap();
+            assert_eq!(state.status.downloaded, paused.downloaded);
+            // A late callback from the stopped worker cannot jump the display
+            // forward either: publication belongs to the new generation.
+            state.publish_progress(initial_generation, total, total);
+            assert_eq!(state.status.downloaded, paused.downloaded);
+            resumed
+        };
 
         let retry = FixtureServer::new(vec![Reply::Resume(contents.clone())]);
-        fixture_download(&directory.0, &models, &retry, &|| false, &|_, _| {}).unwrap();
+        let raw_retry = RefCell::new(Vec::new());
+        fixture_download(
+            &directory.0,
+            &models,
+            &retry,
+            &|| resumed.request.load(Ordering::Acquire) != RUN,
+            &|done, total| {
+                raw_retry.borrow_mut().push(done);
+                let mut state = shared.lock().unwrap();
+                state.publish_progress(resumed.generation, done, total);
+                displayed.borrow_mut().push(state.status.downloaded);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            raw_retry.borrow()[0],
+            0,
+            "resume must still revalidate files"
+        );
+        assert!(
+            raw_retry
+                .borrow()
+                .iter()
+                .any(|done| *done == config.len() as u64),
+            "resume did not verify the completed first file"
+        );
+        assert!(
+            displayed.borrow().windows(2).all(|pair| pair[0] <= pair[1]),
+            "displayed progress went backwards across pause/resume: {:?}",
+            displayed.borrow()
+        );
+        assert_eq!(retry.requests().len(), 1, "valid config should be reused");
         assert_eq!(retry.requests()[0].range, Some(format!("bytes={offset}-")));
         assert_eq!(fs::read(destination).unwrap(), contents);
         assert!(ready_at_catalog(&directory.0, &models));
         assert!(!partial.exists());
+        finish_worker(&shared, resumed, Ok(()), &|_| panic!("resume ran cleanup"));
+        let state = shared.lock().unwrap();
+        assert_eq!(state.status.phase, Phase::Ready);
+        assert_eq!(state.status.downloaded, total);
+        assert_eq!(state.status.total, total);
     }
 
     #[test]

@@ -3,6 +3,10 @@ use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
     rc::Rc,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 type Hwnd = *mut c_void;
@@ -90,6 +94,9 @@ const TRAY_MESSAGE: u32 = 0x8000 + 42;
 const SHOW_MESSAGE: u32 = 0x8000 + 43;
 const REFRESH_MESSAGE: u32 = 0x8000 + 44;
 const VERIFY_ACTIVATION_MESSAGE: u32 = 0x8000 + 45;
+const TASKBAR_PROGRESS_MESSAGE: u32 = 0x8000 + 46;
+const TASKBAR_PROGRESS_TIMER: usize = 0x5450_5247;
+const TASKBAR_PROGRESS_INTERVAL_MS: u32 = 200;
 const ACTIVATION_TIMER: usize = 0x5441_4354;
 const ACTIVATION_DELAY_MS: u32 = 30;
 const ACTIVATION_RETRY_WINDOW: Duration = Duration::from_millis(250);
@@ -108,6 +115,57 @@ const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
 const APP_NAME: &str = "WinTranslater";
 const SETTINGS_TITLE: &str = "WinTranslater 设置";
 const APP_ICON_ID: usize = 1;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskbarProgress {
+    None,
+    Indeterminate,
+    Normal { completed: u64, total: u64 },
+    Paused { completed: u64, total: u64 },
+}
+impl TaskbarProgress {
+    fn from_bytes(completed: u64, total: u64) -> Self {
+        if total == 0 {
+            Self::Indeterminate
+        } else {
+            Self::Normal {
+                completed: completed.min(total),
+                total,
+            }
+        }
+    }
+    fn state(self) -> u32 {
+        match self {
+            Self::None => 0,          // TBPF_NOPROGRESS
+            Self::Indeterminate => 1, // TBPF_INDETERMINATE
+            Self::Normal { .. } => 2, // TBPF_NORMAL
+            Self::Paused { .. } => 4, // TBPF_PAUSED
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum TaskbarProgressSource {
+    Manual(TaskbarProgress),
+    ModelDownload,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AppliedTaskbarProgress {
+    window: Hwnd,
+    progress: TaskbarProgress,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TaskbarProgressDiagnostic {
+    window: Hwnd,
+    state: u32,
+    percent: Option<u64>,
+    state_result: i32,
+    value_result: Option<i32>,
+}
+// Worker threads only publish a request and post to the UI-owned sink. They
+// never enumerate HWNDs, initialize COM, or use an apartment-bound interface.
+static TASKBAR_PROGRESS_SOURCE: Mutex<TaskbarProgressSource> =
+    Mutex::new(TaskbarProgressSource::Manual(TaskbarProgress::None));
+static TASKBAR_PROGRESS_SINK: AtomicUsize = AtomicUsize::new(0);
+static TASKBAR_PROGRESS_POSTED: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy)]
 struct ResizeAnimation {
     window: Hwnd,
@@ -261,6 +319,18 @@ thread_local! {
     static ANCHOR: Cell<Hwnd> = const { Cell::new(std::ptr::null_mut()) };
     static SIZE: Cell<(f64, f64)> = const { Cell::new((480.0, 172.0)) };
     static TASKBAR_MESSAGE: Cell<u32> = const { Cell::new(0) };
+    static TASKBAR_BUTTON_MESSAGE: Cell<u32> = const { Cell::new(0) };
+    static TASKBAR_BUTTONS: RefCell<Vec<Hwnd>> = const { RefCell::new(Vec::new()) };
+    static TASKBAR_INTERFACE: RefCell<Option<TaskbarInterface>> = const { RefCell::new(None) };
+    static TASKBAR_INTERFACE_STALE: Cell<bool> = const { Cell::new(false) };
+    static TASKBAR_APPLIED: Cell<Option<AppliedTaskbarProgress>> = const { Cell::new(None) };
+    static TASKBAR_ACTIVE_WINDOWS: RefCell<Vec<Hwnd>> = const { RefCell::new(Vec::new()) };
+    static TASKBAR_FORCE_REFRESH: Cell<bool> = const { Cell::new(false) };
+    static TASKBAR_APPLYING: Cell<bool> = const { Cell::new(false) };
+    static TASKBAR_DIRTY: Cell<bool> = const { Cell::new(false) };
+    static TASKBAR_WAITING: Cell<bool> = const { Cell::new(false) };
+    static TASKBAR_DIAGNOSTIC: Cell<Option<TaskbarProgressDiagnostic>> = const { Cell::new(None) };
+    static TASKBAR_COM_FAILURE: Cell<Option<(&'static str, i32)>> = const { Cell::new(None) };
     static STARTUP_WARNING: RefCell<Option<String>> = const { RefCell::new(None) };
     static PENDING_ACTION: Cell<Option<Action>> = const { Cell::new(None) };
     static RESIZE_ANIMATION: Cell<Option<ResizeAnimation>> = const { Cell::new(None) };
@@ -318,6 +388,7 @@ unsafe extern "system" {
     fn GetClientRect(window: Hwnd, rect: *mut Rect) -> i32;
     fn SetWindowRgn(window: Hwnd, region: Hwnd, redraw: i32) -> i32;
     fn IsWindowVisible(window: Hwnd) -> i32;
+    fn IsWindow(window: Hwnd) -> i32;
     fn RedrawWindow(window: Hwnd, rectangle: *const Rect, region: Hwnd, flags: u32) -> i32;
     fn SetTimer(
         window: Hwnd,
@@ -494,6 +565,235 @@ fn window(name: &str) -> Option<Hwnd> {
         EnumThreadWindows(GetCurrentThreadId(), find, &mut search as *mut _ as isize);
     }
     (!search.window.is_null()).then_some(search.window)
+}
+fn request_taskbar_progress_refresh() {
+    let sink = TASKBAR_PROGRESS_SINK.load(Ordering::Acquire) as Hwnd;
+    if !sink.is_null()
+        && !TASKBAR_PROGRESS_POSTED.swap(true, Ordering::AcqRel)
+        && unsafe { PostMessageW(sink, TASKBAR_PROGRESS_MESSAGE, 0, 0) } == 0
+    {
+        TASKBAR_PROGRESS_POSTED.store(false, Ordering::Release);
+    }
+}
+fn publish_taskbar_progress(source: TaskbarProgressSource) {
+    *TASKBAR_PROGRESS_SOURCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = source;
+    request_taskbar_progress_refresh();
+}
+/// May be called from any thread. A zero total displays indeterminate progress;
+/// all HWND and ITaskbarList3 work is dispatched to the native UI thread.
+pub fn set_taskbar_progress(completed: u64, total: u64) {
+    publish_taskbar_progress(TaskbarProgressSource::Manual(TaskbarProgress::from_bytes(
+        completed, total,
+    )));
+}
+/// Stop automatic download tracking and remove progress from the last target.
+pub fn clear_taskbar_progress() {
+    publish_taskbar_progress(TaskbarProgressSource::Manual(TaskbarProgress::None));
+}
+/// Call after starting a model download or opening its settings. The native
+/// timer follows the memory-only worker snapshot even after settings closes,
+/// preserves paused progress, and clears it when downloading is cancelled,
+/// removed, completed, or fails.
+pub fn sync_model_download_taskbar_progress() {
+    publish_taskbar_progress(TaskbarProgressSource::ModelDownload);
+}
+fn requested_taskbar_progress() -> TaskbarProgress {
+    let source = *TASKBAR_PROGRESS_SOURCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match source {
+        TaskbarProgressSource::Manual(progress) => progress,
+        TaskbarProgressSource::ModelDownload => {
+            let status = crate::model_download::status();
+            match status.phase {
+                crate::model_download::Phase::Downloading => {
+                    TaskbarProgress::from_bytes(status.downloaded, status.total)
+                }
+                crate::model_download::Phase::Pausing | crate::model_download::Phase::Paused => {
+                    TaskbarProgress::Paused {
+                        completed: status.downloaded.min(status.total),
+                        total: status.total.max(1),
+                    }
+                }
+                _ => TaskbarProgress::None,
+            }
+        }
+    }
+}
+fn taskbar_progress_window() -> Hwnd {
+    // A hidden popup has no taskbar button. Settings remains the download's
+    // visible owner when that popup is dismissed; minimized windows count too.
+    for name in [SETTINGS_TITLE, APP_NAME] {
+        if let Some(window) = window(name)
+            && unsafe { IsWindowVisible(window) } != 0
+            && TASKBAR_BUTTONS.with(|buttons| buttons.borrow().contains(&window))
+        {
+            return window;
+        }
+    }
+    std::ptr::null_mut()
+}
+fn taskbar_progress_diagnostic(
+    window: Hwnd,
+    progress: TaskbarProgress,
+    state_result: i32,
+    value_result: Option<i32>,
+) {
+    let (completed, total, percent) = match progress {
+        TaskbarProgress::Normal { completed, total }
+        | TaskbarProgress::Paused { completed, total } => (
+            Some(completed),
+            Some(total),
+            Some((u128::from(completed) * 100 / u128::from(total)) as u64),
+        ),
+        _ => (None, None, None),
+    };
+    let diagnostic = TaskbarProgressDiagnostic {
+        window,
+        state: progress.state(),
+        percent,
+        state_result,
+        value_result,
+    };
+    if TASKBAR_DIAGNOSTIC.with(|last| last.replace(Some(diagnostic))) == Some(diagnostic) {
+        return;
+    }
+    crate::storage::diagnostic(serde_json::json!({
+        "event": "taskbar_progress_applied",
+        "thread": unsafe { GetCurrentThreadId() },
+        "window": format!("{:p}", window),
+        "title": title(window),
+        "visible": unsafe { IsWindowVisible(window) } != 0,
+        "state": match progress {
+            TaskbarProgress::None => "none",
+            TaskbarProgress::Indeterminate => "indeterminate",
+            TaskbarProgress::Normal { .. } => "normal",
+            TaskbarProgress::Paused { .. } => "paused",
+        },
+        "completed": completed,
+        "total": total,
+        "percent": percent,
+        "state_hresult": format!("0x{:08X}", state_result as u32),
+        "value_hresult": value_result.map(|result| format!("0x{:08X}", result as u32)),
+    }));
+}
+fn apply_taskbar_progress(progress: TaskbarProgress, force: bool) -> bool {
+    let target = if progress == TaskbarProgress::None {
+        std::ptr::null_mut()
+    } else {
+        taskbar_progress_window()
+    };
+    let waiting = progress != TaskbarProgress::None && target.is_null();
+    if TASKBAR_WAITING.with(|value| value.replace(waiting)) != waiting && waiting {
+        crate::storage::diagnostic(serde_json::json!({
+            "event": "taskbar_progress_waiting_for_visible_button",
+            "thread": unsafe { GetCurrentThreadId() },
+        }));
+    }
+    let desired = AppliedTaskbarProgress {
+        window: target,
+        progress,
+    };
+    let previous = TASKBAR_APPLIED.with(Cell::get);
+    if !force && previous == Some(desired) {
+        return false;
+    }
+    let clear_windows = TASKBAR_ACTIVE_WINDOWS.with(|windows| {
+        let mut windows = windows.borrow_mut();
+        windows.retain(|window| unsafe { IsWindow(*window) } != 0);
+        windows
+            .iter()
+            .copied()
+            .filter(|window| *window != target)
+            .collect::<Vec<_>>()
+    });
+    if target.is_null() && clear_windows.is_empty() {
+        TASKBAR_APPLIED.with(|value| value.set(Some(desired)));
+        return false;
+    }
+    // Release RefCell borrows before COM calls, which can pump native messages.
+    let mut interface = TASKBAR_INTERFACE.with(|value| value.borrow_mut().take());
+    if TASKBAR_INTERFACE_STALE.with(|value| value.replace(false)) {
+        interface = None;
+    }
+    if interface.is_none() {
+        interface = TaskbarInterface::new();
+    }
+    let Some(interface) = interface else {
+        TASKBAR_APPLIED.with(|value| value.set(None));
+        return true;
+    };
+    let table = unsafe { interface.object.table::<TaskbarList3Table>() };
+    let mut succeeded = true;
+    for window in clear_windows {
+        let result = unsafe { (table.set_progress_state)(interface.object.0, window, 0) };
+        taskbar_progress_diagnostic(window, TaskbarProgress::None, result, None);
+        succeeded &= result >= 0;
+        if result >= 0 {
+            TASKBAR_ACTIVE_WINDOWS.with(|windows| {
+                windows.borrow_mut().retain(|active| *active != window);
+            });
+        }
+    }
+    if !target.is_null() {
+        // Remember every touched button, including partial COM failures, so a
+        // later cancel/retarget can still clear all progress we may have set.
+        TASKBAR_ACTIVE_WINDOWS.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            if !windows.contains(&target) {
+                windows.push(target);
+            }
+        });
+        let value_result = if let TaskbarProgress::Normal { completed, total }
+        | TaskbarProgress::Paused { completed, total } = progress
+        {
+            Some(unsafe {
+                (table.set_progress_value)(interface.object.0, target, completed, total)
+            })
+        } else {
+            None
+        };
+        // Apply the final state after updating the value so pause/resume keeps
+        // the desired color even when the button has just been recreated.
+        let state_result =
+            unsafe { (table.set_progress_state)(interface.object.0, target, progress.state()) };
+        taskbar_progress_diagnostic(target, progress, state_result, value_result);
+        succeeded &= state_result >= 0 && value_result.is_none_or(|result| result >= 0);
+    }
+    if succeeded {
+        TASKBAR_APPLIED.with(|value| value.set(Some(desired)));
+        TASKBAR_INTERFACE.with(|value| *value.borrow_mut() = Some(interface));
+    } else {
+        TASKBAR_APPLIED.with(|value| value.set(None));
+    }
+    !succeeded
+}
+fn update_taskbar_progress(sink: Hwnd) {
+    if TASKBAR_APPLYING.with(|value| value.replace(true)) {
+        TASKBAR_DIRTY.with(|value| value.set(true));
+        return;
+    }
+    let progress = requested_taskbar_progress();
+    let force = TASKBAR_FORCE_REFRESH.with(|value| value.replace(false));
+    let retry = apply_taskbar_progress(progress, force);
+    unsafe {
+        if progress != TaskbarProgress::None || retry {
+            SetTimer(
+                sink,
+                TASKBAR_PROGRESS_TIMER,
+                TASKBAR_PROGRESS_INTERVAL_MS,
+                None,
+            );
+        } else {
+            KillTimer(sink, TASKBAR_PROGRESS_TIMER);
+        }
+    }
+    TASKBAR_APPLYING.with(|value| value.set(false));
+    if TASKBAR_DIRTY.with(|value| value.replace(false)) {
+        request_taskbar_progress_refresh();
+    }
 }
 fn mouse_monitor() -> Hwnd {
     let mut point = Point { x: 0, y: 0 };
@@ -1103,9 +1403,43 @@ fn attach_popup(window: Hwnd) {
         });
     }
 }
+fn observe_taskbar_button_created(window: Hwnd, message: u32) {
+    let taskbar_button_message = TASKBAR_BUTTON_MESSAGE.with(Cell::get);
+    if taskbar_button_message == 0 || message != taskbar_button_message || window.is_null() {
+        return;
+    }
+    // Explorer explicitly announces when this HWND's button is ready.
+    // Calling SetProgress* before this message can silently do nothing.
+    TASKBAR_BUTTONS.with(|buttons| {
+        let mut buttons = buttons.borrow_mut();
+        if !buttons.contains(&window) {
+            buttons.push(window);
+        }
+    });
+    TASKBAR_FORCE_REFRESH.with(|value| value.set(true));
+    request_taskbar_progress_refresh();
+}
 unsafe extern "system" fn call_hook(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 {
         let event = unsafe { &*(lparam as *const Cwp) };
+        observe_taskbar_button_created(event.window, event.message);
+        if event.message == 0x0082 {
+            TASKBAR_BUTTONS.with(|buttons| {
+                buttons
+                    .borrow_mut()
+                    .retain(|window| *window != event.window);
+            });
+            TASKBAR_ACTIVE_WINDOWS.with(|windows| {
+                windows
+                    .borrow_mut()
+                    .retain(|window| *window != event.window);
+            });
+        }
+        if matches!(event.message, 0x0018 | 0x0082)
+            && unsafe { GetAncestor(event.window, 2) } == event.window
+        {
+            request_taskbar_progress_refresh();
+        }
         // Observe our settings and native popup windows too: main-window blur
         // alone misses settings -> another-app activation and internal flyouts.
         if (event.message == 0x0006 && event.wparam & 0xffff == 0)
@@ -1126,6 +1460,7 @@ unsafe extern "system" fn call_hook(code: i32, wparam: usize, lparam: isize) -> 
                         attach_popup(event.window);
                     }
                     set_window_icon(event.window);
+                    request_taskbar_progress_refresh();
                     break;
                 }
             }
@@ -1158,6 +1493,10 @@ unsafe extern "system" fn cbt_hook(code: i32, wparam: usize, lparam: isize) -> i
 unsafe extern "system" fn key_hook(code: i32, wparam: usize, lparam: isize) -> isize {
     if code >= 0 && wparam == 1 {
         let message = unsafe { &mut *(lparam as *mut Msg) };
+        // TaskbarButtonCreated can be posted. WH_CALLWNDPROC observes sent
+        // messages; consume queued notifications through WH_GETMESSAGE too,
+        // once PM_REMOVE confirms the UI thread is taking the message.
+        observe_taskbar_button_created(message.window, message.message);
         if message.message == 0x0100
             && message.wparam == 0x1b
             && !is_composing()
@@ -1197,6 +1536,15 @@ unsafe extern "system" fn sink_proc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
+    if message == TASKBAR_PROGRESS_MESSAGE {
+        TASKBAR_PROGRESS_POSTED.store(false, Ordering::Release);
+        update_taskbar_progress(window);
+        return 0;
+    }
+    if message == 0x0113 && wparam == TASKBAR_PROGRESS_TIMER {
+        update_taskbar_progress(window);
+        return 0;
+    }
     if message == 0x0312 && wparam == HOTKEY_ID as usize {
         remember_activation_source();
         crate::desktop::remember_foreground();
@@ -1206,7 +1554,11 @@ unsafe extern "system" fn sink_proc(
     if message == SHOW_MESSAGE {
         remember_activation_source();
         crate::desktop::remember_foreground();
-        emit(Action::Show);
+        emit(if wparam == 1 {
+            Action::Settings
+        } else {
+            Action::Show
+        });
         return 0;
     }
     if message == TRAY_MESSAGE {
@@ -1249,6 +1601,10 @@ unsafe extern "system" fn sink_proc(
     }
     if message != 0 && message == TASKBAR_MESSAGE.with(Cell::get) {
         tray(window, 0);
+        TASKBAR_BUTTONS.with(|buttons| buttons.borrow_mut().clear());
+        TASKBAR_INTERFACE_STALE.with(|value| value.set(true));
+        TASKBAR_FORCE_REFRESH.with(|value| value.set(true));
+        request_taskbar_progress_refresh();
         return 0;
     }
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -1260,6 +1616,18 @@ pub struct NativeSession {
 }
 impl Drop for NativeSession {
     fn drop(&mut self) {
+        TASKBAR_PROGRESS_SINK.store(0, Ordering::Release);
+        clear_taskbar_progress();
+        if !self.sink.is_null() {
+            update_taskbar_progress(self.sink);
+            unsafe { KillTimer(self.sink, TASKBAR_PROGRESS_TIMER) };
+        }
+        // Balance COM initialization on the same thread that owns the sink.
+        TASKBAR_INTERFACE.with(|value| value.borrow_mut().take());
+        TASKBAR_BUTTONS.with(|buttons| buttons.borrow_mut().clear());
+        TASKBAR_ACTIVE_WINDOWS.with(|windows| windows.borrow_mut().clear());
+        TASKBAR_APPLIED.with(|value| value.set(None));
+        TASKBAR_PROGRESS_POSTED.store(false, Ordering::Release);
         unsafe {
             if !self.sink.is_null() {
                 tray(self.sink, 2);
@@ -1305,7 +1673,12 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
                         let mut process = 0;
                         GetWindowThreadProcessId(existing, &mut process);
                         AllowSetForegroundWindow(process);
-                        PostMessageW(existing, SHOW_MESSAGE, 0, 0);
+                        PostMessageW(
+                            existing,
+                            SHOW_MESSAGE,
+                            usize::from(std::env::args().any(|argument| argument == "--settings")),
+                            0,
+                        );
                     }
                     break;
                 }
@@ -1364,6 +1737,7 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
         std::io::Error::last_os_error()
     );
     SINK.with(|value| value.set(session.sink));
+    TASKBAR_PROGRESS_SINK.store(session.sink as usize, Ordering::Release);
     if unsafe { RegisterHotKey(session.sink, HOTKEY_ID, 0x0002 | 0x4000, 0x09) } == 0 {
         STARTUP_WARNING.with(|v| {
             *v.borrow_mut() = Some(format!(
@@ -1392,6 +1766,8 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
     }
     TASKBAR_MESSAGE
         .with(|v| v.set(unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) }));
+    TASKBAR_BUTTON_MESSAGE
+        .with(|v| v.set(unsafe { RegisterWindowMessageW(wide("TaskbarButtonCreated").as_ptr()) }));
     anyhow::ensure!(
         tray(session.sink, 0),
         "无法创建通知区域图标：{}",
@@ -1404,6 +1780,9 @@ pub fn initialize(background: bool) -> Result<Option<NativeSession>> {
         for (to, from) in data.info_title.iter_mut().zip("WinTranslater：快捷键不可用".encode_utf16()) { *to = from; }
         unsafe { Shell_NotifyIconW(1, &data); }
     } });
+    if std::env::args().any(|argument| argument == "--settings") {
+        emit(Action::Settings);
+    }
     Ok(Some(session))
 }
 pub fn take_startup_warning() -> Option<String> {
@@ -1964,6 +2343,109 @@ struct UnknownTable {
     release: unsafe extern "system" fn(Hwnd) -> u32,
 }
 #[repr(C)]
+struct TaskbarList3Table {
+    unknown: UnknownTable,
+    hr_init: unsafe extern "system" fn(Hwnd) -> i32,
+    add_tab: usize,
+    delete_tab: usize,
+    activate_tab: usize,
+    set_active_alt: usize,
+    mark_fullscreen_window: usize,
+    set_progress_value: unsafe extern "system" fn(Hwnd, Hwnd, u64, u64) -> i32,
+    set_progress_state: unsafe extern "system" fn(Hwnd, Hwnd, u32) -> i32,
+}
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(reserved: Hwnd, flags: u32) -> i32;
+    fn CoUninitialize();
+    fn CoCreateInstance(
+        class: *const Guid,
+        outer: Hwnd,
+        context: u32,
+        iid: *const Guid,
+        object: *mut Hwnd,
+    ) -> i32;
+}
+struct TaskbarApartment {
+    initialized: bool,
+}
+impl Drop for TaskbarApartment {
+    fn drop(&mut self) {
+        if self.initialized {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+struct TaskbarInterface {
+    // Fields drop in declaration order: release the COM object before balancing
+    // our successful CoInitializeEx (including S_FALSE on an existing STA).
+    object: Com,
+    _apartment: TaskbarApartment,
+}
+fn taskbar_com_failure(stage: &'static str, result: i32) {
+    if TASKBAR_COM_FAILURE.with(|value| value.replace(Some((stage, result))))
+        != Some((stage, result))
+    {
+        crate::storage::diagnostic(serde_json::json!({
+            "event": "taskbar_progress_com_failed",
+            "stage": stage,
+            "hresult": format!("0x{:08X}", result as u32),
+            "thread": unsafe { GetCurrentThreadId() },
+        }));
+    }
+}
+impl TaskbarInterface {
+    fn new() -> Option<Self> {
+        const RPC_E_CHANGED_MODE: i32 = 0x80010106_u32 as i32;
+        let apartment_result = unsafe { CoInitializeEx(std::ptr::null_mut(), 2) };
+        if apartment_result < 0 && apartment_result != RPC_E_CHANGED_MODE {
+            taskbar_com_failure("CoInitializeEx", apartment_result);
+            return None;
+        }
+        let apartment = TaskbarApartment {
+            initialized: apartment_result >= 0,
+        };
+        let class = Guid {
+            first: 0x56fdf344,
+            second: 0xfd6d,
+            third: 0x11d0,
+            last: [0x95, 0x8a, 0x00, 0x60, 0x97, 0xc9, 0xa0, 0x90],
+        };
+        let iid = Guid {
+            first: 0xea1afb91,
+            second: 0x9e28,
+            third: 0x4b86,
+            last: [0x90, 0xe9, 0x9e, 0x9f, 0x8a, 0x5e, 0xef, 0xaf],
+        };
+        let mut create_result = 0;
+        let object = Com::out(|out| {
+            create_result = unsafe { CoCreateInstance(&class, std::ptr::null_mut(), 1, &iid, out) };
+            create_result
+        });
+        let Some(object) = object else {
+            taskbar_com_failure("CoCreateInstance", create_result);
+            return None;
+        };
+        let init_result = unsafe { (object.table::<TaskbarList3Table>().hr_init)(object.0) };
+        if init_result < 0 {
+            taskbar_com_failure("ITaskbarList3::HrInit", init_result);
+            return None;
+        }
+        TASKBAR_COM_FAILURE.with(|value| value.set(None));
+        crate::storage::diagnostic(serde_json::json!({
+            "event": "taskbar_progress_initialized",
+            "thread": unsafe { GetCurrentThreadId() },
+            "apartment_hresult": format!("0x{:08X}", apartment_result as u32),
+            "create_hresult": format!("0x{:08X}", create_result as u32),
+            "init_hresult": format!("0x{:08X}", init_result as u32),
+        }));
+        Some(Self {
+            object,
+            _apartment: apartment,
+        })
+    }
+}
+#[repr(C)]
 struct ThreadTable {
     unknown: UnknownTable,
     activate: usize,
@@ -2130,6 +2612,90 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
+
+    #[test]
+    fn posted_taskbar_button_notification_reaches_progress_tracking() {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn PeekMessageW(
+                message: *mut Msg,
+                window: Hwnd,
+                minimum: u32,
+                maximum: u32,
+                remove: u32,
+            ) -> i32;
+        }
+        struct NotificationTest {
+            window: Hwnd,
+            hook: Hwnd,
+            old_message: u32,
+            old_buttons: Vec<Hwnd>,
+            old_force: bool,
+        }
+        impl Drop for NotificationTest {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.hook.is_null() {
+                        UnhookWindowsHookEx(self.hook);
+                    }
+                    if !self.window.is_null() {
+                        DestroyWindow(self.window);
+                    }
+                }
+                TASKBAR_BUTTON_MESSAGE.with(|value| value.set(self.old_message));
+                TASKBAR_BUTTONS.with(|buttons| {
+                    buttons.replace(std::mem::take(&mut self.old_buttons));
+                });
+                TASKBAR_FORCE_REFRESH.with(|value| value.set(self.old_force));
+            }
+        }
+        let foreground = unsafe { GetForegroundWindow() };
+        let notification = unsafe { RegisterWindowMessageW(wide("TaskbarButtonCreated").as_ptr()) };
+        assert_ne!(notification, 0);
+        let mut test = NotificationTest {
+            window: std::ptr::null_mut(),
+            hook: std::ptr::null_mut(),
+            old_message: TASKBAR_BUTTON_MESSAGE.with(|value| value.replace(notification)),
+            old_buttons: TASKBAR_BUTTONS.with(|buttons| buttons.replace(Vec::new())),
+            old_force: TASKBAR_FORCE_REFRESH.with(|value| value.replace(false)),
+        };
+        test.window = unsafe {
+            CreateWindowExW(
+                0x80,
+                wide("STATIC").as_ptr(),
+                std::ptr::null(),
+                0x80000000,
+                0,
+                0,
+                1,
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!test.window.is_null());
+        test.hook =
+            unsafe { SetWindowsHookExW(3, key_hook, std::ptr::null_mut(), GetCurrentThreadId()) };
+        assert!(!test.hook.is_null());
+        assert_ne!(unsafe { PostMessageW(test.window, notification, 0, 0) }, 0);
+        let mut message: Msg = unsafe { std::mem::zeroed() };
+        // Merely peeking must not consume the button's readiness notification.
+        assert_ne!(
+            unsafe { PeekMessageW(&mut message, test.window, notification, notification, 0) },
+            0
+        );
+        assert!(TASKBAR_BUTTONS.with(|buttons| buttons.borrow().is_empty()));
+        assert_ne!(
+            unsafe { PeekMessageW(&mut message, test.window, notification, notification, 1) },
+            0
+        );
+        assert!(TASKBAR_BUTTONS.with(|buttons| buttons.borrow().contains(&test.window)));
+        assert!(TASKBAR_FORCE_REFRESH.with(Cell::get));
+        assert_eq!(message.message, notification);
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    }
 
     #[test]
     fn transparent_slide_track_reaches_taskbar_without_changing_card_size() {

@@ -41,9 +41,9 @@ Windows 11 x64 翻译工具，使用 Rust、原生 WinUI 3 控件与 Mica 背景
 
 ## 本地词典与离线翻译
 
-本地释义来自 [ECDICT](dictionary/SOURCES.md)，安装完成即可查询。离线翻译使用 ONNX Runtime 和 OPUS-MT 量化模型，支持简体中文与英语互译。在“设置 → 翻译服务”的“离线模型”卡中点击“下载离线模型”，从 Hugging Face 的 [Xenova/opus-mt-en-zh](https://huggingface.co/Xenova/opus-mt-en-zh) 和 [Xenova/opus-mt-zh-en](https://huggingface.co/Xenova/opus-mt-zh-en) 原仓库下载两个方向的模型，合计约 220 MiB。
+本地释义来自 [ECDICT](dictionary/SOURCES.md)，安装完成即可查询。离线翻译使用 ONNX Runtime 和 OPUS-MT 量化模型，支持简体中文与英语互译。在“设置 → 翻译服务”选择“本地离线”，在下方配置区域点击蓝色“下载模型”，从 Hugging Face 的 [Xenova/opus-mt-en-zh](https://huggingface.co/Xenova/opus-mt-en-zh) 和 [Xenova/opus-mt-zh-en](https://huggingface.co/Xenova/opus-mt-zh-en) 原仓库下载两个方向的模型，合计约 220 MiB。设置页和任务栏图标同步显示下载进度。下载期间可暂停、继续或取消；暂停保留已下载内容，继续时断点续传，取消会清理下载文件。
 
-下载的模型保存在 `%LOCALAPPDATA%\TranslationTool\models`，界面显示“中文 ⇄ 英语 · 已就绪”后即可使用。升级可复用用户目录或旧安装目录中已有的完整模型，无需重复下载。模型清单记录上游修订、文件大小和完整性信息。词典查询和已准备模型的推理不需要联网或 Python；词典释义与机器译文来自不同来源，覆盖范围和翻译准确度各有限制。
+下载的模型保存在 `%LOCALAPPDATA%\TranslationTool\models`，下载完成后即可使用。升级可复用用户目录或旧安装目录中已有的完整模型，无需重复下载。点击模型旁边的红色“卸载模型”可释放模型文件和内存占用，之后可重新下载；本地词典、API 配置与历史记录保留。模型清单记录上游修订、文件大小和完整性信息。词典查询和已准备模型的推理不需要联网或 Python；词典释义与机器译文来自不同来源，覆盖范围和翻译准确度各有限制。
 
 模型就绪后，超过 5,000 个字符的文本自动使用本地模型翻译全文，按句界、词界与模型 token 数分段并保留段落。此时手动选择在线服务只翻译前 5,000 个 Unicode 字符，界面会提示未翻译的后续内容；在线失败且启用自动离线时，本地模型翻译全文。
 
