@@ -8,7 +8,7 @@ Windows 11 x64 翻译工具，使用 Rust、原生 WinUI 3 控件与 Mica 背景
 
 ## 下载与安装
 
-在 [GitHub Releases](https://github.com/FluorescentLava/WinTranslator/releases) 下载并运行 `WinTranslater-0.1.0-Beta-windows-x64-setup.exe`。安装包包含本地 ECDICT 词典、ONNX Runtime 和应用所需的 Visual C++ DLL，无需安装 Rust 或 Python。中英双向离线模型在应用内按需下载，安装应用无需先下载模型。API 凭据在设置中填写。
+在 [GitHub Releases](https://github.com/FluorescentLava/WinTranslator/releases) 下载并运行 `WinTranslater-0.1.1-windows-x64-setup.exe`。安装包包含本地 ECDICT 词典、ONNX Runtime 和应用所需的 Visual C++ DLL，无需安装 Rust 或 Python。中英双向离线模型在应用内按需下载，安装应用无需先下载模型。API 凭据在设置中填写。
 
 默认安装到 `%LOCALAPPDATA%\Programs\WinTranslater`，无需管理员权限，提供开始菜单入口和系统卸载项。程序需要为当前用户注册的 Windows App Runtime 2.4 或更新的兼容 2.x x64 版本；缺少时，安装程序从微软下载官方安装程序并安装。已有兼容运行库时可离线安装应用。
 

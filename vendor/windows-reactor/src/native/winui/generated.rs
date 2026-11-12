@@ -1318,6 +1318,21 @@ pub fn set_property(
                 }
             })
             .map_err(native_error),
+        (Handle::TextBox(control), PropertyId::TextBoxPadding, PropertyValue::Thickness(value)) => {
+            control
+                .cast::<IControl>()
+                .map_err(native_error)?
+                .SetPadding({
+                    let [left, top, right, bottom] = value.values();
+                    bindings::Thickness {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    }
+                })
+                .map_err(native_error)
+        }
         (
             Handle::AutoSuggestBox(control),
             PropertyId::AutoSuggestBoxText,
@@ -3178,6 +3193,9 @@ pub fn clear_property(handle: &Handle, property: PropertyId) -> Result<(), Runti
             .map_err(native_error),
         (Handle::TextBox(_), PropertyId::TextBoxBorderThickness) => dependency_object
             .ClearValue(&bindings::Control::BorderThicknessProperty().map_err(native_error)?)
+            .map_err(native_error),
+        (Handle::TextBox(_), PropertyId::TextBoxPadding) => dependency_object
+            .ClearValue(&bindings::Control::PaddingProperty().map_err(native_error)?)
             .map_err(native_error),
         (Handle::AutoSuggestBox(_), PropertyId::AutoSuggestBoxText) => dependency_object
             .ClearValue(&bindings::AutoSuggestBox::TextProperty().map_err(native_error)?)

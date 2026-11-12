@@ -113,10 +113,6 @@ const RESIZE_INTERVAL_MS: u32 = 10;
 // The visible card stays 16 DIPs from the work-area edges. The transparent
 // host reserves the same gutter on all sides for the card's moving shadow.
 pub const POPUP_SHADOW_INSET: u16 = 16;
-/// The card grows with its text box in WinUI's layout pass, one line at a time,
-/// a moment before this module learns its new height. The window region keeps
-/// this much room above the card so that growth is never cut off.
-const POPUP_GROWTH_HEADROOM: f64 = 20.0;
 const POPUP_MAX_HEIGHT: f64 = 480.0;
 const CLASS_NAME: &str = "TranslationTool.Native.MessageWindow.v1";
 const APP_NAME: &str = "WinTranslater";
@@ -178,12 +174,34 @@ struct ResizeAnimation {
     window: Hwnd,
     from: PopupViewport,
     to: PopupViewport,
-    elapsed_ms: f64,
-    last_sample: Instant,
+    started: Instant,
+    initial_slope: f64,
+    sampled_progress: f64,
+    committed_progress: f64,
     monitor: Hwnd,
     dpi: u32,
     revision: u64,
     transition_key: u64,
+    bounds: Rect,
+}
+impl ResizeAnimation {
+    fn progress_at(&self, now: Instant) -> f64 {
+        (now.saturating_duration_since(self.started).as_secs_f64() * 1000.0 / RESIZE_DURATION_MS)
+            .clamp(0.0, 1.0)
+    }
+    fn committed_velocity(&self) -> f64 {
+        let (_, slope) = resize_curve(self.committed_progress, self.initial_slope);
+        (self.to.height - self.from.height) * slope / RESIZE_DURATION_MS
+    }
+}
+/// A monotone cubic with an inherited entrance velocity and a settled endpoint.
+/// Keeping the slope within [0, 3] prevents reversals or overshoot while typing.
+fn resize_curve(progress: f64, initial_slope: f64) -> (f64, f64) {
+    let t = progress.clamp(0.0, 1.0);
+    let slope = initial_slope.clamp(0.0, 3.0);
+    let value = t * t * (3.0 - 2.0 * t) + slope * t * (1.0 - t) * (1.0 - t);
+    let velocity = 6.0 * t * (1.0 - t) + slope * (3.0 * t * t - 4.0 * t + 1.0);
+    (value.clamp(0.0, 1.0), velocity.max(0.0))
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PopupViewport {
@@ -343,6 +361,7 @@ thread_local! {
     static STARTUP_WARNING: RefCell<Option<String>> = const { RefCell::new(None) };
     static PENDING_ACTION: Cell<Option<Action>> = const { Cell::new(None) };
     static RESIZE_ANIMATION: Cell<Option<ResizeAnimation>> = const { Cell::new(None) };
+    static RENDER_CLOCK: Cell<bool> = const { Cell::new(false) };
     static RESIZE_REVISION: Cell<u64> = const { Cell::new(0) };
     static FRAME_SERIAL: Cell<u64> = const { Cell::new(0) };
     static TRANSITION_KEY: Cell<u64> = const { Cell::new(0) };
@@ -395,7 +414,6 @@ unsafe extern "system" {
     fn GetDpiForWindow(window: Hwnd) -> u32;
     fn GetWindowRect(window: Hwnd, rect: *mut Rect) -> i32;
     fn GetClientRect(window: Hwnd, rect: *mut Rect) -> i32;
-    fn SetWindowRgn(window: Hwnd, region: Hwnd, redraw: i32) -> i32;
     fn IsWindowVisible(window: Hwnd) -> i32;
     fn IsWindow(window: Hwnd) -> i32;
     fn RedrawWindow(window: Hwnd, rectangle: *const Rect, region: Hwnd, flags: u32) -> i32;
@@ -479,11 +497,6 @@ unsafe extern "system" {
     fn GetMessageW(message: *mut Msg, window: Hwnd, minimum: u32, maximum: u32) -> i32;
     fn TranslateMessage(message: *const Msg) -> i32;
     fn DispatchMessageW(message: *const Msg) -> isize;
-}
-#[link(name = "gdi32")]
-unsafe extern "system" {
-    fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> Hwnd;
-    fn DeleteObject(object: Hwnd) -> i32;
 }
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -843,8 +856,7 @@ fn placement(window: Hwnd) -> (i32, i32, i32, i32) {
         };
     }
     let scale = f64::from(monitor_dpi(window, monitor)) / 96.0;
-    let (width, _) = SIZE.with(Cell::get);
-    let bounds = popup_bounds(info.work, scale, width);
+    let bounds = popup_bounds(info.work, scale, SIZE.with(Cell::get));
     (
         bounds.left,
         bounds.top,
@@ -852,16 +864,25 @@ fn placement(window: Hwnd) -> (i32, i32, i32, i32) {
         bounds.bottom - bounds.top,
     )
 }
-fn popup_bounds(work: Rect, scale: f64, width: f64) -> Rect {
+fn popup_bounds(work: Rect, scale: f64, size: (f64, f64)) -> Rect {
     let inset = (f64::from(POPUP_SHADOW_INSET) * scale).round() as i32;
-    let width = ((width * scale).round() as i32).min((work.right - work.left - 2 * inset).max(1));
-    let height = ((POPUP_MAX_HEIGHT * scale).round() as i32)
+    let width = ((size.0 * scale).round() as i32).min((work.right - work.left - 2 * inset).max(1));
+    let height = ((size.1.min(POPUP_MAX_HEIGHT) * scale).round() as i32)
         .min((work.bottom - work.top - 2 * inset).max(1));
     Rect {
         left: work.right - 2 * inset - width,
         top: work.bottom - 2 * inset - height,
         right: work.right,
         bottom: work.bottom,
+    }
+}
+fn frame_rectangle(anchor: Rect, scale: f64, viewport: PopupViewport) -> Rect {
+    let inset = (f64::from(POPUP_SHADOW_INSET) * scale).round() as i32;
+    Rect {
+        left: anchor.right - 2 * inset - (viewport.width * scale).round() as i32,
+        top: anchor.bottom - 2 * inset - (viewport.height * scale).round() as i32,
+        right: anchor.right,
+        bottom: anchor.bottom,
     }
 }
 fn popup_viewport_extent(physical_extent: i32, scale: f64) -> f64 {
@@ -874,36 +895,6 @@ fn limited_viewport(host: Rect, scale: f64, requested: (f64, f64)) -> PopupViewp
     PopupViewport {
         width: available_width.min(requested.0).max(1.0),
         height: ((requested.1 * scale).round() / scale).clamp(1.0, available_height),
-    }
-}
-fn update_popup_region(window: Hwnd, card_height: f64) {
-    let mut client: Rect = unsafe { std::mem::zeroed() };
-    if unsafe { GetClientRect(window, &mut client) } == 0 {
-        return;
-    }
-    let scale = f64::from(unsafe { GetDpiForWindow(window) }.max(96)) / 96.0;
-    let visible_height = ((card_height
-        + POPUP_GROWTH_HEADROOM
-        + 2.0 * f64::from(POPUP_SHADOW_INSET))
-        * scale)
-        .ceil() as i32;
-    let region = unsafe {
-        CreateRectRgn(
-            0,
-            (client.bottom - visible_height).max(0),
-            client.right,
-            client.bottom,
-        )
-    };
-    if region.is_null() {
-        return;
-    }
-    // Success transfers ownership to USER. The excluded upper host area is
-    // outside the native window region, so other processes receive its clicks.
-    if unsafe { SetWindowRgn(window, region, 1) } == 0 {
-        unsafe {
-            DeleteObject(region);
-        }
     }
 }
 /// Distance needed to move the entire card and shadow below the taskbar edge.
@@ -948,7 +939,7 @@ fn set_rectangle(window: Hwnd, rectangle: Rect, flags: u32) {
             rectangle.right - rectangle.left,
             rectangle.bottom - rectangle.top,
             // The caller has already committed the corresponding XAML viewport.
-            flags | 0x0004 | 0x0010 | 0x2000,
+            flags | 0x0004 | 0x0010 | 0x0100 | 0x2000,
         );
     }
     APPLYING_FRAME.with(|value| value.set(was_applying));
@@ -1050,6 +1041,32 @@ pub fn install_popup_frame_handler(handler: impl Fn(PopupFrame) + 'static) {
     }
 }
 
+/// Use WinUI's CompositionTarget.Rendering cadence for native/XAML size frames.
+/// USER timers remain a bootstrap fallback when no rendering subscription exists.
+pub fn set_popup_render_clock(enabled: bool) {
+    if RENDER_CLOCK.with(|value| value.replace(enabled)) == enabled {
+        return;
+    }
+    if let Some(animation) = RESIZE_ANIMATION.with(Cell::get) {
+        unsafe {
+            if enabled {
+                KillTimer(animation.window, RESIZE_TIMER);
+            } else {
+                SetTimer(animation.window, RESIZE_TIMER, RESIZE_INTERVAL_MS, None);
+            }
+        }
+    }
+}
+
+pub fn popup_animation_frame() {
+    if RENDER_CLOCK.with(Cell::get) {
+        let window = POPUP.with(Cell::get);
+        if !window.is_null() {
+            resize_tick(window);
+        }
+    }
+}
+
 pub fn popup_frame_is_current(frame: PopupFrame) -> bool {
     PENDING_FRAME.with(Cell::get).is_some_and(|pending| {
         pending.frame == frame && RESIZE_REVISION.with(Cell::get) == frame.revision
@@ -1108,9 +1125,8 @@ pub fn commit_popup_frame(frame: PopupFrame) {
     let Some(pending) = PENDING_FRAME.with(Cell::take) else {
         return;
     };
-    // Only a first presentation or a monitor/DPI change places the fixed host.
-    // Ordinary animation frames update XAML alone; HWND top and client size
-    // cannot race the footer's bottom anchor on a separate rendering clock.
+    // XAML and HWND consume the same frame. The bottom edge remains anchored;
+    // the native client never retains a hidden maximum-height capture area.
     if let Some((rectangle, flags)) = pending.placement {
         set_rectangle(pending.window, rectangle, flags);
     }
@@ -1120,7 +1136,6 @@ pub fn commit_popup_frame(frame: PopupFrame) {
         return;
     }
     COMMITTED_FRAME.with(|value| value.set(Some(frame)));
-    update_popup_region(pending.window, frame.height);
     if frame.finished {
         finish_resize(pending.window);
         if SHOW_AFTER_FRAME.with(Cell::take) {
@@ -1132,9 +1147,10 @@ pub fn commit_popup_frame(frame: PopupFrame) {
             if let Some(mut animation) = value.get()
                 && animation.revision == frame.revision
             {
-                // UI commit time is backpressure, not elapsed animation time.
-                // An overloaded message queue cannot skip directly to the end.
-                animation.last_sample = Instant::now();
+                // The animation keeps an absolute compositor-paced clock.
+                // Remember only the velocity of the frame actually presented,
+                // so retargeting never starts from an unacknowledged position.
+                animation.committed_progress = animation.sampled_progress;
                 value.set(Some(animation));
             }
         });
@@ -1152,7 +1168,7 @@ fn resize_tick(window: Hwnd) {
         stop_resize(window);
         return;
     }
-    // At most one XAML height frame may be in flight. The HWND remains fixed.
+    // At most one coordinated XAML/native frame may be in flight.
     if PENDING_FRAME.with(Cell::get).is_some() {
         return;
     }
@@ -1163,25 +1179,25 @@ fn resize_tick(window: Hwnd) {
         resize_popup(window, true, true);
         return;
     }
-    animation.elapsed_ms += (animation.last_sample.elapsed().as_secs_f64() * 1000.0).min(32.0);
-    animation.last_sample = Instant::now();
-    let progress = (animation.elapsed_ms / RESIZE_DURATION_MS).clamp(0.0, 1.0);
-    // Zero velocity at both ends avoids cubic-out's large first-frame movement.
-    let eased = progress * progress * (3.0 - 2.0 * progress);
+    let progress = animation.progress_at(Instant::now());
+    let (eased, _) = resize_curve(progress, animation.initial_slope);
+    animation.sampled_progress = progress;
     RESIZE_ANIMATION.with(|value| value.set(Some(animation)));
+    let viewport = animation.from.interpolate(animation.to, eased);
+    let scale = f64::from(animation.dpi) / 96.0;
+    let bounds = frame_rectangle(animation.bounds, scale, viewport);
+    let viewport = limited_viewport(bounds, scale, (viewport.width, viewport.height));
     queue_popup_frame(
         window,
-        animation.from.interpolate(animation.to, eased),
+        viewport,
         animation.to,
         animation.revision,
         eased,
         progress >= 1.0,
-        None,
+        Some((bounds, 0)),
     );
 }
-/// `animated == false` applies the target size in one step. Text edits use it:
-/// the view has already laid the card out at its new height in the same turn,
-/// and an eased resize would trail every keystroke that adds a line.
+/// Size changes share a single acknowledged animation timeline.
 fn resize_popup(window: Hwnd, first: bool, animated: bool) {
     // Keep the committed viewport steady while its WinUI visual slides out.
     // SIZE still records newer results, and reopening consumes that target.
@@ -1241,16 +1257,16 @@ fn resize_popup(window: Hwnd, first: bool, animated: bool) {
         && visible
         && has_rectangle
         && monitor == anchor
-        && current == host
+        && current.left == host.left
+        && current.right == host.right
+        && current.bottom == host.bottom
         && committed.is_some_and(|frame| frame.width == target.width);
+    let incoming_velocity = RESIZE_ANIMATION
+        .with(Cell::get)
+        .map_or(0.0, |animation| animation.committed_velocity());
     stop_resize(window);
     let revision = RESIZE_REVISION.with(Cell::get);
     if !animate {
-        if !animated && !first && visible && has_rectangle && current == host {
-            // The card is already this tall in XAML. Expose it now instead of
-            // after the frame acknowledgement, so its top edge is never cut.
-            update_popup_region(window, target.height);
-        }
         queue_popup_frame(
             window,
             target,
@@ -1263,23 +1279,33 @@ fn resize_popup(window: Hwnd, first: bool, animated: bool) {
         );
         return;
     }
-    // A reversal starts from the last XAML viewport actually acknowledged,
-    // independently of the fixed maximum-height native client rectangle.
+    // Reversals start at the last committed viewport and physical rectangle.
     let from = PopupViewport::from_frame(committed.unwrap());
+    let distance = target.height - from.height;
+    let initial_slope = if distance.abs() > f64::EPSILON {
+        (incoming_velocity * RESIZE_DURATION_MS / distance).clamp(0.0, 3.0)
+    } else {
+        0.0
+    };
     RESIZE_ANIMATION.with(|value| {
         value.set(Some(ResizeAnimation {
             window,
             from,
             to: target,
-            elapsed_ms: 0.0,
-            last_sample: Instant::now(),
+            started: Instant::now(),
+            initial_slope,
+            sampled_progress: 0.0,
+            committed_progress: 0.0,
             monitor,
             dpi,
             revision,
             transition_key,
+            bounds: host,
         }))
     });
-    if unsafe { SetTimer(window, RESIZE_TIMER, RESIZE_INTERVAL_MS, None) } == 0 {
+    if !RENDER_CLOCK.with(Cell::get)
+        && unsafe { SetTimer(window, RESIZE_TIMER, RESIZE_INTERVAL_MS, None) } == 0
+    {
         stop_resize(window);
         queue_popup_frame(
             window,
@@ -1288,10 +1314,19 @@ fn resize_popup(window: Hwnd, first: bool, animated: bool) {
             RESIZE_REVISION.with(Cell::get),
             1.0,
             true,
-            None,
+            Some((host, 0)),
         );
     } else {
-        queue_popup_frame(window, from, target, revision, 0.0, false, None);
+        let bounds = frame_rectangle(host, scale, from);
+        queue_popup_frame(
+            window,
+            from,
+            target,
+            revision,
+            0.0,
+            false,
+            Some((bounds, 0)),
+        );
     }
 }
 unsafe extern "system" fn popup_proc(
@@ -1300,13 +1335,24 @@ unsafe extern "system" fn popup_proc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
-    if INITIALIZED.with(Cell::get) && POPUP.with(Cell::get) == window {
-        if message == 0x0083 && wparam != 0 {
+    if POPUP.with(Cell::get) == window {
+        if message == 0x0083 {
             // This popup has no caption or resize frame. Keep its client area
             // equal to the whole HWND, rather than letting the overlapped
             // presenter reintroduce top/bottom frame insets during a resize.
-            // The rounded Mica card is inside the transparent WinUI host.
+            // This also applies during creation, before configure_popup runs.
             return 0;
+        }
+        if message == 0x0085 {
+            // WM_NCPAINT can arrive before the transparent backdrop connects.
+            // The XAML card owns the stroke and shadow, including first show.
+            return 0;
+        }
+        if message == 0x0086 {
+            // Deliver activation to WinUI without painting a native frame.
+            return unsafe {
+                CallWindowProcW(ORIGINAL_PROC.with(Cell::get), window, message, wparam, -1)
+            };
         }
     }
     if message == 0x031d {
@@ -1335,7 +1381,9 @@ unsafe extern "system" fn popup_proc(
         return 0;
     }
     if message == 0x0113 && wparam == RESIZE_TIMER {
-        resize_tick(window);
+        if !RENDER_CLOCK.with(Cell::get) {
+            resize_tick(window);
+        }
         return 0;
     }
     if message == 0x0113 && wparam == FOCUS_TIMER {
@@ -2779,7 +2827,8 @@ mod presentation_tests {
             bottom: 1040,
         };
         for scale in [1.0, 1.25, 1.5, 2.0] {
-            let bounds = popup_bounds(work, scale, 480.0);
+            let height = 320.0;
+            let bounds = popup_bounds(work, scale, (480.0, height));
             let margin = (16.0 * scale).round() as i32;
             assert_eq!(bounds.bottom, work.bottom);
             assert_eq!(bounds.right, work.right);
@@ -2789,7 +2838,7 @@ mod presentation_tests {
             );
             assert_eq!(
                 bounds.top,
-                work.bottom - 2 * margin - (POPUP_MAX_HEIGHT * scale).round() as i32
+                work.bottom - 2 * margin - (height * scale).round() as i32
             );
             assert_eq!(
                 popup_viewport_extent(bounds.right - bounds.left, scale),
@@ -2797,7 +2846,7 @@ mod presentation_tests {
             );
             assert_eq!(
                 popup_viewport_extent(bounds.bottom - bounds.top, scale),
-                POPUP_MAX_HEIGHT
+                height
             );
             let card = limited_viewport(bounds, scale, (480.0, 320.0));
             assert_eq!(card.height, 320.0);
@@ -2817,7 +2866,7 @@ mod presentation_tests {
             right: 1380,
             bottom: -180,
         };
-        let bounds = popup_bounds(work, 1.5, 1600.0);
+        let bounds = popup_bounds(work, 1.5, (1600.0, 1200.0));
         assert_eq!(bounds.left, work.left);
         assert_eq!(bounds.top, work.top);
         assert_eq!(bounds.bottom, work.bottom);
@@ -2849,11 +2898,106 @@ mod presentation_tests {
             right: 1920,
             bottom: 1040,
         };
-        let host = popup_bounds(work, 1.0, 480.0);
+        let host = popup_bounds(work, 1.0, (480.0, 480.0));
         for height in [172.0, 200.0, 326.0, 480.0, 320.0, 172.0] {
-            assert_eq!(limited_viewport(host, 1.0, (480.0, height)).height, height);
-            assert_eq!(popup_bounds(work, 1.0, 480.0), host);
+            let bounds = frame_rectangle(
+                host,
+                1.0,
+                PopupViewport {
+                    width: 480.0,
+                    height,
+                },
+            );
+            assert_eq!(
+                limited_viewport(bounds, 1.0, (480.0, height)).height,
+                height
+            );
+            assert_eq!(bounds.bottom, host.bottom);
+            assert_eq!(bounds.bottom - bounds.top, height as i32 + 32);
         }
+    }
+
+    #[test]
+    fn retargeted_resize_preserves_velocity_without_overshoot() {
+        for initial_slope in [0.0, 0.25, 1.0, 2.0, 3.0] {
+            let (start, start_velocity) = resize_curve(0.0, initial_slope);
+            let (end, end_velocity) = resize_curve(1.0, initial_slope);
+            assert_eq!(start, 0.0);
+            assert_eq!(end, 1.0);
+            assert_eq!(start_velocity, initial_slope);
+            assert_eq!(end_velocity, 0.0);
+            let mut previous = 0.0;
+            for sample in 0..=1000 {
+                let (position, velocity) = resize_curve(f64::from(sample) / 1000.0, initial_slope);
+                assert!(position >= previous);
+                assert!((0.0..=1.0).contains(&position));
+                assert!(velocity >= 0.0);
+                previous = position;
+            }
+        }
+        let (_, old_slope) = resize_curve(0.4, 0.0);
+        let old_velocity = 100.0 * old_slope / RESIZE_DURATION_MS;
+        let remaining_distance = 120.0;
+        let inherited_slope =
+            (old_velocity * RESIZE_DURATION_MS / remaining_distance).clamp(0.0, 3.0);
+        let (_, new_slope) = resize_curve(0.0, inherited_slope);
+        let new_velocity = remaining_distance * new_slope / RESIZE_DURATION_MS;
+        assert!((old_velocity - new_velocity).abs() < 1e-12);
+    }
+
+    #[test]
+    fn committing_resize_frames_does_not_pause_the_animation_clock() {
+        let duration = Duration::from_secs_f64(RESIZE_DURATION_MS / 1000.0);
+        let started = Instant::now() - duration.mul_f64(0.4);
+        let from = PopupViewport {
+            width: 480.0,
+            height: 181.0,
+        };
+        let to = PopupViewport {
+            width: 480.0,
+            height: 320.0,
+        };
+        let animation = ResizeAnimation {
+            window: std::ptr::null_mut(),
+            from,
+            to,
+            started,
+            initial_slope: 0.0,
+            sampled_progress: 0.4,
+            committed_progress: 0.0,
+            monitor: std::ptr::null_mut(),
+            dpi: 96,
+            revision: RESIZE_REVISION.with(Cell::get),
+            transition_key: TRANSITION_KEY.with(Cell::get),
+            bounds: Rect {
+                left: 0,
+                top: 0,
+                right: 512,
+                bottom: 352,
+            },
+        };
+        let old_animation = RESIZE_ANIMATION.with(|value| value.replace(Some(animation)));
+        let old_pending = PENDING_FRAME.with(Cell::take);
+        let old_committed = COMMITTED_FRAME.with(Cell::get);
+        let old_handler = FRAME_HANDLER.with(|value| value.borrow_mut().take());
+        queue_popup_frame(
+            std::ptr::null_mut(),
+            from.interpolate(to, resize_curve(0.4, 0.0).0),
+            to,
+            animation.revision,
+            resize_curve(0.4, 0.0).0,
+            false,
+            None,
+        );
+        let acknowledged = RESIZE_ANIMATION.with(Cell::get).unwrap();
+        assert_eq!(acknowledged.started, started);
+        assert_eq!(acknowledged.committed_progress, 0.4);
+        assert!((acknowledged.progress_at(started + duration.mul_f64(0.6)) - 0.6).abs() < 1e-12);
+        assert_eq!(acknowledged.progress_at(started + duration), 1.0);
+        RESIZE_ANIMATION.with(|value| value.set(old_animation));
+        PENDING_FRAME.with(|value| value.set(old_pending));
+        COMMITTED_FRAME.with(|value| value.set(old_committed));
+        FRAME_HANDLER.with(|value| *value.borrow_mut() = old_handler);
     }
 
     #[test]
@@ -2877,15 +3021,75 @@ mod presentation_tests {
     }
 
     #[test]
-    fn hidden_host_region_excludes_upper_blank_area_without_moving_the_window() {
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn GetWindowRgn(window: Hwnd, region: Hwnd) -> i32;
+    fn initial_popup_has_no_native_non_client_frame_before_configuration() {
+        struct PopupProbe {
+            window: Hwnd,
+            procedure: isize,
+            previous_popup: Hwnd,
+            previous_procedure: isize,
+            previous_initialized: bool,
         }
-        #[link(name = "gdi32")]
-        unsafe extern "system" {
-            fn GetRgnBox(region: Hwnd, bounds: *mut Rect) -> i32;
+        impl Drop for PopupProbe {
+            fn drop(&mut self) {
+                unsafe {
+                    SetWindowLongPtrW(self.window, -4, self.procedure);
+                    DestroyWindow(self.window);
+                }
+                POPUP.with(|value| value.set(self.previous_popup));
+                ORIGINAL_PROC.with(|value| value.set(self.previous_procedure));
+                INITIALIZED.with(|value| value.set(self.previous_initialized));
+            }
         }
+        let foreground = unsafe { GetForegroundWindow() };
+        let window = unsafe {
+            CreateWindowExW(
+                0x80,
+                wide("STATIC").as_ptr(),
+                std::ptr::null(),
+                0x00cf0000, // An overlapped frame, as WinUI initially creates.
+                100,
+                100,
+                512,
+                256,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!window.is_null());
+        let procedure = unsafe { SetWindowLongPtrW(window, -4, popup_proc as *const () as isize) };
+        let _probe = PopupProbe {
+            window,
+            procedure,
+            previous_popup: POPUP.with(|value| value.replace(window)),
+            previous_procedure: ORIGINAL_PROC.with(|value| value.replace(procedure)),
+            previous_initialized: INITIALIZED.with(|value| value.replace(false)),
+        };
+        unsafe {
+            SetWindowPos(
+                window,
+                std::ptr::null_mut(),
+                100,
+                100,
+                512,
+                256,
+                0x0020 | 0x0010 | 0x0004,
+            );
+        }
+        let mut bounds: Rect = unsafe { std::mem::zeroed() };
+        let mut client: Rect = unsafe { std::mem::zeroed() };
+        assert_ne!(unsafe { GetWindowRect(window, &mut bounds) }, 0);
+        assert_ne!(unsafe { GetClientRect(window, &mut client) }, 0);
+        assert_eq!(client.right, bounds.right - bounds.left);
+        assert_eq!(client.bottom, bounds.bottom - bounds.top);
+        assert_eq!(unsafe { SendMessageW(window, 0x0085, 1, 0) }, 0);
+        assert_eq!(unsafe { IsWindowVisible(window) }, 0);
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    }
+
+    #[test]
+    fn every_committed_frame_has_tight_native_capture_bounds() {
         struct HiddenWindow(Hwnd);
         impl Drop for HiddenWindow {
             fn drop(&mut self) {
@@ -2913,36 +3117,120 @@ mod presentation_tests {
             )
         });
         assert!(!window.0.is_null());
-        let mut original: Rect = unsafe { std::mem::zeroed() };
-        assert_ne!(unsafe { GetWindowRect(window.0, &mut original) }, 0);
         let scale = f64::from(unsafe { GetDpiForWindow(window.0) }.max(96)) / 96.0;
+        let work = Rect {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2160,
+        };
+        let old_frame = COMMITTED_FRAME.with(Cell::take);
         for height in [172.0, 320.0, 480.0, 320.0, 172.0] {
-            update_popup_region(window.0, height);
-            let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
-            assert!(!region.is_null());
+            let bounds = popup_bounds(work, scale, (480.0, height));
+            let viewport = limited_viewport(bounds, scale, (480.0, height));
+            queue_popup_frame(
+                window.0,
+                viewport,
+                viewport,
+                RESIZE_REVISION.with(Cell::get),
+                1.0,
+                true,
+                Some((bounds, 0)),
+            );
             let mut actual: Rect = unsafe { std::mem::zeroed() };
-            assert_ne!(unsafe { GetWindowRgn(window.0, region) }, 0);
-            assert_ne!(unsafe { GetRgnBox(region, &mut actual) }, 0);
-            unsafe {
-                DeleteObject(region);
-            }
+            assert_ne!(unsafe { GetClientRect(window.0, &mut actual) }, 0);
             assert_eq!(
                 actual,
                 Rect {
                     left: 0,
-                    // The card, its shadow gutter, and room for one more line.
-                    top: (512 - ((height + 32.0 + POPUP_GROWTH_HEADROOM) * scale).ceil() as i32)
-                        .max(0),
-                    right: 512,
-                    bottom: 512
+                    top: 0,
+                    right: bounds.right - bounds.left,
+                    bottom: bounds.bottom - bounds.top
                 }
             );
             let mut current: Rect = unsafe { std::mem::zeroed() };
             assert_ne!(unsafe { GetWindowRect(window.0, &mut current) }, 0);
-            assert_eq!(current, original);
+            assert_eq!(current, bounds);
             assert_eq!(unsafe { IsWindowVisible(window.0) }, 0);
         }
+        // A font-only change still needs its own acknowledged presentation
+        // frame, even when both font modes fit the same minimum card height.
+        let old_handler = FRAME_HANDLER.with(|value| value.replace(Some(Rc::new(|_| {}))));
+        let old_key = TRANSITION_KEY.with(Cell::get);
+        let viewport = PopupViewport {
+            width: 480.0,
+            height: 181.0,
+        };
+        let bounds = popup_bounds(work, scale, (viewport.width, viewport.height));
+        TRANSITION_KEY.with(|value| value.set(0));
+        queue_popup_frame(
+            window.0,
+            viewport,
+            viewport,
+            RESIZE_REVISION.with(Cell::get),
+            1.0,
+            true,
+            Some((bounds, 0)),
+        );
+        let large_frame = PENDING_FRAME.with(Cell::get).unwrap().frame;
+        commit_popup_frame(large_frame);
+        TRANSITION_KEY.with(|value| value.set(1 << 4));
+        queue_popup_frame(
+            window.0,
+            viewport,
+            viewport,
+            RESIZE_REVISION.with(Cell::get),
+            1.0,
+            true,
+            None,
+        );
+        let compact_frame = PENDING_FRAME.with(Cell::get).unwrap().frame;
+        assert_ne!(large_frame.serial, compact_frame.serial);
+        assert!(!popup_frame_is_current(large_frame));
+        assert_eq!(COMMITTED_FRAME.with(Cell::get).unwrap(), large_frame);
+        commit_popup_frame(large_frame);
+        assert_eq!(COMMITTED_FRAME.with(Cell::get).unwrap(), large_frame);
+        commit_popup_frame(compact_frame);
+        assert_eq!(COMMITTED_FRAME.with(Cell::get).unwrap(), compact_frame);
+        assert_eq!(large_frame.height, compact_frame.height);
+        FRAME_HANDLER.with(|value| *value.borrow_mut() = old_handler);
+        TRANSITION_KEY.with(|value| value.set(old_key));
+        COMMITTED_FRAME.with(|value| value.set(old_frame));
         assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    }
+
+    #[test]
+    fn intermediate_frames_share_physical_pixel_rounding_and_bottom_anchor() {
+        let work = Rect {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let anchor = popup_bounds(work, scale, (480.0, 480.0));
+            let from = PopupViewport {
+                width: 480.0,
+                height: 181.0,
+            };
+            let to = PopupViewport {
+                width: 480.0,
+                height: 470.0,
+            };
+            for step in 0..=40 {
+                let requested = from.interpolate(to, f64::from(step) / 40.0);
+                let bounds = frame_rectangle(anchor, scale, requested);
+                let viewport = limited_viewport(bounds, scale, (requested.width, requested.height));
+                assert_eq!(frame_rectangle(anchor, scale, viewport), bounds);
+                assert_eq!(bounds.bottom, work.bottom);
+                assert_eq!(bounds.right, work.right);
+                let inset = (16.0 * scale).round() as i32;
+                assert_eq!(
+                    bounds.bottom - bounds.top,
+                    (viewport.height * scale).round() as i32 + 2 * inset
+                );
+            }
+        }
     }
 
     #[test]

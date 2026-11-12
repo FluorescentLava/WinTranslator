@@ -1284,6 +1284,8 @@ pub mod public {
         background: Property<Brush>,
         border_brush: Property<Brush>,
         border_thickness: Property<Thickness>,
+        padding: Property<Thickness>,
+        adaptive_large_font: Property<f64>,
         on_text_changed: Option<Callback<String>>,
         reference: Option<NativeElementRef>,
         element_state: Option<std::rc::Rc<ElementState>>,
@@ -1403,6 +1405,36 @@ pub mod public {
                 "TextBox BorderThickness must contain finite non-negative values",
             );
             self.border_thickness = Property::from(value);
+            self
+        }
+        pub fn padding(mut self, value: impl Into<Thickness>) -> Self {
+            let value = value.into();
+            assert!(
+                value.is_finite_non_negative(),
+                "TextBox Padding must contain finite non-negative values"
+            );
+            self.padding = Property::Set(value);
+            self
+        }
+        pub fn padding_optional<T>(mut self, value: Option<T>) -> Self
+        where
+            T: Into<Thickness>,
+        {
+            let value = value.map(Into::into);
+            assert!(
+                value
+                    .as_ref()
+                    .is_none_or(|value| value.is_finite_non_negative()),
+                "TextBox Padding must contain finite non-negative values"
+            );
+            self.padding = Property::from(value);
+            self
+        }
+        /// Scales a Viewbox-hosted editor before new text is drawn. Text fitting
+        /// two large lines uses this size; longer text uses the fixed FontSize.
+        pub fn adaptive_large_font(mut self, value: f64) -> Self {
+            assert!(value.is_finite() && value > 0.0);
+            self.adaptive_large_font = Property::Set(value);
             self
         }
         pub fn on_text_changed(mut self, callback: impl IntoPayloadCallback<String>) -> Self {
@@ -6730,6 +6762,8 @@ pub mod public {
                         background,
                         border_brush,
                         border_thickness,
+                        padding,
+                        adaptive_large_font,
                         on_text_changed,
                         reference,
                         element_state,
@@ -6748,6 +6782,8 @@ pub mod public {
                             background,
                             border_brush,
                             border_thickness,
+                            padding,
+                            adaptive_large_font,
                             on_text_changed,
                         })),
                         reference,
@@ -8388,6 +8424,7 @@ pub mod public {
                         && value.background == mounted.background
                         && value.border_brush == mounted.border_brush
                         && value.border_thickness == mounted.border_thickness
+                        && value.padding == mounted.padding
                         && value.on_text_changed == mounted.on_text_changed
                 }
                 (Self::AutoSuggestBox(value), MountedProps::AutoSuggestBox(mounted)) => {
@@ -9866,6 +9903,20 @@ impl MountedPropsExt for MountedProps {
                     match &values.border_thickness {
                         Property::Inherited => None,
                         Property::Set(value) => Some(PropertyValueRef::Thickness(value)),
+                    },
+                );
+                visit(
+                    PropertyId::TextBoxPadding,
+                    match &values.padding {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::Thickness(value)),
+                    },
+                );
+                visit(
+                    PropertyId::TextBoxAdaptiveLargeFont,
+                    match &values.adaptive_large_font {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::F64(*value)),
                     },
                 );
             }
@@ -12902,6 +12953,8 @@ pub(crate) struct TextBoxMountedProps {
     background: Property<Brush>,
     border_brush: Property<Brush>,
     border_thickness: Property<Thickness>,
+    padding: Property<Thickness>,
+    adaptive_large_font: Property<f64>,
     on_text_changed: Option<Callback<String>>,
 }
 impl PartialEq for TextBoxMountedProps {
@@ -12917,6 +12970,8 @@ impl PartialEq for TextBoxMountedProps {
             && self.background == other.background
             && self.border_brush == other.border_brush
             && self.border_thickness == other.border_thickness
+            && self.padding == other.padding
+            && f64_property_eq(&self.adaptive_large_font, &other.adaptive_large_font)
             && self.on_text_changed == other.on_text_changed
     }
 }
@@ -14024,6 +14079,8 @@ pub enum PropertyId {
     TextBoxBackground,
     TextBoxBorderBrush,
     TextBoxBorderThickness,
+    TextBoxPadding,
+    TextBoxAdaptiveLargeFont,
     AutoSuggestBoxText,
     AutoSuggestBoxItemsSource,
     AutoSuggestBoxPlaceholderText,
@@ -15553,6 +15610,28 @@ const TEXT_BOX_PROPERTIES: &[PropertyDescriptor] = &[
         field: "border_thickness",
         value: "Thickness",
         interface: "Microsoft.UI.Xaml.Controls.IControl",
+        clearable: true,
+        feedback: None,
+        feedback_contract: None,
+        observes_feedback: false,
+    },
+    PropertyDescriptor {
+        id: PropertyId::TextBoxPadding,
+        name: "Padding",
+        field: "padding",
+        value: "Thickness",
+        interface: "Microsoft.UI.Xaml.Controls.IControl",
+        clearable: true,
+        feedback: None,
+        feedback_contract: None,
+        observes_feedback: false,
+    },
+    PropertyDescriptor {
+        id: PropertyId::TextBoxAdaptiveLargeFont,
+        name: "AdaptiveLargeFont",
+        field: "adaptive_large_font",
+        value: "f64",
+        interface: "Microsoft.UI.Xaml.Controls.ITextBox",
         clearable: true,
         feedback: None,
         feedback_contract: None,

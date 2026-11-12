@@ -206,6 +206,11 @@ struct TransparentOverrides {
     brush: RefCell<Option<IUnknown>>,
     connections: Rc<Cell<u32>>,
     disconnections: Rc<Cell<u32>>,
+    layout: Rc<CardLayout>,
+}
+struct CardLayout {
+    root: IUIElement,
+    updating: Cell<bool>,
 }
 impl Drop for TransparentOverrides {
     fn drop(&mut self) {
@@ -228,22 +233,6 @@ impl BackdropOverridesImpl for TransparentOverrides_Impl {
     fn connected(&self, target: Ref<BackdropTarget>, root: Ref<XamlRoot>) -> Result<()> {
         let target = target.as_ref().ok_or_else(Error::empty)?;
         configure_dwm(self.hwnd)?;
-        unsafe {
-            if SetWindowSubclass(
-                self.hwnd as Raw,
-                Some(transparent_window_proc),
-                SUBCLASS_ID,
-                0,
-            ) == 0
-            {
-                return Err(Error::from_thread());
-            }
-            let dc = GetDC(self.hwnd as Raw);
-            if !dc.is_null() {
-                clear_background(self.hwnd as Raw, dc);
-                ReleaseDC(self.hwnd as Raw, dc);
-            }
-        }
         let mut raw = std::ptr::null_mut();
         unsafe {
             (self.compositor.vtable().create_color_brush_with_color)(
@@ -276,9 +265,6 @@ impl BackdropOverridesImpl for TransparentOverrides_Impl {
             target.set_brush(None)?;
         }
         self.brush.borrow_mut().take();
-        unsafe {
-            RemoveWindowSubclass(self.hwnd as Raw, Some(transparent_window_proc), SUBCLASS_ID);
-        }
         let base = self.base_overrides()?;
         unsafe {
             (base.vtable().disconnected)(
@@ -314,7 +300,7 @@ struct TransparentBackdrop {
     _disconnections: Rc<Cell<u32>>,
 }
 impl TransparentBackdrop {
-    fn new(hwnd: isize) -> Result<Self> {
+    fn new(hwnd: isize, host: &bindings::Grid) -> Result<Self> {
         let compositor = windows_core::imp::load_factory::<
             OsCompositorClass,
             windows_core::imp::IGenericFactory,
@@ -328,7 +314,31 @@ impl TransparentBackdrop {
             brush: RefCell::new(None),
             connections: connections.clone(),
             disconnections: disconnections.clone(),
+            layout: Rc::new(CardLayout {
+                root: host.cast()?,
+                updating: Cell::new(false),
+            }),
         };
+        // Presenter changes can paint a native frame before SystemBackdrop's
+        // first target connection. Own the transparent host from construction,
+        // and retain it across target disconnect/reconnect until the owner drops.
+        configure_dwm(hwnd)?;
+        unsafe {
+            if SetWindowSubclass(
+                hwnd as Raw,
+                Some(transparent_window_proc),
+                SUBCLASS_ID,
+                Rc::as_ptr(&implementation.layout) as usize,
+            ) == 0
+            {
+                return Err(Error::from_thread());
+            }
+            let dc = GetDC(hwnd as Raw);
+            if !dc.is_null() {
+                clear_background(hwnd as Raw, dc);
+                ReleaseDC(hwnd as Raw, dc);
+            }
+        }
         let factory = windows_core::imp::load_factory::<SystemBackdrop, BackdropFactory>()?;
         let value = unsafe {
             let (outer, inner) = Compose::compose(implementation);
@@ -533,13 +543,7 @@ impl WindowHost {
         if activate {
             window.Activate()?;
         }
-        let element = self.host.cast::<IUIElement>()?;
-        unsafe {
-            native_method::<unsafe extern "system" fn(Raw) -> HRESULT>(&element, 214)(
-                element.as_raw(),
-            )
-            .ok()?;
-        }
+        update_layout(&self.host.cast::<IUIElement>()?)?;
         Ok(activate)
     }
     pub fn slide_layout(&self, window: &Window) -> Result<Option<slide::LayoutGate>> {
@@ -605,7 +609,9 @@ impl WindowHost {
                 .WindowHandle(&mut hwnd)
                 .ok()?;
         }
+        let transparent = TransparentBackdrop::new(hwnd as isize, &self.host)?;
         let frame = presenter_frame::PresenterFrame::hide(window)?;
+        configure_dwm(hwnd as isize)?;
         let surface = bindings::Grid::new()?;
         surface.cast::<UIElement>()?.SetOpacity(0.0)?;
         // The animated root includes the transparent shadow gutter. A receiver
@@ -617,8 +623,8 @@ impl WindowHost {
             r#"<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Background="Transparent" CornerRadius="{ThemeResource OverlayCornerRadius}" Translation="0,0,32"><Border.Shadow><ThemeShadow/></Border.Shadow></Border>"#,
         )?.cast::<bindings::Border>()?;
         set_card_inset(&caster, inset)?;
-        // The native host has a stable maximum height. The app root supplies
-        // the current card height, and this caster grows upward from its bottom.
+        // The app root supplies the card height. Bottom anchoring keeps its
+        // footer in place while the content grows upward.
         caster
             .cast::<FrameworkElement>()?
             .SetVerticalAlignment(bindings::VerticalAlignment::Bottom)?;
@@ -645,7 +651,6 @@ impl WindowHost {
         let surface_children = surface.cast::<IPanel>()?.Children()?;
         surface_children.Append(&receiver.cast::<UIElement>()?)?;
         surface_children.Append(&caster.cast::<UIElement>()?)?;
-        let transparent = TransparentBackdrop::new(hwnd as isize)?;
         move_children(&self.host, &content)?;
         self.host
             .cast::<IPanel>()?
@@ -708,6 +713,12 @@ fn set_card_inset(caster: &bindings::Border, inset: u16) -> Result<()> {
             right: f64::from(inset),
             bottom: f64::from(inset),
         })
+}
+fn update_layout(element: &IUIElement) -> Result<()> {
+    unsafe {
+        native_method::<unsafe extern "system" fn(Raw) -> HRESULT>(element, 214)(element.as_raw())
+            .ok()
+    }
 }
 fn move_children(from: &bindings::Grid, to: &bindings::Grid) -> Result<()> {
     let source = from.cast::<IPanel>()?.Children()?;
@@ -838,10 +849,32 @@ unsafe extern "system" fn transparent_window_proc(
     wparam: usize,
     lparam: isize,
     _id: usize,
-    _data: usize,
+    data: usize,
 ) -> isize {
     unsafe {
         match message {
+            0x0083 | 0x0085 => return 0, // WM_NCCALCSIZE / WM_NCPAINT
+            0x0086 => {
+                // Preserve WinUI input activation and Mica policy, but prevent
+                // DefWindowProc from drawing the stationary native host edge.
+                return DefSubclassProc(hwnd, message, wparam, -1);
+            }
+            0x0005 if data != 0 && wparam != 1 => {
+                // WM_SIZE, except SIZE_MINIMIZED
+                // Keep the layout state alive across the WinUI procedure and
+                // any nested size notifications. No runtime/pump borrow is held.
+                let pointer = data as *const CardLayout;
+                Rc::increment_strong_count(pointer);
+                let layout = Rc::from_raw(pointer);
+                if !layout.updating.replace(true) {
+                    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+                    // Complete bottom anchoring before SetWindowPos returns,
+                    // so a host rebase cannot paint at the old client origin.
+                    _ = update_layout(&layout.root);
+                    layout.updating.set(false);
+                    return result;
+                }
+            }
             0x0014 => {
                 clear_background(hwnd, wparam as Raw);
                 return 1;

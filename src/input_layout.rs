@@ -1,16 +1,10 @@
 //! Sizing rules for the popup's text input.
 //!
-//! The text box sizes itself natively, and the card around it takes its height
-//! from its content, so text that fits is never clipped or scrolled and the
-//! card moves in the same layout pass as the text. This module predicts that
-//! native height, which is what the window region and the result area are
-//! sized from. Heights only ever move in whole lines.
+//! Native text measurement determines the editor's height on every edit. The
+//! viewport reveals that height with the card and native window animation.
 //!
-//! A word or short phrase is shown large; anything longer uses the compact
-//! size. The size is state, not a function of the text alone: it is held while
-//! an IME composition is in progress (WinUI keeps drawing the composition at
-//! the size it started with) and it has hysteresis, so editing around the
-//! threshold does not flip it on every key.
+//! Text that fits two lines at the large size stays large. Longer text uses
+//! the compact size, which the native editor applies before drawing new text.
 
 use std::borrow::Cow;
 
@@ -26,22 +20,13 @@ pub const COMPACT_FONT: f64 = 15.0;
 const LARGE_LINE: f64 = 31.0;
 const COMPACT_LINE: f64 = 20.0;
 
-/// Tall enough for two large lines or three compact ones at every display
-/// scale. WinUI draws an edit one frame before this application can react to
-/// it, so pressing Enter after a large word briefly shows two large lines; with
-/// this minimum that frame, and the switch to the compact size after it, leave
-/// the box and the card exactly where they were.
+/// Fits two large lines or three compact ones across display scales. Crossing
+/// the third large line therefore does not shrink the editor's height.
 pub const MIN_HEIGHT: f64 = 74.0;
 /// Beyond this many compact lines the box stops growing and scrolls.
 pub const MAX_VISIBLE_LINES: usize = 8;
 pub const MAX_HEIGHT: f64 = MAX_VISIBLE_LINES as f64 * COMPACT_LINE + PADDING_VERTICAL;
 
-/// Large text wider than this share of the line becomes compact, and compact
-/// text must drop below the lower share to become large again.
-const COMPACT_ABOVE: f64 = 0.6;
-const LARGE_BELOW: f64 = 0.5;
-/// Longer text is compact without being measured at the large size.
-const LARGE_LENGTH_LIMIT: usize = 60;
 /// Longer text cannot fit in `MAX_VISIBLE_LINES` at any glyph width, so its
 /// exact line count is never needed.
 const MEASURE_LIMIT: usize = 1200;
@@ -93,12 +78,6 @@ fn advance(c: char, font_size: f64) -> f64 {
     }
 }
 
-/// Unwrapped width from average glyph widths, for when native measurement is
-/// unavailable.
-pub fn estimate_width(text: &str, font_size: f64) -> f64 {
-    text.chars().map(|c| advance(c, font_size)).sum()
-}
-
 /// Wrapped line count from average glyph widths. Used for text the native
 /// measurement does not cover (results, notices) and when it is unavailable.
 pub fn estimate_lines(text: &str, font_size: f64, width: f64) -> usize {
@@ -135,27 +114,16 @@ pub fn font_size(compact: bool) -> f64 {
     if compact { COMPACT_FONT } else { LARGE_FONT }
 }
 
-/// Whether the input should use the compact size, given the size it uses now.
-/// `large_width(text)` is the unwrapped width of single-line text at
-/// `LARGE_FONT`; `line_width` is the width available to one line.
-pub fn wants_compact(
-    text: &str,
-    compact: bool,
-    line_width: f64,
-    large_width: &dyn Fn(&str) -> f64,
-) -> bool {
+/// Always measure at the large size, so compact text cannot flip back merely
+/// because its smaller glyphs fit fewer lines.
+pub fn wants_compact(text: &str, wrapped_lines: &dyn Fn(&str, f64) -> usize) -> bool {
     if text.is_empty() {
         return false;
     }
-    if text.contains(['\r', '\n']) || text.chars().nth(LARGE_LENGTH_LIMIT).is_some() {
+    if lines(text).count() > 2 || text.chars().nth(MEASURE_LIMIT).is_some() {
         return true;
     }
-    let width = large_width(text);
-    if compact {
-        width >= line_width * LARGE_BELOW
-    } else {
-        width > line_width * COMPACT_ABOVE
-    }
+    wrapped_lines(text, LARGE_FONT) > 2
 }
 
 /// Height of the text box for `text` at the given size.
@@ -164,24 +132,11 @@ pub fn wants_compact(
 pub fn height(text: &str, compact: bool, wrapped_lines: &dyn Fn(&str, f64) -> usize) -> f64 {
     let pitch = if compact { COMPACT_LINE } else { LARGE_LINE };
     let fits = (MAX_HEIGHT - PADDING_VERTICAL) / pitch;
-    let lines = if lines(text).count() as f64 >= fits || text.chars().nth(MEASURE_LIMIT).is_some()
-    {
+    let lines = if lines(text).count() as f64 >= fits || text.chars().nth(MEASURE_LIMIT).is_some() {
         fits
     } else {
         wrapped_lines(text, font_size(compact)) as f64
     };
-    (lines * pitch + PADDING_VERTICAL).clamp(MIN_HEIGHT, MAX_HEIGHT)
-}
-
-/// The height this module would report for a text box that really laid out at
-/// `actual` DIPs. Sub-pixel rounding snaps to the same line; a line taller than
-/// the usual pitch rounds up, so the box is never predicted too small.
-pub fn snap_height(actual: f64, compact: bool) -> f64 {
-    if !actual.is_finite() || actual <= MIN_HEIGHT + 0.75 {
-        return MIN_HEIGHT;
-    }
-    let pitch = if compact { COMPACT_LINE } else { LARGE_LINE };
-    let lines = ((actual - PADDING_VERTICAL - 0.75) / pitch).ceil();
     (lines * pitch + PADDING_VERTICAL).clamp(MIN_HEIGHT, MAX_HEIGHT)
 }
 
@@ -191,12 +146,14 @@ mod tests {
 
     const WIDTH: f64 = 432.0;
 
-    fn compact_after(text: &str, compact: bool) -> bool {
-        wants_compact(text, compact, WIDTH, &|text| estimate_width(text, LARGE_FONT))
+    fn compact_after(text: &str, _compact: bool) -> bool {
+        wants_compact(text, &|value, font| estimate_lines(value, font, WIDTH))
     }
 
     fn estimated_height(text: &str, compact: bool) -> f64 {
-        height(text, compact, &|text, font_size| estimate_lines(text, font_size, WIDTH))
+        height(text, compact, &|text, font_size| {
+            estimate_lines(text, font_size, WIDTH)
+        })
     }
 
     /// Types `text` one character at a time, as the popup sees it.
@@ -214,7 +171,10 @@ mod tests {
 
     #[test]
     fn every_line_break_style_separates_lines() {
-        assert_eq!(lines("a\rb\nc\r\nd").collect::<Vec<_>>(), ["a", "b", "c", "d"]);
+        assert_eq!(
+            lines("a\rb\nc\r\nd").collect::<Vec<_>>(),
+            ["a", "b", "c", "d"]
+        );
         assert_eq!(lines("").collect::<Vec<_>>(), [""]);
         assert_eq!(lines("a\r").collect::<Vec<_>>(), ["a", ""]);
         assert_eq!(lines("\r\n\r\n").collect::<Vec<_>>(), ["", "", ""]);
@@ -229,22 +189,40 @@ mod tests {
 
     #[test]
     fn carriage_returns_count_as_lines() {
-        assert_eq!(estimate_lines("first\rsecond\rthird", COMPACT_FONT, WIDTH), 3);
+        assert_eq!(
+            estimate_lines("first\rsecond\rthird", COMPACT_FONT, WIDTH),
+            3
+        );
         assert_eq!(estimate_lines("first\r\nsecond", COMPACT_FONT, WIDTH), 2);
     }
 
     #[test]
-    fn a_word_is_large_and_a_sentence_is_compact() {
+    fn words_and_sentences_that_fit_two_lines_stay_large() {
         assert!(!compact_after("", true));
         assert!(!compact_after("hello", false));
         assert!(!compact_after("你好世界", false));
-        assert!(compact_after("the quick brown fox jumps over the lazy dog", false));
-        assert!(compact_after("离线翻译使用量化模型，支持简体中文与英语互译", false));
+        assert!(!compact_after(
+            "the quick brown fox jumps over the lazy dog",
+            false
+        ));
+        assert!(!compact_after(
+            "离线翻译使用量化模型，支持简体中文与英语互译",
+            false
+        ));
+        assert!(!wants_compact(&"i".repeat(100), &|_, _| 2));
     }
 
     #[test]
-    fn enter_makes_the_input_compact_without_changing_its_height() {
-        assert!(compact_after("hello\r", false));
+    fn two_explicit_lines_stay_large_and_the_third_becomes_compact() {
+        assert!(!compact_after("hello\r", false));
+        assert!(!compact_after("hello\rworld", false));
+        for text in [
+            "hello\rworld\ragain",
+            "hello\nworld\n",
+            "hello\r\nworld\r\n",
+        ] {
+            assert!(compact_after(text, false));
+        }
         assert_eq!(estimated_height("hello", false), MIN_HEIGHT);
         // The frame WinUI draws before the size can change: two large lines.
         assert_eq!(estimated_height("hello\r", false), MIN_HEIGHT);
@@ -254,24 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn the_size_does_not_flip_around_its_threshold() {
-        let mut text = String::new();
-        let mut compact = false;
-        while !compact {
-            text.push('文');
-            compact = compact_after(&text, compact);
-        }
-        // Deleting the character that crossed the threshold keeps it compact.
-        text.pop();
-        assert!(compact_after(&text, true));
-        assert!(!compact_after(&text, false));
-        while compact {
-            text.pop();
-            compact = compact_after(&text, compact);
-        }
-        // And typing that character back keeps it large.
-        text.push('文');
-        assert!(!compact_after(&text, false));
+    fn compact_threshold_uses_large_wrapped_lines_in_both_directions() {
+        assert!(!compact_after(&"文".repeat(36), false));
+        assert!(!compact_after(&"文".repeat(36), true));
+        assert!(compact_after(&"文".repeat(37), false));
+        assert!(compact_after(&"文".repeat(37), true));
     }
 
     #[test]
@@ -286,7 +251,10 @@ mod tests {
             let mut previous = (false, MIN_HEIGHT);
             for (index, state) in typed_heights(text).into_iter().enumerate() {
                 assert!(state.1 >= previous.1, "shrank at character {index}");
-                assert!(state.0 || !previous.0, "became large again at character {index}");
+                assert!(
+                    state.0 || !previous.0,
+                    "became large again at character {index}"
+                );
                 previous = state;
             }
             assert!(previous.0 && previous.1 > MIN_HEIGHT);
@@ -300,7 +268,9 @@ mod tests {
             .collect();
         assert_eq!(
             heights,
-            [74.0, 74.0, 74.0, 91.0, 111.0, 131.0, 151.0, 171.0, 171.0, 171.0]
+            [
+                74.0, 74.0, 74.0, 91.0, 111.0, 131.0, 151.0, 171.0, 171.0, 171.0
+            ]
         );
         assert_eq!(MAX_HEIGHT, 171.0);
     }
@@ -321,7 +291,7 @@ mod tests {
             let height = height(text, true, &|_, _| panic!("measured text that cannot fit"));
             assert_eq!(height, MAX_HEIGHT);
         }
-        assert!(wants_compact(&long, false, WIDTH, &|_| panic!("measured long text")));
+        assert!(wants_compact(&long, &|_, _| panic!("measured long text")));
     }
 
     #[test]
@@ -329,27 +299,5 @@ mod tests {
         assert_eq!(measurable(""), "A");
         assert_eq!(measurable("a\r"), "a\nA");
         assert_eq!(measurable("a\rb"), "a\nb");
-    }
-
-    #[test]
-    fn real_heights_snap_to_the_predicted_line_grid() {
-        assert_eq!(snap_height(41.7, false), MIN_HEIGHT);
-        assert_eq!(snap_height(74.0, true), MIN_HEIGHT);
-        assert_eq!(snap_height(74.67, true), MIN_HEIGHT);
-        assert_eq!(snap_height(90.67, true), 91.0);
-        assert_eq!(snap_height(91.33, true), 91.0);
-        assert_eq!(snap_height(111.0, true), 111.0);
-        // One taller line (an emoji, a fallback font) needs the next step.
-        assert_eq!(snap_height(97.0, true), 111.0);
-        assert_eq!(snap_height(400.0, true), MAX_HEIGHT);
-        assert_eq!(snap_height(f64::NAN, true), MIN_HEIGHT);
-        // Two large lines fit the minimum at 100%, 125%, 150% and 175% scale.
-        for actual in [73.0, 71.8, 73.33, 73.2] {
-            assert_eq!(snap_height(actual, false), MIN_HEIGHT);
-        }
-        // Three large lines at 150% and 100% display scale.
-        for actual in [103.33, 104.0] {
-            assert_eq!(snap_height(actual, false), 104.0);
-        }
     }
 }

@@ -15,7 +15,9 @@ pub use crate::generated::{
     EventId, EventPayload, PropertyId, PropertyValue, SelectionChange, SlotId,
 };
 #[cfg(feature = "test")]
-pub use crate::native::{schedule_live_test_exit, subscribe_live_rendering};
+pub use crate::native::{
+    schedule_live_test_exit, subscribe_live_rendering, verify_synchronous_editor_scale,
+};
 #[cfg(test)]
 pub(crate) use recording::RecordedContentDialog;
 pub use recording::RecordingRuntime;

@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "translator"
-version = "0.1.0-Beta"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arboard",

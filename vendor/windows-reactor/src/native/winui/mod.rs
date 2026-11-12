@@ -37,10 +37,23 @@ mod input_activation;
 mod slide;
 mod text_box_layout;
 mod text_metrics;
-pub use text_metrics::{TextMetrics, measure_text, measure_wrapped_text_height};
 #[cfg(feature = "test")]
 pub(crate) use content_dialog::LiveContentDialogState;
 use content_dialog::{ContentDialogAction, ContentDialogScheduler};
+pub use text_metrics::{TextMetrics, measure_text, measure_wrapped_text_height};
+
+/// Subscribes to WinUI's rendering clock on the current UI thread.
+/// Keep the revoker alive for as long as frame callbacks are needed.
+pub fn subscribe_rendering(
+    rendering: impl Fn() + 'static,
+) -> windows_core::Result<windows_core::EventRevoker> {
+    CompositionTarget::Rendering(move |_, _| {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(&rendering)).is_err() {
+            std::process::abort();
+        }
+    })
+}
+
 mod element_factory;
 #[allow(unused_qualifications)]
 mod generated;
@@ -159,6 +172,7 @@ pub struct WinUiRuntime {
     event_errors: Rc<RefCell<Vec<NativeWork<QueuedEventError>>>>,
     handles: HashMap<NodeId, Handle>,
     caret_overrides: HashMap<NodeId, caret::CaretState>,
+    adaptive_text_scales: HashMap<NodeId, text_box_layout::AdaptiveTextScale>,
     slides: Rc<RefCell<HashMap<NodeId, slide::SlideState>>>,
     navigation_menu_layouts: HashMap<NodeId, navigation_layout::NavigationMenuLayout>,
     events: Rc<RefCell<Vec<NativeWork<QueuedEvent>>>>,
@@ -2047,6 +2061,29 @@ impl WinUiRuntime {
                         _ => Err(RuntimeError::UnsupportedKind),
                     };
                 }
+                if *property == PropertyId::TextBoxAdaptiveLargeFont {
+                    let (Some(Handle::TextBox(control)), PropertyValue::F64(font)) =
+                        (self.handles.get(node), value)
+                    else {
+                        return Err(RuntimeError::UnsupportedKind);
+                    };
+                    if let Some(layout) = self.adaptive_text_scales.get(node) {
+                        return layout.set_large_font(*font).map_err(native_error);
+                    }
+                    let layout = text_box_layout::AdaptiveTextScale::new(control, *font)
+                        .map_err(native_error)?;
+                    let editor = control.cast::<UIElement>().map_err(native_error)?;
+                    for handle in self.handles.values() {
+                        if let Handle::Viewbox(parent) = handle
+                            && parent.Child().map_err(native_error)?.as_ref() == Some(&editor)
+                        {
+                            layout.attach(parent).map_err(native_error)?;
+                            break;
+                        }
+                    }
+                    self.adaptive_text_scales.insert(*node, layout);
+                    return Ok(());
+                }
                 if matches!(
                     property,
                     PropertyId::ButtonResources | PropertyId::TextBoxResources
@@ -2136,6 +2173,11 @@ impl WinUiRuntime {
                 }
             }
             Command::ClearProperty { node, property } => {
+                if *property == PropertyId::TextBoxAdaptiveLargeFont {
+                    self.adaptive_text_scales.remove(node);
+                    return Ok(());
+                }
+
                 if *property == PropertyId::NavigationViewMenuColumns {
                     if let Some(layout) = self.navigation_menu_layouts.remove(node) {
                         layout.restore().map_err(native_error)?;
@@ -2246,12 +2288,19 @@ impl WinUiRuntime {
                 slot,
                 child,
             } => {
+                let child_node = *child;
                 let child = child.map(|child| self.ui_element(child)).transpose()?;
                 let handle = self
                     .handles
                     .get(parent)
                     .ok_or(RuntimeError::MissingNode(*parent))?;
                 set_slot(handle, *slot, child.as_ref())?;
+                if *slot == SlotId::ViewboxChild
+                    && let (Handle::Viewbox(parent), Some(child)) = (handle, child_node)
+                    && let Some(layout) = self.adaptive_text_scales.get(&child)
+                {
+                    layout.attach(parent).map_err(native_error)?;
+                }
             }
             Command::SetTooltip {
                 target,
@@ -3857,6 +3906,7 @@ impl NativeRuntime for WinUiRuntime {
                 Err(RuntimeError::MissingNode(node)),
             );
         }
+        self.adaptive_text_scales.clear();
         self.subscriptions.clear();
         self.encoded_image_nodes.borrow_mut().clear();
         self.image_decode_tickets.clear();
@@ -4333,6 +4383,7 @@ impl WinUiRuntime {
             .retain(|(subscription_node, _), _| *subscription_node != node);
         self.drop_policies.borrow_mut().remove(&node);
         self.caret_overrides.remove(&node);
+        self.adaptive_text_scales.remove(&node);
         self.navigation_menu_layouts.remove(&node);
         self.pointer_capture.borrow_mut().remove(&node);
         if self.resource_override_keys.contains_key(&node) {

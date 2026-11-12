@@ -7629,6 +7629,26 @@ impl windows_core::RuntimeType for IControl {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IControl {
+    pub(crate) fn FontSize(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut value = 0.0;
+            (windows_core::Interface::vtable(self).FontSize)(
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .map(|| value)
+        }
+    }
+    pub(crate) fn Padding(&self) -> windows_core::Result<Thickness> {
+        unsafe {
+            let mut value = Thickness::default();
+            (windows_core::Interface::vtable(self).Padding)(
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .map(|| value)
+        }
+    }
     pub(crate) fn SetPadding(&self, value: Thickness) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetPadding)(
@@ -7723,7 +7743,8 @@ pub struct IControl_Vtbl {
     SetIsFocusEngaged: usize,
     RequiresPointer: usize,
     SetRequiresPointer: usize,
-    FontSize: usize,
+    pub FontSize:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
     pub SetFontSize:
         unsafe extern "system" fn(*mut core::ffi::c_void, f64) -> windows_core::HRESULT,
     FontFamily: usize,
@@ -7747,7 +7768,8 @@ pub struct IControl_Vtbl {
     SetTabNavigation: usize,
     Template: usize,
     SetTemplate: usize,
-    Padding: usize,
+    pub Padding:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Thickness) -> windows_core::HRESULT,
     pub SetPadding:
         unsafe extern "system" fn(*mut core::ffi::c_void, Thickness) -> windows_core::HRESULT,
     HorizontalContentAlignment: usize,
@@ -19784,9 +19806,9 @@ impl IUIElement {
     }
     pub(crate) fn UpdateLayout(&self) -> windows_core::Result<()> {
         unsafe {
-            (windows_core::Interface::vtable(self).UpdateLayout)(
-                windows_core::Interface::as_raw(self),
-            )
+            (windows_core::Interface::vtable(self).UpdateLayout)(windows_core::Interface::as_raw(
+                self,
+            ))
             .ok()
         }
     }
@@ -20134,8 +20156,7 @@ pub struct IUIElement_Vtbl {
     RemovePreviewKeyUp: usize,
     BringIntoViewRequested: usize,
     RemoveBringIntoViewRequested: usize,
-    pub Measure:
-        unsafe extern "system" fn(*mut core::ffi::c_void, Size) -> windows_core::HRESULT,
+    pub Measure: unsafe extern "system" fn(*mut core::ffi::c_void, Size) -> windows_core::HRESULT,
     Arrange: usize,
     pub CapturePointer: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -20153,8 +20174,7 @@ pub struct IUIElement_Vtbl {
     TransformToVisual: usize,
     InvalidateMeasure: usize,
     InvalidateArrange: usize,
-    pub UpdateLayout:
-        unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub UpdateLayout: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
     CancelDirectManipulations: usize,
     StartDragAsync: usize,
     pub StartBringIntoView:
@@ -20419,6 +20439,16 @@ impl windows_core::RuntimeType for IViewbox {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IViewbox {
+    pub(crate) fn Child(&self) -> windows_core::Result<Option<UIElement>> {
+        unsafe {
+            let mut value = core::ptr::null_mut();
+            (windows_core::Interface::vtable(self).Child)(
+                windows_core::Interface::as_raw(self),
+                &mut value,
+            )
+            .map(|| (!value.is_null()).then(|| windows_core::Interface::from_raw(value)))
+        }
+    }
     pub(crate) fn SetChild<P0>(&self, value: P0) -> windows_core::Result<()>
     where
         P0: windows_core::Param<UIElement>,
@@ -20444,7 +20474,10 @@ impl IViewbox {
 #[repr(C)]
 pub struct IViewbox_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
-    Child: usize,
+    pub Child: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub SetChild: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,

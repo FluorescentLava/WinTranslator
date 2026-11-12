@@ -39,8 +39,6 @@ pub enum Message {
     ColorScheme(ColorScheme),
     RepairCaret(u8),
     RetryCaret(u8),
-    ConfirmInputHeight(u64),
-    InputMeasured(u64, f64),
     Dismiss,
     Drag,
     Show,
@@ -82,7 +80,6 @@ pub enum Message {
     Restore(usize),
     Star(usize),
     Warmed,
-    PopupSettled,
 }
 pub struct Translator {
     settings_window: bool,
@@ -101,14 +98,11 @@ pub struct Translator {
     popup_details_reveal: f64,
     popup_details_from: f64,
     popup_committed_reveal: std::rc::Rc<std::cell::Cell<f64>>,
-    /// What the popup was last sized for, shared with the effect that sizes it.
-    popup_target: std::rc::Rc<std::cell::Cell<Option<PopupTarget>>>,
-    /// Changes with every edit to the input's text, size or measured height.
-    /// The popup follows these changes in one step instead of easing.
+    popup_input_from: f64,
+    popup_committed_input_height: std::rc::Rc<std::cell::Cell<f64>>,
+    /// Changes with every edit, so the native caret can be refreshed.
     input_revision: u64,
     input_compact: bool,
-    /// Height the text box really laid out at beyond the prediction.
-    input_height_correction: f64,
     provider_picker_open: bool,
     provider_picker_selected: Option<Provider>,
     provider_picker_revision: u64,
@@ -136,46 +130,28 @@ pub struct Translator {
     input: ElementRef<TextBox>,
     provider_button: ElementRef<Button>,
     popup_surface: ElementRef<Border>,
+    result_opacity: std::rc::Rc<std::cell::Cell<f64>>,
     popup_animation_revision: Option<u64>,
 }
-#[derive(Clone, Copy)]
-struct PopupTarget {
-    height: f64,
-    transition_key: u64,
-    input_revision: u64,
-    /// An eased resize toward `height` is in flight.
-    animating: bool,
-}
-
-/// WinUI lays the text box out on a later tick than the edit it reports, and
-/// eases the box to its new height when a line is added with Enter or removed.
-/// The height is read back this long after the last edit, once it is at rest.
-const INPUT_CONFIRM_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// Width one line of text has inside the input box.
 const INPUT_LINE_WIDTH: f64 =
     POPUP_CONTENT_WIDTH - input_layout::PADDING_LEFT - input_layout::PADDING_RIGHT;
 
 /// Lines `value` occupies in the input box, from WinUI's own text layout.
 fn input_wrapped_lines(value: &str, font_size: f64) -> usize {
+    let scale = font_size / EDITOR_FONT_SIZE;
+    wrapped_text_lines(value, EDITOR_FONT_SIZE, INPUT_LINE_WIDTH / scale)
+}
+
+fn wrapped_text_lines(value: &str, font_size: f64, width: f64) -> usize {
     let measured = || {
-        let line = measure_wrapped_text_height("A", font_size, INPUT_LINE_WIDTH)?;
-        let height = measure_wrapped_text_height(
-            &input_layout::measurable(value),
-            font_size,
-            INPUT_LINE_WIDTH,
-        )?;
+        let line = measure_wrapped_text_height("A", font_size, width)?;
+        let height =
+            measure_wrapped_text_height(&input_layout::measurable(value), font_size, width)?;
         // Lines that use a fallback font can be slightly taller than the probe.
         (line > 0.0).then(|| ((height / line) + 0.25).floor().max(1.0) as usize)
     };
-    measured().unwrap_or_else(|| input_layout::estimate_lines(value, font_size, INPUT_LINE_WIDTH))
-}
-
-fn input_large_width(value: &str) -> f64 {
-    measure_text(value, input_layout::LARGE_FONT).map_or_else(
-        || input_layout::estimate_width(value, input_layout::LARGE_FONT),
-        |metrics| metrics.width,
-    )
+    measured().unwrap_or_else(|| input_layout::estimate_lines(value, font_size, width))
 }
 
 fn caret_color(dark: bool) -> Color {
@@ -284,6 +260,9 @@ const SETTINGS: &str = "\u{E713}";
 const HISTORY: &str = "\u{E81C}";
 const POPUP_WIDTH: f64 = 480.0;
 const POPUP_CONTENT_WIDTH: f64 = POPUP_WIDTH - 32.0;
+const EDITOR_FONT_SIZE: f64 = input_layout::COMPACT_FONT;
+const INPUT_COMPACT_KEY: u64 = 1 << 4;
+const RESULT_COMPACT_KEY: u64 = 1 << 5;
 fn icon(path: &str) -> FontIcon {
     FontIcon::new().glyph(path)
 }
@@ -454,59 +433,28 @@ impl Translator {
         input_layout::unix_newlines(&self.text)
     }
 
-    /// Records an edit to the input's text, size or measured height. The card
-    /// sizes itself around the real text box; the predicted height sizes the
-    /// window region and the result's share of the popup, and is checked
-    /// against the real text box once that has come to rest.
-    fn input_edited(&mut self, cx: &ComponentContext<Self>) {
+    fn set_text(&mut self, text: String) {
+        self.text = text;
         self.input_revision += 1;
+        self.update_input_size();
+    }
+
+    /// Geometry follows every edit, independently of translation debounce.
+    /// The native Viewbox also scales during composition without reformatting
+    /// RichEdit's internal font or waiting for a window animation frame.
+    fn update_input_size(&mut self) {
         if self.settings_window {
             return;
         }
-        let revision = self.input_revision;
-        cx.spawn_background(move |_| {
-            std::thread::sleep(INPUT_CONFIRM_DELAY);
-            Message::ConfirmInputHeight(revision)
-        });
-    }
-
-    fn set_text(&mut self, text: String, cx: &ComponentContext<Self>) {
-        self.text = text;
-        self.input_edited(cx);
-        self.update_input_size(cx);
-    }
-
-    /// Chooses the large or compact input size for the current text. WinUI
-    /// keeps drawing an IME composition at the size it started with, so the
-    /// size is held while one is in progress and settled when it ends.
-    fn update_input_size(&mut self, cx: &ComponentContext<Self>) {
-        if self.settings_window || native::is_composing() {
-            return;
-        }
-        let compact = input_layout::wants_compact(
-            &self.text,
-            self.input_compact,
-            INPUT_LINE_WIDTH,
-            &input_large_width,
-        );
-        if compact != self.input_compact {
-            self.input_compact = compact;
-            self.input_height_correction = 0.0;
-            self.input_edited(cx);
-        }
+        self.input_compact = input_layout::wants_compact(&self.text, &input_wrapped_lines);
     }
 
     fn input_height(&self) -> f64 {
-        (input_layout::height(&self.text, self.input_compact, &input_wrapped_lines)
-            + self.input_height_correction)
-            .clamp(input_layout::MIN_HEIGHT, input_layout::MAX_HEIGHT)
+        input_layout::height(&self.text, self.input_compact, &input_wrapped_lines)
     }
 
     fn pronunciation_text(&self) -> Option<&str> {
         let translation = self.output.as_ref()?;
-        if self.busy || self.source_text().trim() != translation.source.trim() {
-            return None;
-        }
         if translation.from == "en" {
             Some(translation.source.trim())
         } else if translation.to == "en" {
@@ -759,6 +707,11 @@ impl Translator {
         if self.busy || self.text.trim().is_empty() {
             return;
         }
+        if native::is_composing() {
+            self.schedule(cx);
+            return;
+        }
+        self.update_input_size();
         self.invalidate();
         self.busy = true;
         self.pending_provider = Some(
@@ -1096,11 +1049,13 @@ impl Translator {
         let dark = self.settings.theme == 2
             || (self.settings.theme == 0 && self.color_scheme == ColorScheme::Dark);
         let sender = cx.sender();
-        let _ = self.input.request_caret_color_result(caret_color(dark), move |result| {
-            if matches!(result, Ok(false)) && attempt < 5 {
-                let _ = sender.send(Message::RetryCaret(attempt + 1));
-            }
-        });
+        let _ = self
+            .input
+            .request_caret_color_result(caret_color(dark), move |result| {
+                if matches!(result, Ok(false)) && attempt < 5 {
+                    let _ = sender.send(Message::RetryCaret(attempt + 1));
+                }
+            });
     }
     fn focus_popup_input(&self, cx: &ComponentContext<Self>, revision: u64, attempt: u8) {
         if !native::popup_show_animation_is_current(revision)
@@ -1138,7 +1093,7 @@ impl Translator {
         let _ = self.popup_surface.request_slide_y(
             native::popup_slide_distance(),
             0.0,
-            1.0,
+            0.0,
             1.0,
             280,
             |result| {
@@ -1185,22 +1140,16 @@ impl Translator {
                     .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'')
         });
         let dictionary_result = self.entry.is_some() || is_word;
-        // The text box sizes itself and the card follows it. This is the height
-        // it will take, which the window region and the result are sized from.
+        // Geometry and the native editor share the current input text.
         let compact_input = self.input_compact;
         let input_height = self.input_height();
         let fixed_height = 107.0 + input_height;
         let available_result = (480.0 - fixed_height).max(80.0);
         let result_font = self.output.as_ref().map_or(23.0, |translation| {
             if compact_input
-                || translation.target.chars().count() > 80
-                || visual_lines(&translation.target, 23.0, POPUP_CONTENT_WIDTH - 56.0) > 2
-                || translation
-                    .target
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .count()
-                    > 1
+                || input_layout::wants_compact(&translation.target, &|value, font| {
+                    wrapped_text_lines(value, font, POPUP_CONTENT_WIDTH - 30.0)
+                })
             {
                 15.0
             } else {
@@ -1297,7 +1246,7 @@ impl Translator {
         let mut target_max_height = available_result;
         let mut details_height = 0.0;
         let mut details_viewport_height = 0.0;
-        let (result_height, rendered_result_height) = if let Some(translation) = &self.output {
+        let (result_height, content_result_height) = if let Some(translation) = &self.output {
             if dictionary_result {
                 let metadata_height = metadata.as_ref().map_or(0.0, |value| {
                     visual_lines(value, 14.0, POPUP_CONTENT_WIDTH - 56.0) as f64 * 20.0 + 6.0
@@ -1314,11 +1263,17 @@ impl Translator {
                         } else {
                             0.0
                         });
-                let closed_target =
-                    estimated_target.min((available_result - header_fixed).max(result_line_height));
-                let open_target = estimated_target
-                    .min((available_result - header_fixed - 72.0).max(result_line_height));
-                let open_header = header_fixed + open_target;
+                // The header keeps one layout throughout expansion. Only its
+                // enclosing viewport reveals/crops the already arranged content.
+                let detail_reserve = if dictionary_senses.is_empty() {
+                    0.0
+                } else {
+                    72.0
+                };
+                target_max_height = estimated_target.min(
+                    (available_result - header_fixed - detail_reserve).max(result_line_height),
+                );
+                let header_height = header_fixed + target_max_height;
                 let meanings_height = dictionary_senses
                     .iter()
                     .map(|sense| {
@@ -1328,20 +1283,12 @@ impl Translator {
                     .sum::<f64>()
                     + dictionary_senses.len().saturating_sub(1) as f64 * 12.0;
                 details_height =
-                    (meanings_height + 25.0).min((available_result - open_header).max(25.0));
+                    (meanings_height + 25.0).min((available_result - header_height).max(25.0));
                 details_viewport_height = (details_height - 25.0).max(0.0);
-                // The target is independent of animation progress. Both the
-                // summary budget and detail reveal use the same eased frame.
-                target_max_height = closed_target + (open_target - closed_target) * details_reveal;
-                let target_height = if details_open {
-                    open_header + details_height
-                } else {
-                    header_fixed + closed_target
-                };
-                (
-                    target_height,
-                    header_fixed + target_max_height + details_height * details_reveal,
-                )
+                let target_height = header_height + if details_open { details_height } else { 0.0 };
+                let content_height =
+                    header_height + if details_mounted { details_height } else { 0.0 };
+                (target_height, content_height)
             } else {
                 let word_metadata = if is_word { 26.0 } else { 0.0 };
                 let height = (30.0
@@ -1369,34 +1316,39 @@ impl Translator {
             fixed_height.max(172.0).min(480.0)
         };
         let height = natural_height;
-        let transition_key =
-            u64::from(details_open) | (u64::from(expanded) << 2) | (u64::from(self.error) << 3);
-        // An edit to the input resizes the card in this very frame. Anything
-        // else (a result arriving, details opening) eases over published frames.
-        let last_target = self.popup_target.get();
-        let resized = last_target
-            .is_none_or(|last| last.height != height || last.transition_key != transition_key);
-        let input_changed =
-            last_target.is_none_or(|last| last.input_revision != self.input_revision);
-        let easing = if resized {
-            !input_changed
+        let transition_key = u64::from(details_open)
+            | (u64::from(expanded) << 2)
+            | (u64::from(self.error) << 3)
+            | if compact_input { INPUT_COMPACT_KEY } else { 0 }
+            | if result_font == input_layout::COMPACT_FONT {
+                RESULT_COMPACT_KEY
+            } else {
+                0
+            }
+            | (((input_height * 64.0).round() as u64) << 8);
+        // Native text scaling runs before text is drawn, independently of the
+        // card's animated viewport. Results also use the current content size.
+        let displayed_result_font = result_font;
+        let editor_height = input_height;
+        let frame_height = self
+            .popup_frame
+            .map_or(107.0 + input_layout::MIN_HEIGHT, |frame| frame.height);
+        let input_viewport_height = if let Some(frame) = self.popup_frame
+            && frame.transition_key == transition_key
+        {
+            self.popup_input_from + (input_height - self.popup_input_from) * frame.progress
         } else {
-            last_target.is_some_and(|last| last.animating)
-        };
-        let frame_height = if easing {
-            self.popup_frame.map_or(172.0, |frame| frame.height)
-        } else {
-            height
-        };
-        let frame_result_height = (frame_height - fixed_height).max(0.0);
-        let rendered_result_height = rendered_result_height.min(frame_result_height);
+            self.popup_committed_input_height.get()
+        }
+        .min((frame_height - 107.0).max(0.0));
+        let frame_result_height = (frame_height - 107.0 - input_viewport_height).max(0.0);
         let details_reveal_height = details_height * details_reveal;
         cx.window_title("WinTranslater");
         cx.window_visuals(
             WindowVisuals::new()
                 .client_size(
                     POPUP_WIDTH + 2.0 * f64::from(native::POPUP_SHADOW_INSET),
-                    480.0 + 2.0 * f64::from(native::POPUP_SHADOW_INSET),
+                    107.0 + input_layout::MIN_HEIGHT + 2.0 * f64::from(native::POPUP_SHADOW_INSET),
                 )
                 .backdrop(WindowBackdrop::MicaCard {
                     inset: native::POPUP_SHADOW_INSET,
@@ -1405,33 +1357,33 @@ impl Translator {
         );
         let dismiss = cx.message(Message::Dismiss);
         let input_revision = self.input_revision;
-        let popup_target = self.popup_target.clone();
         cx.use_effect(
             "popup-target",
-            (transition_key, height.to_bits(), input_revision),
+            (transition_key, height.to_bits()),
             move || {
-                let animating = if resized {
-                    native::configure_popup(POPUP_WIDTH, height, transition_key, !input_changed)
-                } else {
-                    easing
-                };
-                popup_target.set(Some(PopupTarget {
-                    height,
-                    transition_key,
-                    input_revision,
-                    animating,
-                }));
+                native::configure_popup(POPUP_WIDTH, height, transition_key, true);
                 native::escape_handler(move || {
                     let _ = dismiss.call(());
                 });
                 None
             },
         );
+        cx.use_effect("popup-render-clock", (), move || match subscribe_rendering(
+            native::popup_animation_frame,
+        ) {
+            Ok(clock) => {
+                native::set_popup_render_clock(true);
+                Some(Box::new(move || {
+                    native::set_popup_render_clock(false);
+                    drop(clock);
+                }))
+            }
+            Err(_) => None,
+        });
         let frame = self.popup_frame;
         let reveal = self.popup_details_reveal;
         let committed_reveal = self.popup_committed_reveal.clone();
-        let popup_target = self.popup_target.clone();
-        let settled_sender = cx.sender();
+        let committed_input = self.popup_committed_input_height.clone();
         cx.use_effect(
             "popup-frame-commit",
             frame.map(|frame| frame.serial),
@@ -1441,18 +1393,7 @@ impl Translator {
                 {
                     native::commit_popup_frame(frame);
                     committed_reveal.set(reveal);
-                    if frame.finished
-                        && let Some(target) = popup_target.get()
-                        && target.animating
-                    {
-                        popup_target.set(Some(PopupTarget {
-                            animating: false,
-                            ..target
-                        }));
-                        // Render once more, so the card stops being pinned to
-                        // the last frame's height before the next edit.
-                        let _ = settled_sender.send(Message::PopupSettled);
-                    }
+                    committed_input.set(input_viewport_height);
                 }
                 None
             },
@@ -1520,7 +1461,7 @@ impl Translator {
             ));
         let input = TextBox::new()
             .element_ref(&self.input)
-            .font_size(input_layout::font_size(compact_input))
+            .font_size(EDITOR_FONT_SIZE)
             .resource_overrides(
                 [
                     "TextControlBackground",
@@ -1557,14 +1498,30 @@ impl Translator {
             .background(Color::transparent())
             .border_thickness(0.0)
             .border_brush(Color::transparent())
-            // No explicit height: the box grows and shrinks with its own text
-            // in the same layout pass, and scrolls only beyond the maximum.
-            .min_height(input_layout::MIN_HEIGHT)
-            .max_height(input_layout::MAX_HEIGHT)
+            .padding(Thickness::new(
+                input_layout::PADDING_LEFT,
+                5.0,
+                input_layout::PADDING_RIGHT,
+                6.0,
+            ))
+            .adaptive_large_font(input_layout::LARGE_FONT)
+            .min_height(0.0)
             .vertical_alignment(VerticalAlignment::Top)
             .horizontal_alignment(Stretch)
             .automation_name("输入单词或文本")
             .on_text_changed(cx.callback(Message::Text));
+        let input = Viewbox::new()
+            .width(POPUP_CONTENT_WIDTH)
+            .height(editor_height)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .vertical_alignment(VerticalAlignment::Top)
+            .stretch(windows_reactor::Stretch::Uniform)
+            .slot(ViewboxSlot::Child, input);
+        let input = ScrollViewer::new()
+            .height(input_viewport_height)
+            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+            .content(input);
         let result: View = if let Some(translation) = &self.output {
             if dictionary_result {
                 let has_details = !dictionary_senses.is_empty();
@@ -1607,7 +1564,7 @@ impl Translator {
                             .grid_row(1)
                             .grid_column_span(if inline_pronunciation { 1 } else { 2 })
                             .content(
-                                text(&translation.target, result_font)
+                                text(&translation.target, displayed_result_font)
                                     .text_wrapping(TextWrapping::WrapWholeWords)
                                     .is_text_selection_enabled(true),
                             ),
@@ -1706,7 +1663,7 @@ impl Translator {
                     .border_brush(ThemeBrush::CardStroke)
                     .border_thickness(1.0)
                     .corner_radius(8.0)
-                    .max_height(rendered_result_height)
+                    .max_height(content_result_height)
                     .vertical_alignment(VerticalAlignment::Top)
                     .content(
                         Grid::new()
@@ -1720,7 +1677,7 @@ impl Translator {
                     .border_thickness(1.0)
                     .corner_radius(8.0)
                     .padding(14.0)
-                    .max_height(rendered_result_height)
+                    .max_height(content_result_height)
                     .vertical_alignment(VerticalAlignment::Top)
                     .content(
                         StackPanel::new().spacing(6.0).children((
@@ -1731,7 +1688,7 @@ impl Translator {
                             },
                             ScrollViewer::new()
                                 .max_height(
-                                    (rendered_result_height
+                                    (content_result_height
                                         - 30.0
                                         - notice_height
                                         - pronunciation_height)
@@ -1746,7 +1703,7 @@ impl Translator {
                                         } else {
                                             View::empty()
                                         },
-                                        text(&translation.target, result_font)
+                                        text(&translation.target, displayed_result_font)
                                             .is_text_selection_enabled(true),
                                     )),
                                 ),
@@ -1756,7 +1713,7 @@ impl Translator {
             }
         } else if self.error {
             ScrollViewer::new()
-                .max_height(rendered_result_height)
+                .max_height(content_result_height)
                 .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .content(
@@ -1764,6 +1721,31 @@ impl Translator {
                         .opacity(0.8)
                         .margin(Thickness::new(6.0, 2.0, 6.0, 2.0)),
                 )
+        } else {
+            View::empty()
+        };
+        let result_visible = expanded || self.error;
+        let result_opacity = if result_visible {
+            self.result_opacity
+                .get()
+                .max((frame_result_height / result_height.max(1.0)).clamp(0.0, 1.0))
+        } else {
+            0.0
+        };
+        let committed_opacity = self.result_opacity.clone();
+        cx.use_effect("result-opacity", result_opacity.to_bits(), move || {
+            committed_opacity.set(result_opacity);
+            None
+        });
+        let result = if result_visible {
+            View::keyed_fragment([(
+                "result",
+                Border::new()
+                    .opacity(result_opacity)
+                    .height(content_result_height)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .content(result),
+            )])
         } else {
             View::empty()
         };
@@ -1864,11 +1846,7 @@ impl Translator {
         let surface = Border::new()
             .element_ref(&self.popup_surface)
             .opacity(0.0)
-            // At rest the card takes its height from its content, so it grows
-            // with the text box in WinUI's own layout pass, before this view
-            // even hears about the edit. Only an eased resize pins it to the
-            // height of the published frame.
-            .height(easing.then_some(frame_height))
+            .height(frame_height)
             .vertical_alignment(VerticalAlignment::Bottom)
             .padding(Thickness::new(16.0, 12.0, 16.0, 10.0))
             .on_pointer_pressed(cx.callback(|point: PointerEventInfo| {
@@ -1880,12 +1858,15 @@ impl Translator {
             }))
             .content(
                 Grid::new().children((
-                    // A stack never limits a child's height, so the text box
-                    // always gets the height its text needs.
-                    StackPanel::new()
-                        .spacing(7.0)
+                    Grid::new()
+                        .rows([
+                            GridLength::Pixel(32.0),
+                            GridLength::Pixel(input_viewport_height),
+                            Star(1.0),
+                        ])
+                        .row_spacing(7.0)
                         .margin(Thickness::new(0.0, 0.0, 0.0, 39.0))
-                        .children((languages, input, result)),
+                        .children((languages, at(input, 1, 0), at(result, 2, 0))),
                     Border::new()
                         .vertical_alignment(VerticalAlignment::Bottom)
                         .content(footer),
@@ -2369,16 +2350,13 @@ impl Component for Translator {
             popup_details_reveal: 0.0,
             popup_details_from: 0.0,
             popup_committed_reveal: std::rc::Rc::new(std::cell::Cell::new(0.0)),
-            popup_target: std::rc::Rc::new(std::cell::Cell::new(None)),
+            popup_input_from: input_layout::MIN_HEIGHT,
+            popup_committed_input_height: std::rc::Rc::new(std::cell::Cell::new(
+                input_layout::MIN_HEIGHT,
+            )),
             input_revision: 0,
             input_compact: !input.settings_window
-                && input_layout::wants_compact(
-                    &input.initial_text,
-                    false,
-                    INPUT_LINE_WIDTH,
-                    &input_large_width,
-                ),
-            input_height_correction: 0.0,
+                && input_layout::wants_compact(&input.initial_text, &input_wrapped_lines),
             provider_picker_open: false,
             provider_picker_selected: None,
             provider_picker_revision: 0,
@@ -2406,6 +2384,7 @@ impl Component for Translator {
             input: ElementRef::new(),
             provider_button: ElementRef::new(),
             popup_surface: ElementRef::new(),
+            result_opacity: std::rc::Rc::new(std::cell::Cell::new(0.0)),
             popup_animation_revision: None,
         };
         if input.settings_window && translator.model_download_status.phase.is_busy() {
@@ -2420,7 +2399,7 @@ impl Component for Translator {
                 if self.text != value {
                     self.cancel_selection();
                     self.cancel_speech();
-                    self.set_text(value, cx);
+                    self.set_text(value);
                     let previously_followed_input = self.settings.auto_pair;
                     self.settings.follow_bilingual_input(&self.text);
                     if !previously_followed_input && self.settings.auto_pair {
@@ -2433,18 +2412,19 @@ impl Component for Translator {
             }
             Message::Translate => self.translate(cx),
             Message::Debounced(revision) if revision == self.revision => {
-                // An IME that reports through TSF alone ends its composition
-                // without a message; this is where the held size settles.
-                self.update_input_size(cx);
-                if self.text.trim().is_empty() {
+                // IME composition delays requests, while native text layout
+                // continues to follow the editor synchronously.
+                if native::is_composing() {
+                    self.schedule(cx);
+                } else if self.text.trim().is_empty() {
+                    self.update_input_size();
                     self.output = None;
                     self.entry = None;
                     self.details_open = false;
                     self.error = false;
                     self.status.clear();
-                } else if native::is_composing() {
-                    self.schedule(cx);
                 } else {
+                    self.update_input_size();
                     self.translate(cx);
                 }
             }
@@ -2457,6 +2437,7 @@ impl Component for Translator {
                     // A reversal starts at the last viewport committed to the
                     // HWND, including when a newer request invalidated a frame.
                     self.popup_details_from = self.popup_committed_reveal.get();
+                    self.popup_input_from = self.popup_committed_input_height.get();
                 }
                 let target = if frame.transition_key & 1 != 0 {
                     1.0
@@ -2518,35 +2499,6 @@ impl Component for Translator {
             }
             Message::ColorScheme(scheme) => self.color_scheme = scheme,
             Message::RepairCaret(attempt) => self.repair_caret(cx, attempt),
-            Message::ConfirmInputHeight(revision)
-                if revision == self.input_revision && native::popup_is_foreground() =>
-            {
-                let sender = cx.sender();
-                let _ = self.input.request_layout_height(move |result| {
-                    // A box that has not been laid out yet reports no height.
-                    if let Ok(actual) = result
-                        && actual >= 1.0
-                    {
-                        let _ = sender.send(Message::InputMeasured(revision, actual));
-                    }
-                });
-            }
-            Message::InputMeasured(revision, actual) if revision == self.input_revision => {
-                // The prediction and the real box agree unless a line wrapped
-                // differently than measured or is taller than usual.
-                let actual = input_layout::snap_height(actual, self.input_compact);
-                let predicted = self.input_height();
-                if (actual - predicted).abs() > 0.5 {
-                    storage::diagnostic(serde_json::json!({
-                        "event": "input_height_corrected",
-                        "predicted": predicted,
-                        "actual": actual,
-                        "compact": self.input_compact,
-                    }));
-                    self.input_height_correction += actual - predicted;
-                    self.input_edited(cx);
-                }
-            }
             Message::RetryCaret(attempt) => {
                 cx.spawn_background(move |_| {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2739,7 +2691,8 @@ impl Component for Translator {
                     if self.text != selected {
                         self.cancel_speech();
                         self.invalidate();
-                        self.set_text(selected, cx);
+                        self.set_text(selected);
+                        self.update_input_size();
                         self.settings.follow_bilingual_input(&self.text);
                         self.force_online_for_long_text = false;
                         self.pending_provider = None;
@@ -2766,7 +2719,6 @@ impl Component for Translator {
                 if active {
                     self.invalidate();
                 } else {
-                    self.update_input_size(cx);
                     self.schedule(cx);
                 }
             }

@@ -17,7 +17,7 @@ pub use app::*;
 pub use core::public::*;
 pub use element::*;
 pub use generated::public::*;
-pub use native::{TextMetrics, measure_text, measure_wrapped_text_height};
+pub use native::{TextMetrics, measure_text, measure_wrapped_text_height, subscribe_rendering};
 pub use reference::{
     CompositionHostError, CompositionHostEvent, ElementObservation, ElementRef, FocusControl,
     FocusError, ImageSourceError, IntegrationError, ReferenceControl, SwapChainPanelError,

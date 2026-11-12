@@ -1,6 +1,10 @@
 use super::*;
 use windows_core::EventRevoker;
 
+pub fn verify_synchronous_editor_scale() -> windows_core::Result<()> {
+    super::text_box_layout::verify_synchronous_scale()
+}
+
 pub(crate) fn native_window_handle(window: &Window) -> windows_core::Result<isize> {
     let mut hwnd = std::ptr::null_mut();
     unsafe {
